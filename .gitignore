@@ -1,0 +1,47 @@
+# Local Python / dependency installs
+.tools/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated datasets, source animation assets, and visual exports
+data/
+ue5/
+*.fbx
+*.FBX
+*.bvh
+*.npz
+*.glb
+*.usd
+*.dae
+
+# Training outputs
+training/runs/
+training/runs_archived*/
+*.pt
+*.pth
+events.out.tfevents.*
+tensorboard_stdout.log
+tensorboard_stderr.log
+console.log
+console.err.log
+pipeline_stdout.log
+pipeline_stderr.log
+timing_profile.csv
+
+# Abandoned adversarial experiments kept locally for reference
+training/train_locomotion_amp.py
+training/debug_amp_*.py
+oneliners.txt
+
+# Reference / external experiments kept locally
+ai4animation_main/
+BVHview/
+Blender/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
