@@ -5,10 +5,14 @@ Stepper is a local pipeline for game-oriented kinematic locomotion experiments:
 - Convert Autodesk FBX animation into NPZ motion data.
 - Strip helper bones into a final training skeleton.
 - Visualize NPZ motion with mannequin-like collider volumes.
-- Train a supervised autoregressive PyTorch locomotion imitator.
+- Train a delta-transition-AE guided autoregressive PyTorch locomotion imitator.
 - Compare generated motion against ground truth in an HTML viewer.
 
-The current stable path is the supervised DeepMimic-style training framework. The experimental AMP/adversarial work is intentionally not part of the saved GitHub snapshot.
+The current default training path is the scratch delta-AE prior workflow. It
+trains a fresh transition autoencoder, a K=1 controller warmup, a K=1 polish,
+then a K=2/4/8 autoregressive controller. The older supervised DeepMimic-style
+runner is still available for comparison. The experimental AMP/adversarial work
+is intentionally not part of the saved GitHub snapshot.
 
 ## Main Folders
 
@@ -31,29 +35,33 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
    .\fbx_npz_pipeline\view_npz.ps1
    ```
 
-3. Train the current fast supervised setup:
+3. Train the current default scratch delta-AE setup:
 
    ```powershell
-   .\training\run_fast_locomotion_timed.ps1 -Polish 1 -MaxK 8 -HiddenDim 256
+   .\run_training.ps1
    ```
 
-4. Visualize checkpoints:
-
-   ```powershell
-   python .\training\visualize_best.py
-   ```
-
-5. Reproduce the scratch delta-AE prior experiment:
+   This delegates to:
 
    ```powershell
    .\training\run_delta_ae_scratch.ps1
    ```
 
-   This trains a fresh transition autoencoder, a K=1 model warmup, a K=1
-   low-learning-rate polish, then a K=2/4/8 autoregressive model. It does not
-   load any older model checkpoints. By default it refreshes the HTML viewer
-   once after training; pass `-LiveViewer -SaveLiveEveryEpochs 20` if you want
-   live HTML updates during the autoregressive stage.
+   It does not load any older model checkpoints. By default it refreshes the
+   HTML viewer once after training; pass `-LiveViewer -SaveLiveEveryEpochs 20`
+   if you want live HTML updates during the autoregressive stage.
+
+4. Optional: run the older fast supervised setup:
+
+   ```powershell
+   .\training\run_fast_locomotion_timed.ps1 -Polish 1 -MaxK 8 -HiddenDim 256
+   ```
+
+5. Visualize checkpoints:
+
+   ```powershell
+   python .\training\visualize_best.py
+   ```
 
 ## Dependencies
 
