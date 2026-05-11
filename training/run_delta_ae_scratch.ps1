@@ -7,7 +7,9 @@ param(
     [int]$AutoregEpochs = 900,
     [int]$K1WarmupSeconds = 130,
     [int]$K1PolishSeconds = 120,
-    [int]$AutoregSeconds = 300,
+    [int]$AutoregSeconds = 260,
+    [int]$SaveLiveEveryEpochs = 0,
+    [switch]$LiveViewer,
     [string]$Prefix = ("delta_ae_scratch_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
 )
 
@@ -120,7 +122,7 @@ try {
 
     $K1PolishCkpt = "training/runs/$K1PolishRun/checkpoints/checkpoint_best.pt"
 
-    Run-Stage "model_autoreg_k8" $AutoregRun @(
+    $AutoregArgs = @(
         $ModelTrain,
         "--folder-path", "data/npz_final",
         "--prior-checkpoint", $AECkpt,
@@ -135,13 +137,16 @@ try {
         "--curriculum-min-epochs", "30",
         "--max-epochs", "$AutoregEpochs",
         "--max-train-seconds", "$AutoregSeconds",
-        "--save-live-every-epochs", "20",
+        "--save-live-every-epochs", "$SaveLiveEveryEpochs",
         "--best-metric", "joint_rmse",
-        "--device", "cuda",
-        "--live-viewer"
+        "--device", "cuda"
     )
+    if ($LiveViewer) {
+        $AutoregArgs += "--live-viewer"
+    }
+    Run-Stage "model_autoreg_k8" $AutoregRun $AutoregArgs
 
-    $FinalCkpt = "training/runs/$AutoregRun/checkpoints/checkpoint_last.pt"
+    $FinalCkpt = "training/runs/$AutoregRun/checkpoints/checkpoint_best.pt"
     $FinalHtml = "training/runs/model_comparisons/model_comparison.html"
     & $Python $Visualize --checkpoint-path $FinalCkpt --output-path $FinalHtml --device cuda
 

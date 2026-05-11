@@ -51,7 +51,9 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
 
    This trains a fresh transition autoencoder, a K=1 model warmup, a K=1
    low-learning-rate polish, then a K=2/4/8 autoregressive model. It does not
-   load any older model checkpoints.
+   load any older model checkpoints. By default it refreshes the HTML viewer
+   once after training; pass `-LiveViewer -SaveLiveEveryEpochs 20` if you want
+   live HTML updates during the autoregressive stage.
 
 ## Dependencies
 
