@@ -24,6 +24,8 @@ training/runs_archived*/
 events.out.tfevents.*
 tensorboard_stdout.log
 tensorboard_stderr.log
+viewer_server_stdout.log
+viewer_server_stderr.log
 console.log
 console.err.log
 pipeline_stdout.log
