@@ -1,4 +1,7 @@
 param(
+    [string]$FbxPath = "ue5/example_cascadeur",
+    [string]$NpzFinalPath = "",
+    [switch]$RebuildNpzFinal,
     [int]$HiddenDim = 512,
     [int]$LatentDim = 64,
     [int]$BatchSize = 64,
@@ -26,11 +29,36 @@ $TimingPath = Join-Path $Runs "$Prefix`_timing.csv"
 $AETrain = Join-Path $Root "training\transition_autoencoder_deltas.py"
 $ModelTrain = Join-Path $Root "training\train_locomotion_ae_prior_deltas.py"
 $Visualize = Join-Path $Root "training\visualize_model.py"
+$EnsureNpzFinal = Join-Path $Root "fbx_npz_pipeline\ensure_npz_final.ps1"
 
 Push-Location $Root
 try {
     New-Item -ItemType Directory -Force -Path $Runs | Out-Null
     "stage,run_name,start_local,end_local,seconds" | Set-Content -LiteralPath $TimingPath
+
+    if ($NpzFinalPath -ne "") {
+        $DatasetPath = (Resolve-Path -LiteralPath $NpzFinalPath).Path
+    }
+    else {
+        $EnsureArgs = @("-FbxPath", $FbxPath)
+        if ($RebuildNpzFinal) {
+            $EnsureArgs += "-Force"
+        }
+        $EnsureOutput = & $EnsureNpzFinal @EnsureArgs
+        $EnsureOutput | ForEach-Object { Write-Output $_ }
+        $DatasetLine = $EnsureOutput | Where-Object { $_ -like "NPZ_FINAL_DIR=*" } | Select-Object -Last 1
+        if (-not $DatasetLine) {
+            throw "Could not resolve npz_final folder from $FbxPath"
+        }
+        $DatasetPath = $DatasetLine.Substring("NPZ_FINAL_DIR=".Length)
+    }
+    $DatasetNpzs = @(Get-ChildItem -LiteralPath $DatasetPath -Filter *.npz -File | Sort-Object Name)
+    if ($DatasetNpzs.Count -eq 0) {
+        throw "No .npz files found in dataset folder: $DatasetPath"
+    }
+    $ViewerNpz = $DatasetNpzs[0].FullName
+    Write-Output "dataset_npz_final=$DatasetPath"
+    Write-Output "viewer_npz=$ViewerNpz"
 
     function Run-Stage {
         param(
@@ -71,7 +99,7 @@ try {
 
     Run-Stage "transition_ae" $AERun @(
         $AETrain,
-        "--folder-path", "data/npz_final",
+        "--folder-path", $DatasetPath,
         "--run-name", $AERun,
         "--latent-dim", "$LatentDim",
         "--hidden-dim", "$HiddenDim",
@@ -87,7 +115,7 @@ try {
 
     Run-Stage "model_k1_warmup" $K1WarmupRun @(
         $ModelTrain,
-        "--folder-path", "data/npz_final",
+        "--folder-path", $DatasetPath,
         "--prior-checkpoint", $AECkpt,
         "--run-name", $K1WarmupRun,
         "--hidden-dim", "$HiddenDim",
@@ -105,7 +133,7 @@ try {
 
     Run-Stage "model_k1_polish" $K1PolishRun @(
         $ModelTrain,
-        "--folder-path", "data/npz_final",
+        "--folder-path", $DatasetPath,
         "--prior-checkpoint", $AECkpt,
         "--resume-checkpoint", $K1WarmupCkpt,
         "--run-name", $K1PolishRun,
@@ -124,7 +152,7 @@ try {
 
     $AutoregArgs = @(
         $ModelTrain,
-        "--folder-path", "data/npz_final",
+        "--folder-path", $DatasetPath,
         "--prior-checkpoint", $AECkpt,
         "--resume-checkpoint", $K1PolishCkpt,
         "--run-name", $AutoregRun,
@@ -138,6 +166,7 @@ try {
         "--max-epochs", "$AutoregEpochs",
         "--max-train-seconds", "$AutoregSeconds",
         "--save-live-every-epochs", "$SaveLiveEveryEpochs",
+        "--live-npz-path", $ViewerNpz,
         "--best-metric", "joint_rmse",
         "--device", "cuda"
     )
@@ -148,8 +177,10 @@ try {
 
     $FinalCkpt = "training/runs/$AutoregRun/checkpoints/checkpoint_best.pt"
     $FinalHtml = "training/runs/model_comparisons/model_comparison.html"
-    & $Python $Visualize --checkpoint-path $FinalCkpt --output-path $FinalHtml --device cuda
+    & $Python $Visualize --npz-path $ViewerNpz --checkpoint-path $FinalCkpt --output-path $FinalHtml --device cuda
 
+    Write-Output "fbx_path=$FbxPath"
+    Write-Output "npz_final=$DatasetPath"
     Write-Output "ae_run=$AERun"
     Write-Output "k1_warmup_run=$K1WarmupRun"
     Write-Output "k1_polish_run=$K1PolishRun"

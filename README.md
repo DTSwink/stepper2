@@ -23,11 +23,24 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
 
 ## Typical Flow
 
-1. Convert FBX files into NPZ and final stripped NPZ:
+1. Put source FBX files in a dataset folder. By default the training runner
+   uses:
 
    ```powershell
-   .\fbx_npz_pipeline\convert_fbx_to_npz.ps1
+   .\ue5\example_cascadeur
    ```
+
+   The runner looks for `npz_final` inside that FBX folder. If it is missing,
+   it automatically creates sibling `npz`, `npz_final`, and `reports` folders
+   with the FBX-to-NPZ pipeline.
+
+   To build or rebuild that folder manually:
+
+   ```powershell
+   .\fbx_npz_pipeline\ensure_npz_final.ps1 -FbxPath .\ue5\example_cascadeur
+   ```
+
+   Add `-Force` to rebuild an existing `npz_final` folder.
 
 2. Visualize an NPZ:
 
@@ -41,15 +54,25 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
    .\run_training.ps1
    ```
 
+   To train from another FBX dataset folder:
+
+   ```powershell
+   .\run_training.ps1 -FbxPath .\ue5\animations
+   ```
+
+   Add `-RebuildNpzFinal` if you want training to regenerate the derived NPZ
+   files from the FBX source before starting.
+
    This delegates to:
 
    ```powershell
    .\training\run_delta_ae_scratch.ps1
    ```
 
-   It does not load any older model checkpoints. By default it refreshes the
-   HTML viewer once after training; pass `-LiveViewer -SaveLiveEveryEpochs 20`
-   if you want live HTML updates during the autoregressive stage.
+   It does not load any older model checkpoints. By default it uses
+   `<FbxPath>\npz_final` and refreshes the HTML viewer once after training; pass
+   `-LiveViewer -SaveLiveEveryEpochs 20` if you want live HTML updates during
+   the autoregressive stage.
 
 4. Optional: run the older fast supervised setup:
 
