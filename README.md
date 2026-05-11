@@ -43,6 +43,16 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
    python .\training\visualize_best.py
    ```
 
+5. Reproduce the scratch delta-AE prior experiment:
+
+   ```powershell
+   .\training\run_delta_ae_scratch.ps1
+   ```
+
+   This trains a fresh transition autoencoder, a K=1 model warmup, a K=1
+   low-learning-rate polish, then a K=2/4/8 autoregressive model. It does not
+   load any older model checkpoints.
+
 ## Dependencies
 
 Install the Python dependencies listed in `training/requirements.txt`. Autodesk FBX SDK Python bindings are required for FBX import/export.
