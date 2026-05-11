@@ -48,6 +48,21 @@ TensorBoard:
 .\.tools\python310\Scripts\tensorboard.exe --logdir .\training\runs
 ```
 
+Refresh-on-demand model viewer:
+
+```powershell
+.\.tools\python310\python.exe .\training\live_model_viewer_server.py --run-dir .\training\runs\YOUR_RUN_NAME --checkpoint-name checkpoint_last.pt
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8017/model_comparison.html
+```
+
+The HTML is regenerated only when the browser requests or refreshes that URL,
+so training no longer pays the cost of repeatedly rendering the viewer.
+
 Checkpoints are written to:
 
 ```text
