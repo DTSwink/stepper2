@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # Put your NPZ folder path here. Relative paths are resolved from the stepper
 # project root, not from the current shell directory.
-folder_path = "data/npz_final"
+folder_path = "data/fbx/npz_final"
 
 import argparse
 import math
@@ -20,6 +20,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+import body_mass
+import contact_physics as cp
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -61,9 +64,9 @@ class TrainConfig:
     max_train_seconds: float = 0.0
     profile_timing: bool = False
     profile_sync_cuda: bool = False
-    disable_validation: bool = False
+    disable_validation: bool = True
 
-    rollout_schedule: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
+    rollout_schedule: tuple[int, ...] = (1, 2, 4, 8)
     curriculum_threshold: float = 1e-3
     curriculum_min_epochs: int = 0
     curriculum_max_epochs_per_stage: int = 0
@@ -79,6 +82,24 @@ class TrainConfig:
     alpha4_end_effector_location: float = 10.0
     alpha5_end_effector_rotation: float = 0.5
     alpha6_full_body_location: float = 1.0
+    alpha7_contact_label: float = 10.0
+    alpha8_foot_penetration: float = 8000.0
+    alpha9_foot_sliding: float = 2.0
+    alpha10_freefall: float = 0.0
+    alpha11_contact_height: float = 3000.0
+    alpha12_termination: float = 0.0
+    enable_contact_physics_losses: bool = False
+    use_contact_state: bool = False
+    zero_contact_state: bool = False
+    training_loop: str = "sampled"
+    agent_sampling: str = "random"
+    enable_early_termination: bool = False
+    restart_on_termination: bool = True
+    freefall_body_height_offset_m: float = 0.0
+    freefall_initial_offset_history: int = 1
+    freefall_initial_contacts_off: bool = True
+    enable_freefall_termination: bool = False
+    ae_loss_weight: float = 1.0
 
     end_effector_bones: tuple[str, ...] = ("foot_l", "ball_l", "foot_r", "ball_r")
     exclude_bone_prefixes: tuple[str, ...] = ("ik_", "weapon_")
@@ -155,6 +176,22 @@ def geodesic_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.acos(cos).mean()
 
 
+def geodesic_angles(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Row-vector relative rotation: R_delta = pred * target^-1 = pred * target^T.
+    delta = pred @ target.transpose(-1, -2)
+    trace = delta.diagonal(dim1=-1, dim2=-2).sum(dim=-1)
+    cos = ((trace - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    return torch.acos(cos)
+
+
+def weighted_batch_mean(values: torch.Tensor, sample_weight: torch.Tensor | None = None) -> torch.Tensor:
+    per_sample = values.reshape(values.shape[0], -1).mean(dim=-1)
+    if sample_weight is None:
+        return per_sample.mean()
+    weights = sample_weight.to(device=values.device, dtype=values.dtype)
+    return (per_sample * weights).sum() / weights.sum().clamp_min(1.0)
+
+
 def yaw_to_row_matrix(yaw: torch.Tensor) -> torch.Tensor:
     c = torch.cos(yaw)
     s = torch.sin(yaw)
@@ -222,6 +259,15 @@ class MotionClip:
                 raise ValueError(f"{path} is missing end effector bone {name!r}")
             self.end_effectors.append(self.body_names.index(name))
         self.end_effectors_tensor = torch.tensor(self.end_effectors, dtype=torch.long)
+        self.foot_indices = []
+        self.toe_indices = []
+        for foot_name, toe_name in (("foot_l", "ball_l"), ("foot_r", "ball_r")):
+            if foot_name not in self.body_names or toe_name not in self.body_names:
+                raise ValueError(f"{path} is missing contact bones {foot_name!r}/{toe_name!r}")
+            self.foot_indices.append(self.body_names.index(foot_name))
+            self.toe_indices.append(self.body_names.index(toe_name))
+        self.foot_indices_tensor = torch.tensor(self.foot_indices, dtype=torch.long)
+        self.toe_indices_tensor = torch.tensor(self.toe_indices, dtype=torch.long)
 
         full_to_body = {full_i: body_i for body_i, full_i in enumerate(self.keep_full)}
         parents_body = []
@@ -266,6 +312,11 @@ class MotionClip:
         self.pelvis_local_pos = lcl_translation_full[:, self.keep_full[self.pelvis]]
         self.pelvis_rot6 = self.local_rot6[:, self.pelvis]
         self.non_pelvis_rot6 = self.local_rot6[:, self.non_pelvis]
+        if "contacts" in arrays.files:
+            self.contacts = torch.tensor(arrays["contacts"], dtype=torch.float32)
+        else:
+            self.contacts = torch.zeros((self.T if hasattr(self, "T") else global_pos_full.shape[0], 2), dtype=torch.float32)
+        self.mass_weights = torch.tensor(body_mass.bone_masses_for_names(self.body_names), dtype=torch.float32)
 
         root_delta = self.global_pos - self.root_pos[:, None, :]
         self.canonical_pos = torch.einsum("tjc,tdc->tjd", root_delta, self.root_heading_rot)
@@ -283,6 +334,7 @@ class MotionClip:
             "pelvis_rot6": self.pelvis_rot6[idx],
             "nonpelvis_rot6": self.non_pelvis_rot6[idx],
             "canon_pos": self.canonical_pos[idx],
+            "contacts": self.contacts[idx],
         }
 
     def tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
@@ -301,7 +353,11 @@ class MotionClip:
                 "pelvis_rot6": self.pelvis_rot6.to(device),
                 "non_pelvis_rot6": self.non_pelvis_rot6.to(device),
                 "canonical_pos": self.canonical_pos.to(device),
+                "contacts": self.contacts.to(device),
+                "mass_weights": self.mass_weights.to(device),
                 "end_effectors": self.end_effectors_tensor.to(device),
+                "foot_indices": self.foot_indices_tensor.to(device),
+                "toe_indices": self.toe_indices_tensor.to(device),
             }
             self._device_cache[key] = cached
         return cached
@@ -356,17 +412,22 @@ class MLPController(nn.Module):
         return self.net(x)
 
 
-def body_pose_vector(pose: dict[str, torch.Tensor]) -> torch.Tensor:
+def body_pose_vector(
+    pose: dict[str, torch.Tensor],
+    include_contacts: bool = True,
+    zero_contacts: bool = False,
+) -> torch.Tensor:
     b = pose["pelvis_pos"].shape[0]
-    return torch.cat(
-        (
-            pose["pelvis_pos"],
-            pose["pelvis_rot6"],
-            pose["canon_pos"].reshape(b, -1),
-            pose["nonpelvis_rot6"].reshape(b, -1),
-        ),
-        dim=-1,
-    )
+    parts = [
+        pose["pelvis_pos"],
+        pose["pelvis_rot6"],
+        pose["canon_pos"].reshape(b, -1),
+        pose["nonpelvis_rot6"].reshape(b, -1),
+    ]
+    if include_contacts:
+        contacts = torch.zeros_like(pose["contacts"]) if zero_contacts else pose["contacts"]
+        parts.append(contacts)
+    return torch.cat(parts, dim=-1)
 
 
 def output_to_pose(raw: torch.Tensor, clip: MotionClip) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -376,7 +437,11 @@ def output_to_pose(raw: torch.Tensor, clip: MotionClip) -> tuple[dict[str, torch
     cursor += 3
     pelvis_rot6_raw = raw[:, cursor : cursor + 6]
     cursor += 6
-    nonpelvis_rot6_raw = raw[:, cursor:].reshape(b, clip.Jn, 6)
+    nonpelvis_end = cursor + clip.Jn * 6
+    nonpelvis_rot6_raw = raw[:, cursor:nonpelvis_end].reshape(b, clip.Jn, 6)
+    cursor = nonpelvis_end
+    contact_logits = raw[:, cursor : cursor + 2]
+    contacts = torch.sigmoid(contact_logits)
 
     pelvis_rot6 = clean_6d(pelvis_rot6_raw)
     nonpelvis_rot6 = clean_6d(nonpelvis_rot6_raw.reshape(-1, 6)).reshape(b, clip.Jn, 6)
@@ -384,10 +449,13 @@ def output_to_pose(raw: torch.Tensor, clip: MotionClip) -> tuple[dict[str, torch
         "pelvis_pos": pelvis_pos,
         "pelvis_rot6": pelvis_rot6,
         "nonpelvis_rot6": nonpelvis_rot6,
+        "contacts": contacts,
+        "contact_logits": contact_logits,
     }
     raw_pose = {
         "pelvis_rot6": pelvis_rot6_raw,
         "nonpelvis_rot6": nonpelvis_rot6_raw,
+        "contact_logits": contact_logits,
     }
     return clean_pose, raw_pose
 
@@ -399,6 +467,7 @@ def pose_target_output(pose: dict[str, torch.Tensor]) -> torch.Tensor:
             pose["pelvis_pos"],
             pose["pelvis_rot6"],
             pose["nonpelvis_rot6"].reshape(b, -1),
+            pose["contacts"],
         ),
         dim=-1,
     )
@@ -412,7 +481,8 @@ def predict_next_raw(
 ) -> torch.Tensor:
     raw = model(inp)
     if cfg.predict_residual:
-        raw = pose_target_output(cur_pose) + raw
+        pose_dim = 3 + 6 + cur_pose["nonpelvis_rot6"].shape[1] * 6
+        raw = torch.cat((pose_target_output(cur_pose)[:, :pose_dim] + raw[:, :pose_dim], raw[:, pose_dim:]), dim=-1)
     return raw
 
 
@@ -453,6 +523,54 @@ def fk_from_pose(
     heading = yaw_to_row_matrix(root_yaw)
     canon = torch.einsum("bjc,bdc->bjd", global_pos - root_pos[:, None, :], heading)
     return global_pos, global_rot, canon
+
+
+def clone_pose(pose: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.clone() for key, value in pose.items()}
+
+
+def apply_initial_body_height_offset(
+    clip: MotionClip,
+    pose: dict[str, torch.Tensor],
+    idx: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    offset = float(cfg.freefall_body_height_offset_m)
+    if offset == 0.0:
+        return pose
+    out = clone_pose(pose)
+    tensors = clip.tensors(device)
+    idx_device = idx.to(device)
+    root_pos = tensors["root_pos"].index_select(0, idx_device)
+    root_rot = tensors["root_rot"].index_select(0, idx_device)
+    world_delta = torch.zeros((idx_device.shape[0], 3), dtype=out["pelvis_pos"].dtype, device=device)
+    world_delta[:, 1] = offset
+    local_delta = torch.matmul(world_delta.unsqueeze(1), root_rot.transpose(-1, -2)).squeeze(1)
+    out["pelvis_pos"] = out["pelvis_pos"] + local_delta
+    if cfg.freefall_initial_contacts_off:
+        out["contacts"] = torch.zeros_like(out["contacts"])
+    _global_pos, _global_rot, canon = fk_from_pose(clip, root_pos, root_rot, out, device)
+    out["canon_pos"] = canon
+    return out
+
+
+def maybe_apply_initial_offsets(
+    clip: MotionClip,
+    prev_idx: torch.Tensor,
+    cur_idx: torch.Tensor,
+    prev_pose: dict[str, torch.Tensor],
+    cur_pose: dict[str, torch.Tensor],
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    if cfg.freefall_body_height_offset_m == 0.0:
+        return prev_pose, cur_pose
+    history = max(1, int(cfg.freefall_initial_offset_history))
+    if history >= 2:
+        prev_pose = apply_initial_body_height_offset(clip, prev_pose, prev_idx, cfg, device)
+    cur_pose = apply_initial_body_height_offset(clip, cur_pose, cur_idx, cfg, device)
+    return prev_pose, cur_pose
 
 
 def root_delta_feature(clip: MotionClip, prev_idx: torch.Tensor, cur_idx: torch.Tensor, cfg: TrainConfig, device) -> torch.Tensor:
@@ -498,8 +616,8 @@ def build_input(
     cfg: TrainConfig,
     device: torch.device,
 ) -> torch.Tensor:
-    current = body_pose_vector(cur_pose)
-    previous = body_pose_vector(prev_pose)
+    current = body_pose_vector(cur_pose, cfg.use_contact_state, cfg.zero_contact_state)
+    previous = body_pose_vector(prev_pose, cfg.use_contact_state, cfg.zero_contact_state)
     pelvis_vel = (cur_pose["pelvis_pos"] - prev_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
     joint_vel = (cur_pose["canon_pos"] - prev_pose["canon_pos"]).reshape(cur_idx.shape[0], -1) / cfg.pose_delta_scale_final
     root_feat = root_delta_feature(clip, prev_idx, cur_idx, cfg, device)
@@ -515,18 +633,39 @@ def get_pose_from_clip(clip: MotionClip, idx: torch.Tensor, device: torch.device
         "pelvis_rot6": tensors["pelvis_rot6"].index_select(0, idx),
         "nonpelvis_rot6": tensors["non_pelvis_rot6"].index_select(0, idx),
         "canon_pos": tensors["canonical_pos"].index_select(0, idx),
+        "contacts": tensors["contacts"].index_select(0, idx),
+    }
+
+
+def blend_pose_by_mask(
+    primary: dict[str, torch.Tensor],
+    replacement: dict[str, torch.Tensor],
+    use_replacement: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: torch.where(
+            use_replacement.reshape((use_replacement.shape[0],) + (1,) * (value.ndim - 1)),
+            replacement[key],
+            value,
+        )
+        for key, value in primary.items()
     }
 
 
 def compute_losses(
     clip: MotionClip,
+    prev_pose: dict[str, torch.Tensor],
+    cur_pose: dict[str, torch.Tensor],
     pred_pose: dict[str, torch.Tensor],
     raw_pose: dict[str, torch.Tensor],
     target_pose: dict[str, torch.Tensor],
+    prev_idx: torch.Tensor,
+    cur_idx: torch.Tensor,
     target_idx: torch.Tensor,
     cfg: TrainConfig,
     device: torch.device,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    sample_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     b = target_idx.shape[0]
     tensors = clip.tensors(device)
     target_idx_device = target_idx.to(device)
@@ -534,29 +673,110 @@ def compute_losses(
     root_rot = tensors["root_rot"].index_select(0, target_idx_device)
     pred_global_pos, pred_global_rot, pred_canon = fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
 
+    prev_idx_device = prev_idx.to(device)
+    cur_idx_device = cur_idx.to(device)
+    prev_root_pos = tensors["root_pos"].index_select(0, prev_idx_device)
+    prev_root_rot = tensors["root_rot"].index_select(0, prev_idx_device)
+    cur_root_pos = tensors["root_pos"].index_select(0, cur_idx_device)
+    cur_root_rot = tensors["root_rot"].index_select(0, cur_idx_device)
+    prev_global_pos, _prev_global_rot, _prev_canon = fk_from_pose(clip, prev_root_pos, prev_root_rot, prev_pose, device)
+    cur_global_pos, cur_global_rot, _cur_canon = fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
+
     target_global_pos = tensors["global_pos"].index_select(0, target_idx_device)
     target_global_rot = tensors["global_rot"].index_select(0, target_idx_device)
 
-    pelvis_loc = F.huber_loss(pred_pose["pelvis_pos"], target_pose["pelvis_pos"])
-    pelvis_rot = geodesic_loss(
-        rotation_6d_to_matrix(pred_pose["pelvis_rot6"]),
-        rotation_6d_to_matrix(target_pose["pelvis_rot6"]),
+    pelvis_loc = weighted_batch_mean(
+        F.huber_loss(pred_pose["pelvis_pos"], target_pose["pelvis_pos"], reduction="none"), sample_weight
     )
-    pose_rot = geodesic_loss(
+    pelvis_rot = weighted_batch_mean(
+        geodesic_angles(
+            rotation_6d_to_matrix(pred_pose["pelvis_rot6"]), rotation_6d_to_matrix(target_pose["pelvis_rot6"])
+        ).unsqueeze(-1),
+        sample_weight,
+    )
+    pose_rot_angles = geodesic_angles(
         rotation_6d_to_matrix(pred_pose["nonpelvis_rot6"].reshape(-1, 6)),
         rotation_6d_to_matrix(target_pose["nonpelvis_rot6"].reshape(-1, 6)),
-    )
-    pose_aux = F.mse_loss(pred_pose["nonpelvis_rot6"], target_pose["nonpelvis_rot6"]) + F.mse_loss(
-        pred_pose["pelvis_rot6"], target_pose["pelvis_rot6"]
+    ).reshape(b, clip.Jn)
+    pose_rot = weighted_batch_mean(pose_rot_angles, sample_weight)
+    pose_aux = weighted_batch_mean(
+        (pred_pose["nonpelvis_rot6"] - target_pose["nonpelvis_rot6"]).square(), sample_weight
+    ) + weighted_batch_mean(
+        (pred_pose["pelvis_rot6"] - target_pose["pelvis_rot6"]).square(), sample_weight
     )
     ee_idx = tensors["end_effectors"]
     ee_delta = pred_global_pos.index_select(1, ee_idx) - target_global_pos.index_select(1, ee_idx)
-    ee_loc = (ee_delta.square().sum(dim=-1)).mean()
-    ee_rot = geodesic_loss(
+    ee_loc = weighted_batch_mean(ee_delta.square().sum(dim=-1), sample_weight)
+    ee_rot = weighted_batch_mean(
+        geodesic_angles(
         pred_global_rot.index_select(1, ee_idx).reshape(-1, 3, 3),
         target_global_rot.index_select(1, ee_idx).reshape(-1, 3, 3),
+        ).reshape(b, -1),
+        sample_weight,
     )
-    full_body_loc = pred_global_pos.sub(target_global_pos).square().sum(dim=-1).mean()
+    full_body_loc = weighted_batch_mean(pred_global_pos.sub(target_global_pos).square().sum(dim=-1), sample_weight)
+    contact_prob = pred_pose["contacts"]
+    zero = pred_pose["pelvis_pos"].new_zeros(())
+    contact_label = zero
+    foot_penetration = zero
+    foot_sliding = zero
+    contact_height = zero
+    freefall = zero
+    termination = zero
+    term_mask = torch.zeros((b,), dtype=torch.bool, device=device)
+    term_severity = torch.zeros((b,), dtype=pred_pose["pelvis_pos"].dtype, device=device)
+    foot_heights = torch.zeros((b, 2), dtype=pred_pose["pelvis_pos"].dtype, device=device)
+    foot_speeds = torch.zeros_like(foot_heights)
+    freefall_rel = torch.zeros((b,), dtype=pred_pose["pelvis_pos"].dtype, device=device)
+
+    if cfg.enable_contact_physics_losses:
+        contact_label = weighted_batch_mean(
+            F.binary_cross_entropy_with_logits(raw_pose["contact_logits"], target_pose["contacts"], reduction="none"),
+            sample_weight,
+        )
+
+    need_foot_geometry = (
+        cfg.enable_early_termination
+        or cfg.alpha12_termination != 0.0
+        or (
+            cfg.enable_contact_physics_losses
+            and (cfg.alpha8_foot_penetration != 0.0 or cfg.alpha9_foot_sliding != 0.0 or cfg.alpha11_contact_height != 0.0)
+        )
+    )
+    need_freefall = cfg.alpha10_freefall != 0.0 or cfg.enable_freefall_termination
+    geom = cp.DEFAULT_GEOMETRY
+    if need_foot_geometry:
+        geom = cp.DEFAULT_GEOMETRY
+        foot_indices = tuple(clip.foot_indices)
+        toe_indices = tuple(clip.toe_indices)
+        foot_heights, _lowest_points = cp.foot_lowest_heights_and_points(
+            pred_global_pos, pred_global_rot, foot_indices, toe_indices, geom
+        )
+        foot_speeds = cp.foot_slide_speeds(
+            cur_global_pos, cur_global_rot, pred_global_pos, pred_global_rot, foot_indices, toe_indices, clip.fps, geom
+        )
+        foot_penetration = weighted_batch_mean(F.relu(-foot_heights).square(), sample_weight)
+        foot_sliding = weighted_batch_mean(contact_prob * F.relu(foot_speeds - geom.speed_threshold_mps).square(), sample_weight)
+        contact_height = weighted_batch_mean(contact_prob * F.relu(foot_heights - geom.height_threshold_m).square(), sample_weight)
+
+    if need_freefall:
+        prev_com = cp.center_of_mass(prev_global_pos, tensors["mass_weights"])
+        cur_com = cp.center_of_mass(cur_global_pos, tensors["mass_weights"])
+        pred_com = cp.center_of_mass(pred_global_pos, tensors["mass_weights"])
+        no_contact_prob = (1.0 - contact_prob[:, 0]) * (1.0 - contact_prob[:, 1])
+        _freefall_unweighted, freefall_rel = cp.freefall_loss(prev_com, cur_com, pred_com, no_contact_prob, clip.fps, geom)
+        dt = 1.0 / float(clip.fps)
+        expected_y = cur_com[:, 1] + (cur_com[:, 1] - prev_com[:, 1]) - 0.5 * geom.gravity_mps2 * dt * dt
+        freefall = weighted_batch_mean((no_contact_prob * (pred_com[:, 1] - expected_y).square()).unsqueeze(-1), sample_weight)
+
+    if need_foot_geometry or cfg.enable_early_termination or cfg.alpha12_termination != 0.0:
+        term_mask = cp.termination_mask(
+            foot_heights, foot_speeds, contact_prob, freefall_rel, geom, cfg.enable_freefall_termination
+        )
+        term_severity = cp.termination_severity(
+            foot_heights, foot_speeds, contact_prob, freefall_rel, geom, cfg.enable_freefall_termination
+        )
+        termination = weighted_batch_mean(term_severity.unsqueeze(-1), sample_weight) * float(clip.T)
     total = (
         cfg.alpha0_pelvis_location * pelvis_loc
         + cfg.alpha1_pelvis_rotation * pelvis_rot
@@ -566,6 +786,16 @@ def compute_losses(
         + cfg.alpha5_end_effector_rotation * ee_rot
         + cfg.alpha6_full_body_location * full_body_loc
     )
+    if cfg.enable_contact_physics_losses:
+        total = (
+            total
+            + cfg.alpha7_contact_label * contact_label
+            + cfg.alpha8_foot_penetration * foot_penetration
+            + cfg.alpha9_foot_sliding * foot_sliding
+            + cfg.alpha10_freefall * freefall
+            + cfg.alpha11_contact_height * contact_height
+            + cfg.alpha12_termination * termination
+        )
     losses = {
         "pelvis_location": pelvis_loc.detach(),
         "pelvis_rotation": pelvis_rot.detach(),
@@ -574,14 +804,27 @@ def compute_losses(
         "end_effector_location": ee_loc.detach(),
         "end_effector_rotation": ee_rot.detach(),
         "full_body_location": full_body_loc.detach(),
+        "contact_label": contact_label.detach(),
+        "foot_penetration": foot_penetration.detach(),
+        "foot_sliding": foot_sliding.detach(),
+        "contact_height": contact_height.detach(),
+        "freefall": freefall.detach(),
+        "termination": termination.detach(),
+        "termination_rate": term_mask.float().mean().detach(),
+        "termination_severity": term_severity.detach().mean(),
+        "contact_prob_mean": contact_prob.detach().mean(),
+        "foot_height_min": foot_heights.detach().amin(),
+        "foot_speed_mean": foot_speeds.detach().mean(),
+        "freefall_relative_error": freefall_rel.detach().mean(),
     }
     next_pose = {
         "pelvis_pos": pred_pose["pelvis_pos"],
         "pelvis_rot6": pred_pose["pelvis_rot6"],
         "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
         "canon_pos": pred_canon,
+        "contacts": pred_pose["contacts"],
     }
-    return total, losses, next_pose
+    return total, losses, next_pose, term_mask
 
 
 def run_batch(
@@ -605,25 +848,76 @@ def run_batch(
     for ci, rows in groups.items():
         clip = clips[ci]
         row_t = torch.tensor(rows, dtype=torch.long)
-        start = starts[row_t].long()
+        start = starts[row_t].long().to(device)
         prev_idx = start - 1
         cur_idx = start
         prev_pose = get_pose_from_clip(clip, prev_idx, device)
         cur_pose = get_pose_from_clip(clip, cur_idx, device)
+        prev_pose, cur_pose = maybe_apply_initial_offsets(
+            clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device
+        )
+        alive = torch.ones(start.shape[0], device=device)
 
         group_loss = torch.zeros((), device=device)
         for step in range(rollout_k):
+            if cfg.enable_early_termination and not cfg.restart_on_termination and bool((alive <= 0.0).all()):
+                break
             inp = build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
             raw_out = predict_next_raw(model, inp, cur_pose, cfg)
             pred_pose, raw_pose = output_to_pose(raw_out, clip)
             target_idx = cur_idx + 1
             target_pose = get_pose_from_clip(clip, target_idx, device)
-            step_loss, parts, next_pose = compute_losses(
-                clip, pred_pose, raw_pose, target_pose, target_idx, cfg, device
+            step_loss, parts, next_pose, term_mask = compute_losses(
+                clip,
+                prev_pose,
+                cur_pose,
+                pred_pose,
+                raw_pose,
+                target_pose,
+                prev_idx,
+                cur_idx,
+                target_idx,
+                cfg,
+                device,
+                alive if cfg.enable_early_termination else None,
             )
             group_loss = group_loss + step_loss / rollout_k
             for key, value in parts.items():
                 accum[key] = accum.get(key, torch.zeros((), device=device)) + value / rollout_k
+            if cfg.enable_early_termination:
+                dead = term_mask.detach()
+                if cfg.restart_on_termination and step + 1 < rollout_k and bool(dead.any()):
+                    remaining_steps = rollout_k - step - 1
+                    max_start = max(1, clip.T - 1 - remaining_steps)
+                    restart_start = torch.randint(1, max_start + 1, cur_idx.shape, device=device)
+                    restart_prev_idx = restart_start - 1
+                    restart_cur_idx = restart_start
+                    restart_prev_pose = get_pose_from_clip(clip, restart_prev_idx, device)
+                    restart_cur_pose = get_pose_from_clip(clip, restart_cur_idx, device)
+                    restart_prev_pose, restart_cur_pose = maybe_apply_initial_offsets(
+                        clip,
+                        restart_prev_idx,
+                        restart_cur_idx,
+                        restart_prev_pose,
+                        restart_cur_pose,
+                        cfg,
+                        device,
+                    )
+                    prev_pose = blend_pose_by_mask(
+                        cur_pose,
+                        restart_prev_pose,
+                        dead,
+                    )
+                    cur_pose = blend_pose_by_mask(
+                        next_pose,
+                        restart_cur_pose,
+                        dead,
+                    )
+                    prev_idx = torch.where(dead, restart_prev_idx, cur_idx)
+                    cur_idx = torch.where(dead, restart_cur_idx, target_idx)
+                    alive = torch.ones_like(alive)
+                    continue
+                alive = alive * (~dead).to(device=device, dtype=alive.dtype)
             prev_pose = cur_pose
             cur_pose = next_pose
             prev_idx = cur_idx
@@ -651,10 +945,10 @@ def load_clips(folder: Path, cfg: TrainConfig) -> list[MotionClip]:
 
 
 def make_batch_dims(clip: MotionClip, cfg: TrainConfig) -> tuple[int, int]:
-    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6
+    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6 + (2 if cfg.use_contact_state else 0)
     velocity_dim = 3 + clip.J * 3
     input_dim = pose_dim * 2 + velocity_dim + 3 + cfg.future_window * 4
-    output_dim = 3 + 6 + clip.Jn * 6
+    output_dim = 3 + 6 + clip.Jn * 6 + 2
     return input_dim, output_dim
 
 
@@ -780,9 +1074,44 @@ def train(args: argparse.Namespace) -> None:
         cfg.curriculum_stall_patience_epochs = args.curriculum_stall_patience_epochs
     if args.curriculum_min_delta is not None:
         cfg.curriculum_min_delta = args.curriculum_min_delta
-    cfg.stop_on_final_stall = not args.no_stop_on_final_stall
+    if args.stop_on_final_stall is not None:
+        cfg.stop_on_final_stall = bool(args.stop_on_final_stall)
     if args.alpha6_full_body_location is not None:
         cfg.alpha6_full_body_location = args.alpha6_full_body_location
+    if args.alpha7_contact_label is not None:
+        cfg.alpha7_contact_label = args.alpha7_contact_label
+    if args.alpha8_foot_penetration is not None:
+        cfg.alpha8_foot_penetration = args.alpha8_foot_penetration
+    if args.alpha9_foot_sliding is not None:
+        cfg.alpha9_foot_sliding = args.alpha9_foot_sliding
+    if args.alpha10_freefall is not None:
+        cfg.alpha10_freefall = args.alpha10_freefall
+    if args.alpha11_contact_height is not None:
+        cfg.alpha11_contact_height = args.alpha11_contact_height
+    if args.alpha12_termination is not None:
+        cfg.alpha12_termination = args.alpha12_termination
+    if args.contact_physics_losses is not None:
+        cfg.enable_contact_physics_losses = bool(args.contact_physics_losses)
+    if args.contact_state is not None:
+        cfg.use_contact_state = bool(args.contact_state)
+    if args.zero_contact_state:
+        cfg.zero_contact_state = True
+    if args.training_loop is not None:
+        cfg.training_loop = args.training_loop
+    if args.agent_sampling is not None:
+        cfg.agent_sampling = args.agent_sampling
+    if args.enable_early_termination:
+        cfg.enable_early_termination = True
+    if args.no_restart_on_termination:
+        cfg.restart_on_termination = False
+    if args.freefall_body_height_offset_m is not None:
+        cfg.freefall_body_height_offset_m = args.freefall_body_height_offset_m
+    if args.freefall_initial_offset_history is not None:
+        cfg.freefall_initial_offset_history = max(1, int(args.freefall_initial_offset_history))
+    if args.freefall_initial_contacts_off is not None:
+        cfg.freefall_initial_contacts_off = bool(args.freefall_initial_contacts_off)
+    if args.no_freefall_termination:
+        cfg.enable_freefall_termination = False
     if args.alpha4_end_effector_location is not None:
         cfg.alpha4_end_effector_location = args.alpha4_end_effector_location
     if args.alpha0_pelvis_location is not None:
@@ -818,7 +1147,8 @@ def train(args: argparse.Namespace) -> None:
         cfg.max_train_seconds = args.max_train_seconds
     cfg.profile_timing = args.profile_timing
     cfg.profile_sync_cuda = args.profile_sync_cuda
-    cfg.disable_validation = args.no_validation
+    if args.validation is not None:
+        cfg.disable_validation = not bool(args.validation)
     set_seed(cfg.seed)
 
     npz_folder = resolve_path(args.folder_path or folder_path)
@@ -844,6 +1174,54 @@ def train(args: argparse.Namespace) -> None:
             val_ds = MotionIndexDataset(clips, cfg, "val", max_rollout)
             val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
         return train_loader, val_loader
+
+    agent_clip_indices: torch.Tensor | None = None
+    agent_starts: torch.Tensor | None = None
+    agent_rng = random.Random(cfg.seed + 7919)
+    agent_coverage_order: list[tuple[int, int]] = []
+    agent_coverage_cursor = 0
+
+    def random_agent_start(max_rollout: int) -> tuple[int, int]:
+        ci = agent_rng.randrange(len(clips))
+        max_start = max(1, clips[ci].T - max_rollout - 1)
+        return ci, agent_rng.randint(1, max_start)
+
+    def reset_agent_coverage_order() -> None:
+        nonlocal agent_coverage_order, agent_coverage_cursor
+        agent_coverage_order = list(train_loader.dataset.items)
+        agent_rng.shuffle(agent_coverage_order)
+        agent_coverage_cursor = 0
+
+    def coverage_agent_start() -> tuple[int, int]:
+        nonlocal agent_coverage_cursor
+        if not agent_coverage_order or agent_coverage_cursor >= len(agent_coverage_order):
+            reset_agent_coverage_order()
+        item = agent_coverage_order[agent_coverage_cursor]
+        agent_coverage_cursor += 1
+        return item
+
+    def reset_agent_state(max_rollout: int) -> None:
+        nonlocal agent_clip_indices, agent_starts
+        clip_ids = []
+        starts = []
+        count = cfg.batch_size
+        if cfg.agent_sampling == "coverage":
+            count = min(cfg.batch_size, len(train_loader.dataset.items))
+        for _ in range(count):
+            if cfg.agent_sampling == "coverage":
+                ci, start = coverage_agent_start()
+            else:
+                ci, start = random_agent_start(max_rollout)
+            clip_ids.append(ci)
+            starts.append(start)
+        agent_clip_indices = torch.tensor(clip_ids, dtype=torch.long)
+        agent_starts = torch.tensor(starts, dtype=torch.long)
+
+    def current_agent_batch() -> tuple[torch.Tensor, torch.Tensor]:
+        if agent_clip_indices is None or agent_starts is None:
+            reset_agent_state(rollout_k)
+        assert agent_clip_indices is not None and agent_starts is not None
+        return agent_clip_indices.clone(), agent_starts.clone()
 
     with profiler.section("setup/model_optimizer_compile"):
         input_dim, output_dim = make_batch_dims(clips[0], cfg)
@@ -883,6 +1261,10 @@ def train(args: argparse.Namespace) -> None:
         "pelvis_index": clips[0].pelvis,
         "non_pelvis_indices": clips[0].non_pelvis,
         "end_effector_indices": clips[0].end_effectors,
+        "foot_indices": clips[0].foot_indices,
+        "toe_indices": clips[0].toe_indices,
+        "contact_output": True,
+        "body_mass_weights": clips[0].mass_weights.tolist(),
         "input_dim": input_dim,
         "output_dim": output_dim,
         "compile_enabled": compile_enabled,
@@ -895,8 +1277,17 @@ def train(args: argparse.Namespace) -> None:
     rollout_k = schedule[rollout_idx]
     with profiler.section("setup/build_dataloaders"):
         train_loader, val_loader = make_loaders(rollout_k)
+    if cfg.training_loop == "agents":
+        reset_agent_state(rollout_k)
     val_sample_text = "disabled" if val_loader is None else str(len(val_loader.dataset))
-    print(f"rollout_k={rollout_k} train_samples={len(train_loader.dataset)} val_samples={val_sample_text}")
+    if cfg.training_loop == "agents":
+        train_sample_text = (
+            f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
+            f"({cfg.agent_sampling})"
+        )
+    else:
+        train_sample_text = str(len(train_loader.dataset))
+    print(f"rollout_k={rollout_k} train_samples={train_sample_text} val_samples={val_sample_text}")
     stage_start_epoch = 1
     stable_epochs = 0
     stall_epochs = 0
@@ -922,7 +1313,8 @@ def train(args: argparse.Namespace) -> None:
         epoch_start = time.perf_counter()
         model.train()
         train_parts = []
-        pbar = tqdm(train_loader, desc=f"epoch {epoch} train K={rollout_k}", leave=False, disable=not cfg.show_progress)
+        train_iter = [current_agent_batch()] if cfg.training_loop == "agents" else train_loader
+        pbar = tqdm(train_iter, desc=f"epoch {epoch} train K={rollout_k}", leave=False, disable=not cfg.show_progress)
         for batch in pbar:
             with profiler.section("train/zero_grad"):
                 optimizer.zero_grad(set_to_none=True)
@@ -934,6 +1326,8 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             with profiler.section("train/optimizer_step"):
                 optimizer.step()
+            if cfg.training_loop == "agents":
+                reset_agent_state(rollout_k)
             train_parts.append(scalars)
             if cfg.show_progress:
                 pbar.set_postfix(loss=f"{scalars['total']:.4f}")
@@ -963,7 +1357,7 @@ def train(args: argparse.Namespace) -> None:
         with profiler.section("logging/tensorboard_scalars"):
             writer.add_scalar("loss/train_total", train_total, epoch)
             writer.add_scalar("loss/validation_total", val_total, epoch)
-            for key in (
+            loss_log_keys = [
                 "pelvis_location",
                 "pelvis_rotation",
                 "pose_rotation",
@@ -971,7 +1365,22 @@ def train(args: argparse.Namespace) -> None:
                 "end_effector_location",
                 "end_effector_rotation",
                 "full_body_location",
-            ):
+            ]
+            if cfg.enable_contact_physics_losses:
+                loss_log_keys.extend([
+                "contact_label",
+                "foot_penetration",
+                "foot_sliding",
+                "contact_height",
+                "contact_prob_mean",
+                "foot_height_min",
+                "foot_speed_mean",
+                ])
+            if cfg.alpha10_freefall != 0.0 or cfg.enable_freefall_termination or cfg.freefall_body_height_offset_m != 0.0:
+                loss_log_keys.extend(["freefall", "freefall_relative_error"])
+            if cfg.alpha12_termination != 0.0 or cfg.enable_early_termination:
+                loss_log_keys.extend(["termination", "termination_rate", "termination_severity"])
+            for key in loss_log_keys:
                 writer.add_scalar(f"loss/train_{key}", mean_scalar(train_parts, key), epoch)
                 writer.add_scalar(f"loss/validation_{key}", mean_scalar(val_parts, key), epoch)
             writer.add_scalar("curriculum/rollout_k", rollout_k, epoch)
@@ -1040,12 +1449,22 @@ def train(args: argparse.Namespace) -> None:
             rollout_k = schedule[rollout_idx]
             with profiler.section("curriculum/rebuild_dataloaders"):
                 train_loader, val_loader = make_loaders(rollout_k)
+            if cfg.training_loop == "agents":
+                reset_agent_coverage_order()
+                reset_agent_state(rollout_k)
             best_val = float("inf")
             stage_start_epoch = epoch + 1
             val_sample_text = "disabled" if val_loader is None else str(len(val_loader.dataset))
+            if cfg.training_loop == "agents":
+                train_sample_text = (
+                    f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
+                    f"({cfg.agent_sampling})"
+                )
+            else:
+                train_sample_text = str(len(train_loader.dataset))
             print(
                 f"advanced rollout_k={rollout_k} reason={reason} "
-                f"train_samples={len(train_loader.dataset)} val_samples={val_sample_text}",
+                f"train_samples={train_sample_text} val_samples={val_sample_text}",
                 flush=True,
             )
             stable_epochs = 0
@@ -1123,7 +1542,7 @@ def main() -> None:
     parser.add_argument("--curriculum-patience-epochs", type=int, default=None)
     parser.add_argument("--curriculum-stall-patience-epochs", type=int, default=None)
     parser.add_argument("--curriculum-min-delta", type=float, default=None)
-    parser.add_argument("--no-stop-on-final-stall", action="store_true")
+    parser.add_argument("--stop-on-final-stall", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--alpha0-pelvis-location", type=float, default=None)
     parser.add_argument("--alpha1-pelvis-rotation", type=float, default=None)
     parser.add_argument("--alpha2-pose-rotation", type=float, default=None)
@@ -1131,6 +1550,23 @@ def main() -> None:
     parser.add_argument("--alpha4-end-effector-location", type=float, default=None)
     parser.add_argument("--alpha5-end-effector-rotation", type=float, default=None)
     parser.add_argument("--alpha6-full-body-location", type=float, default=None)
+    parser.add_argument("--alpha7-contact-label", type=float, default=None)
+    parser.add_argument("--alpha8-foot-penetration", type=float, default=None)
+    parser.add_argument("--alpha9-foot-sliding", type=float, default=None)
+    parser.add_argument("--alpha10-freefall", type=float, default=None)
+    parser.add_argument("--alpha11-contact-height", type=float, default=None)
+    parser.add_argument("--alpha12-termination", type=float, default=None)
+    parser.add_argument("--contact-physics-losses", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--contact-state", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--zero-contact-state", action="store_true")
+    parser.add_argument("--training-loop", choices=("sampled", "agents"), default=None)
+    parser.add_argument("--agent-sampling", choices=("random", "coverage"), default=None)
+    parser.add_argument("--enable-early-termination", action="store_true")
+    parser.add_argument("--no-restart-on-termination", action="store_true")
+    parser.add_argument("--freefall-body-height-offset-m", type=float, default=None)
+    parser.add_argument("--freefall-initial-offset-history", type=int, choices=(1, 2), default=None)
+    parser.add_argument("--freefall-initial-contacts-off", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--no-freefall-termination", action="store_true")
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--num-hidden-layers", type=int, default=None)
     parser.add_argument("--save-last-every-epochs", type=int, default=None)
@@ -1151,9 +1587,10 @@ def main() -> None:
         help="Synchronize CUDA around timed sections for stricter timing. Slower, but more precise.",
     )
     parser.add_argument(
-        "--no-validation",
-        action="store_true",
-        help="Skip validation passes and use train loss for curriculum/checkpoint selection.",
+        "--validation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable validation passes. Disabled by default.",
     )
     train(parser.parse_args())
 

@@ -27,6 +27,16 @@ For GPU training:
 .\.tools\python310\python.exe .\training\train_locomotion.py --device cuda
 ```
 
+Recommended K8 Isaac-style supervised run:
+
+```powershell
+.\.tools\python310\python.exe .\training\train_locomotion.py --folder-path data/fbx/npz_final --device cuda --training-loop agents --agent-sampling coverage --rollout-schedule 1,2,4,8 --max-epochs 320 --batch-size 64 --learning-rate 1e-4 --no-compile
+```
+
+Use `--agent-sampling coverage` for small clips. It resets rollout agents across
+the valid start frames uniformly, which avoids the noisy duplicate/missed starts
+you get from pure random reset on tiny datasets.
+
 `torch.compile` is enabled by default and self-tests before training. If the
 local PyTorch build cannot compile, for example because Triton is unavailable on
 Windows, the trainer prints the reason and falls back to normal eager GPU
@@ -88,3 +98,6 @@ By default, positions are scaled by `position_unit_scale = 0.01`, because the
 FBX/NPZ data is in Unreal-style centimeters while the speed constants are easier
 to reason about in meters/sec. Set it to `1.0` in `TrainConfig` if you want raw
 FBX units.
+
+For experiment notes and known-good run names, see
+`training/EXPERIMENT_JOURNAL.md`.

@@ -72,7 +72,7 @@ def set_seed(seed: int) -> None:
 
 
 def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int]:
-    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6
+    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6 + 2
     velocity_dim = 3 + clip.J * 3
     input_dim, output_dim = tl.make_batch_dims(clip, cfg)
     next_canon_dim = clip.J * 3

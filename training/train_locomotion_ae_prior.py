@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import subprocess
 import sys
@@ -82,16 +83,19 @@ def run_batch_ae(
     for ci, rows in groups.items():
         clip = clips[ci]
         row_t = torch.tensor(rows, dtype=torch.long)
-        start = starts[row_t].long()
+        start = starts[row_t].long().to(device)
         prev_idx = start - 1
         cur_idx = start
         prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
         cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
+        prev_pose, cur_pose = tl.maybe_apply_initial_offsets(
+            clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device
+        )
         group_loss = torch.zeros((), device=device)
-        for _ in range(rollout_k):
+        for step in range(rollout_k):
             inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
             raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
-            pred_pose, _ = tl.output_to_pose(raw_out, clip)
+            pred_pose, raw_pose = tl.output_to_pose(raw_out, clip)
             target_idx = cur_idx + 1
             tensors = clip.tensors(device)
             root_pos = tensors["root_pos"].index_select(0, target_idx.to(device))
@@ -102,12 +106,39 @@ def run_batch_ae(
                 "pelvis_rot6": pred_pose["pelvis_rot6"],
                 "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
                 "canon_pos": pred_canon,
+                "contacts": pred_pose["contacts"],
             }
             features = tae.transition_feature_from_next_pose(
                 clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
             )
             score = ae_score(prior, prior_mean, prior_std, features)
-            group_loss = group_loss + score / rollout_k
+            step_loss = cfg.ae_loss_weight * score
+            term_mask = torch.zeros(cur_idx.shape[0], dtype=torch.bool, device=device)
+            if cfg.enable_contact_physics_losses:
+                target_pose = tl.get_pose_from_clip(clip, target_idx, device)
+                physics_cfg = copy.copy(cfg)
+                physics_cfg.alpha0_pelvis_location = 0.0
+                physics_cfg.alpha1_pelvis_rotation = 0.0
+                physics_cfg.alpha2_pose_rotation = 0.0
+                physics_cfg.alpha3_pose_6d_aux = 0.0
+                physics_cfg.alpha4_end_effector_location = 0.0
+                physics_cfg.alpha5_end_effector_rotation = 0.0
+                physics_cfg.alpha6_full_body_location = 0.0
+                physics_loss, _physics_parts, _physics_next_pose, term_mask = tl.compute_losses(
+                    clip,
+                    prev_pose,
+                    cur_pose,
+                    pred_pose,
+                    raw_pose,
+                    target_pose,
+                    prev_idx,
+                    cur_idx,
+                    target_idx,
+                    physics_cfg,
+                    device,
+                )
+                step_loss = step_loss + physics_loss
+            group_loss = group_loss + step_loss / rollout_k
             scores.append(float(score.detach().cpu()))
             motion_sizes.append(float((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach().cpu()))
             target_pose = tl.get_pose_from_clip(clip, target_idx, device)
@@ -138,6 +169,28 @@ def run_batch_ae(
                     .cpu()
                 )
             )
+            if cfg.enable_early_termination and cfg.restart_on_termination and step + 1 < rollout_k and bool(term_mask.any()):
+                remaining_steps = rollout_k - step - 1
+                max_start = max(1, clip.T - 1 - remaining_steps)
+                restart_start = torch.randint(1, max_start + 1, cur_idx.shape, device=device)
+                restart_prev_idx = restart_start - 1
+                restart_cur_idx = restart_start
+                restart_prev_pose = tl.get_pose_from_clip(clip, restart_prev_idx, device)
+                restart_cur_pose = tl.get_pose_from_clip(clip, restart_cur_idx, device)
+                restart_prev_pose, restart_cur_pose = tl.maybe_apply_initial_offsets(
+                    clip,
+                    restart_prev_idx,
+                    restart_cur_idx,
+                    restart_prev_pose,
+                    restart_cur_pose,
+                    cfg,
+                    device,
+                )
+                prev_pose = tl.blend_pose_by_mask(cur_pose, restart_prev_pose, term_mask)
+                cur_pose = tl.blend_pose_by_mask(next_pose, restart_cur_pose, term_mask)
+                prev_idx = torch.where(term_mask, restart_prev_idx, cur_idx)
+                cur_idx = torch.where(term_mask, restart_cur_idx, target_idx)
+                continue
             prev_pose = cur_pose
             cur_pose = next_pose
             prev_idx = cur_idx
@@ -173,6 +226,19 @@ def train(args: argparse.Namespace) -> None:
     cfg.zero_init_output = args.zero_init_output
     cfg.run_name = args.run_name
     cfg.device = args.device
+    cfg.enable_contact_physics_losses = not args.no_contact_physics_losses
+    cfg.enable_early_termination = args.enable_early_termination
+    cfg.restart_on_termination = not args.no_restart_on_termination
+    cfg.freefall_body_height_offset_m = args.freefall_body_height_offset_m
+    cfg.freefall_initial_offset_history = max(1, int(args.freefall_initial_offset_history))
+    cfg.freefall_initial_contacts_off = bool(args.freefall_initial_contacts_off)
+    cfg.alpha7_contact_label = args.alpha7_contact_label
+    cfg.alpha8_foot_penetration = args.alpha8_foot_penetration
+    cfg.alpha9_foot_sliding = args.alpha9_foot_sliding
+    cfg.alpha10_freefall = args.alpha10_freefall
+    cfg.alpha11_contact_height = args.alpha11_contact_height
+    cfg.alpha12_termination = args.alpha12_termination
+    cfg.ae_loss_weight = args.ae_loss_weight
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
     if cfg.allow_tf32 and device.type == "cuda":
@@ -327,6 +393,19 @@ def main() -> None:
     parser.add_argument("--live-output-path", default="training/runs/model_comparisons/model_comparison.html")
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--no-contact-physics-losses", action="store_true")
+    parser.add_argument("--enable-early-termination", action="store_true")
+    parser.add_argument("--no-restart-on-termination", action="store_true")
+    parser.add_argument("--freefall-body-height-offset-m", type=float, default=0.0)
+    parser.add_argument("--freefall-initial-offset-history", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--freefall-initial-contacts-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--alpha7-contact-label", type=float, default=5.0)
+    parser.add_argument("--alpha8-foot-penetration", type=float, default=1700.0)
+    parser.add_argument("--alpha9-foot-sliding", type=float, default=1.0)
+    parser.add_argument("--alpha10-freefall", type=float, default=1700.0)
+    parser.add_argument("--alpha11-contact-height", type=float, default=245.0)
+    parser.add_argument("--alpha12-termination", type=float, default=0.07)
+    parser.add_argument("--ae-loss-weight", type=float, default=1.0)
     train(parser.parse_args())
 
 

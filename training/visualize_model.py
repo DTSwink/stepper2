@@ -697,6 +697,20 @@ def rollout_model(
     cur_idx = torch.tensor([1], dtype=torch.long)
     prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
     cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
+    prev_pose, cur_pose = tl.maybe_apply_initial_offsets(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
+    if cfg.freefall_body_height_offset_m != 0.0:
+        tensors = clip.tensors(device)
+        prev_root_pos = tensors["root_pos"].index_select(0, prev_idx.to(device))
+        prev_root_rot = tensors["root_rot"].index_select(0, prev_idx.to(device))
+        cur_root_pos = tensors["root_pos"].index_select(0, cur_idx.to(device))
+        cur_root_rot = tensors["root_rot"].index_select(0, cur_idx.to(device))
+        init_prev_pos, init_prev_rot, _ = tl.fk_from_pose(clip, prev_root_pos, prev_root_rot, prev_pose, device)
+        init_cur_pos, init_cur_rot, _ = tl.fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
+        pred_ar_pos[0] = init_prev_pos[0].detach().cpu().numpy()
+        pred_ar_rot[0] = init_prev_rot[0].detach().cpu().numpy()
+        if frame_count > 1:
+            pred_ar_pos[1] = init_cur_pos[0].detach().cpu().numpy()
+            pred_ar_rot[1] = init_cur_rot[0].detach().cpu().numpy()
 
     for target in range(2, frame_count):
         target_idx = torch.tensor([target], dtype=torch.long)
@@ -728,6 +742,7 @@ def rollout_model(
             "pelvis_rot6": pred_pose["pelvis_rot6"],
             "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
             "canon_pos": canon_pos,
+            "contacts": pred_pose["contacts"],
         }
         prev_idx = cur_idx
         cur_idx = target_idx

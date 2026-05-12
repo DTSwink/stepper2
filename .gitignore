@@ -35,6 +35,7 @@ training/*debug*.png
 training/*_test.png
 training/*overlay*.png
 training/viewer_settings_*.png
+training/controller_trajectory_*.png
 
 # Abandoned adversarial experiments kept locally for reference
 training/train_locomotion_amp.py

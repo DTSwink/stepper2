@@ -14,21 +14,28 @@ TransitionAutoencoder = base.TransitionAutoencoder
 
 def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int]:
     velocity_dim = 3 + clip.J * 3
+    contact_dim = 2
     root_dim = 3
     future_dim = cfg.future_window * 4
     rot_delta_dim = clip.J * 6
-    next_velocity_start = velocity_dim + root_dim + future_dim
-    rot_delta_start = next_velocity_start + velocity_dim
+    current_contact_start = velocity_dim
+    root_start = current_contact_start + contact_dim
+    next_velocity_start = root_start + root_dim + future_dim
+    next_contact_start = next_velocity_start + velocity_dim
+    rot_delta_start = next_contact_start + contact_dim
     return {
         "velocity_dim": velocity_dim,
+        "contact_dim": contact_dim,
         "root_dim": root_dim,
         "future_dim": future_dim,
         "next_velocity_dim": velocity_dim,
         "rot_delta_dim": rot_delta_dim,
         "current_velocity_start": 0,
-        "root_start": velocity_dim,
-        "root_end": velocity_dim + root_dim + future_dim,
+        "current_contact_start": current_contact_start,
+        "root_start": root_start,
+        "root_end": root_start + root_dim + future_dim,
         "next_velocity_start": next_velocity_start,
+        "next_contact_start": next_contact_start,
         "rot_delta_start": rot_delta_start,
         "total_dim": rot_delta_start + rot_delta_dim,
     }
@@ -74,10 +81,12 @@ def transition_feature_from_next_pose(
         (
             cur_pelvis_vel,
             cur_joint_vel,
+            cur_pose["contacts"],
             root_feat,
             future_feat,
             next_pelvis_vel,
             next_joint_vel,
+            next_pose["contacts"],
             rot_delta,
         ),
         dim=-1,
@@ -117,9 +126,11 @@ def make_tiers(x_norm: torch.Tensor, schema: dict[str, int]) -> dict[str, torch.
     tier2 = x_norm + 0.05 * torch.randn_like(x_norm) * mask
     tier3 = x_norm + 0.75 * torch.randn_like(x_norm) * mask
     vel_start = schema["next_velocity_start"]
+    next_contact_start = schema["next_contact_start"]
     rot_start = schema["rot_delta_start"]
     statue = x_norm.clone()
     statue[:, vel_start:rot_start] = 0.0
+    statue[:, next_contact_start:rot_start] = x_norm[:, schema["current_contact_start"] : schema["current_contact_start"] + schema["contact_dim"]]
     statue[:, rot_start:] = 0.0
     choose_statue = (torch.arange(x_norm.shape[0], device=x_norm.device)[:, None] % 2) == 0
     tier3 = torch.where(choose_statue, statue, tier3)
