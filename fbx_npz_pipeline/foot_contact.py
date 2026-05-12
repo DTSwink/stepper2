@@ -47,8 +47,10 @@ def canonicalize_rotations(rotations: np.ndarray, up_axis: int) -> np.ndarray:
     rotations = np.asarray(rotations, dtype=np.float32)
     if int(up_axis) != 3:
         return rotations.copy()
-    # Row-vector convention: p_c = p_s P, so R_c = P^-1 R_s P.
-    return (Z_UP_TO_Y_UP.T @ rotations @ Z_UP_TO_Y_UP).copy()
+    # The stored FBX matrices expose basis rows in world coordinates. To convert
+    # those rows from UE/Z-up world axes to our Y-up world axes, transform the
+    # coordinate columns the same way positions are transformed.
+    return (rotations @ Z_UP_TO_Y_UP).copy()
 
 
 def _basis_axes_from_direction(

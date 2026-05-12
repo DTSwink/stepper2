@@ -2950,12 +2950,7 @@ class ModelViewerApp(tk.Tk):
             if hand is None:
                 continue
             center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
-                positions,
-                rotations,
-                hand,
-                name_to_index.get(mid_name),
-                name_to_index.get(parent_name),
-                actor.clip.source_up_axis if actor.clip is not None else 2,
+                positions, rotations, hand, name_to_index.get(mid_name), name_to_index.get(parent_name)
             )
             score = self.collider_box_hit_score(x, y, center, axis_x, axis_y, axis_z, dims)
             if score is not None:
@@ -3615,7 +3610,6 @@ class ModelViewerApp(tk.Tk):
                     hand,
                     name_to_index.get(mid_name),
                     name_to_index.get(parent_name),
-                    actor.clip.source_up_axis if actor.clip is not None else 2,
                     draw_color,
                     alpha,
                 )
@@ -3854,73 +3848,19 @@ class ModelViewerApp(tk.Tk):
         except tk.TclError:
             return DEFAULT_HAND_LENGTH, DEFAULT_HAND_WIDTH, DEFAULT_HAND_HEIGHT
 
-    @staticmethod
-    def basis_axes_from_direction(
-        basis: np.ndarray,
-        direction: np.ndarray,
-        fallback_forward_axis: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        basis = np.asarray(basis, dtype=np.float32)
-        lengths = np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-8)
-        basis = basis / lengths
-        direction = np.asarray(direction, dtype=np.float32)
-        direction_len = float(np.linalg.norm(direction))
-        if direction_len > 1e-8:
-            direction_n = direction / direction_len
-            dots = basis @ direction_n
-            forward_index = int(np.argmax(np.abs(dots)))
-            forward = basis[forward_index].copy()
-            if float(dots[forward_index]) < 0.0:
-                forward *= -1.0
-        else:
-            forward_index = int(fallback_forward_axis)
-            forward = basis[forward_index].copy()
-
-        remaining = [i for i in range(3) if i != forward_index]
-        up_index = max(remaining, key=lambda i: abs(float(basis[i, 1])))
-        up = basis[up_index].copy()
-        if float(up[1]) < 0.0:
-            up *= -1.0
-
-        side = np.cross(up, forward).astype(np.float32)
-        side_len = float(np.linalg.norm(side))
-        if side_len <= 1e-8:
-            side = basis[[i for i in remaining if i != up_index][0]].copy()
-        else:
-            side /= side_len
-        return forward, side, up
-
-    @staticmethod
-    def hand_axes_from_source(
-        basis: np.ndarray,
-        guide: np.ndarray,
-        source_up_axis: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        basis = np.asarray(basis, dtype=np.float32)
-        lengths = np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-8)
-        basis = basis / lengths
-        forward = basis[0].copy()
-        guide = np.asarray(guide, dtype=np.float32)
-        if float(np.linalg.norm(guide)) > 1e-8 and dot3(forward, guide) < 0.0:
-            forward *= -1.0
-        up_axis = 1 if int(source_up_axis) == 3 else 2
-        up = basis[up_axis].copy()
-        side = np.cross(up, forward).astype(np.float32)
-        side_len = float(np.linalg.norm(side))
-        if side_len <= 1e-8:
-            fallback_axis = 2 if up_axis == 1 else 1
-            side = basis[fallback_axis].copy()
-        else:
-            side /= side_len
-        return forward, side, up
-
     def foot_box_specs(
         self, positions: np.ndarray, rotations: np.ndarray, ankle: int, toe: int
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float]]]:
         foot = positions[ankle]
         toe_pos = positions[toe]
+        up = rotations[ankle, 0].copy()
+        forward = rotations[ankle, 1].copy()
+        side_axis = rotations[ankle, 2].copy()
         toe_vector = sub3(toe_pos, foot)
-        forward, side_axis, up = self.basis_axes_from_direction(rotations[ankle], toe_vector, 1)
+        if dot3(forward, toe_vector) < 0:
+            forward = mul3(forward, -1)
+        if float(up[1]) < 0:
+            up = mul3(up, -1)
         ball_distance = max(0.10, min(0.28, abs(dot3(toe_vector, forward))))
         heel_length = 0.07
         auto_length = ball_distance + heel_length
@@ -3928,7 +3868,13 @@ class ModelViewerApp(tk.Tk):
         length = foot_dims[0]
         heel_back = add3(toe_pos, mul3(forward, -length))
         center = add3(add3(heel_back, mul3(forward, length * 0.5)), mul3(up, -0.006))
-        toe_forward, toe_side, toe_up = self.basis_axes_from_direction(rotations[toe], toe_vector, 0)
+        toe_forward = rotations[toe, 0].copy()
+        toe_up = rotations[toe, 1].copy()
+        toe_side = rotations[toe, 2].copy()
+        if dot3(toe_forward, toe_vector) < 0:
+            toe_forward = mul3(toe_forward, -1)
+        if float(toe_up[1]) < 0:
+            toe_up = mul3(toe_up, -1)
         toe_center = add3(add3(toe_pos, mul3(toe_forward, toe_dims[0] * 0.5)), mul3(toe_up, -0.006))
         return [
             (center, forward, side_axis, up, foot_dims),
@@ -3942,18 +3888,27 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
-        source_up_axis: int = 2,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float]]:
         hand_pos = positions[hand]
-        guide = rotations[hand, 0].copy()
+        forward = rotations[hand, 0].copy()
+        side_axis = rotations[hand, 1].copy()
+        up = rotations[hand, 2].copy()
         if mid is not None:
-            guide = sub3(positions[mid], hand_pos)
+            finger_vector = sub3(positions[mid], hand_pos)
+            if dot3(forward, finger_vector) < 0:
+                forward = mul3(forward, -1)
         elif parent is not None:
             forearm_vector = sub3(hand_pos, positions[parent])
             length = float(np.linalg.norm(forearm_vector))
             if length > 1e-6:
-                guide = forearm_vector / length
-        forward, side_axis, up = self.hand_axes_from_source(rotations[hand], guide, source_up_axis)
+                forward = forearm_vector / length
+                side_axis = np.cross(up, forward)
+                side_length = float(np.linalg.norm(side_axis))
+                if side_length > 1e-6:
+                    side_axis = side_axis / side_length
+                    up = np.cross(forward, side_axis)
+        if float(up[1]) < 0:
+            up = mul3(up, -1)
         dims = self.hand_dimensions()
         center = add3(add3(hand_pos, mul3(forward, dims[0] * 0.5)), mul3(up, -0.0025))
         return center, forward, up, side_axis, dims
@@ -3971,13 +3926,10 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
-        source_up_axis: int,
         color: str,
         alpha: float = 1.0,
     ) -> None:
-        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
-            positions, rotations, hand, mid, parent, source_up_axis
-        )
+        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(positions, rotations, hand, mid, parent)
         self.gl_draw_box(center, axis_x, axis_y, axis_z, dims, color, alpha)
 
     def gl_draw_controller_trajectory(self) -> None:
@@ -4460,7 +4412,6 @@ class ModelViewerApp(tk.Tk):
                     hand,
                     name_to_index.get(mid_name),
                     name_to_index.get(parent_name),
-                    actor.clip.source_up_axis if actor.clip is not None else 2,
                     actor.color,
                 )
 
@@ -4564,12 +4515,9 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
-        source_up_axis: int,
         color: str,
     ) -> None:
-        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
-            positions, rotations, hand, mid, parent, source_up_axis
-        )
+        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(positions, rotations, hand, mid, parent)
         self.draw_oriented_box(center, axis_x, axis_y, axis_z, dims, color)
 
     def draw_oriented_box(

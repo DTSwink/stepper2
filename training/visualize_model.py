@@ -261,8 +261,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         {{ ankle: nameToIndex.get("foot_r"), toe: nameToIndex.get("ball_r") }}
       ].filter(v => v.ankle !== undefined && v.toe !== undefined);
       handSpecs = [
-        {{ bone: nameToIndex.get("hand_l"), mid: nameToIndex.get("middle_03_l"), parent: nameToIndex.get("lowerarm_l") }},
-        {{ bone: nameToIndex.get("hand_r"), mid: nameToIndex.get("middle_03_r"), parent: nameToIndex.get("lowerarm_r") }}
+        {{ bone: nameToIndex.get("hand_l"), mid: nameToIndex.get("middle_03_l") }},
+        {{ bone: nameToIndex.get("hand_r"), mid: nameToIndex.get("middle_03_r") }}
       ].filter(v => v.bone !== undefined);
       frameCarry = 0;
     }}
@@ -297,51 +297,6 @@ HTML_TEMPLATE = r"""<!doctype html>
     function mul3(a, s) {{ return [a[0] * s, a[1] * s, a[2] * s]; }}
     function dot3(a, b) {{ return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }}
     function len3(a) {{ return Math.max(1e-6, Math.hypot(a[0], a[1], a[2])); }}
-    function norm3(a) {{
-      const l = len3(a);
-      return [a[0] / l, a[1] / l, a[2] / l];
-    }}
-    function cross3(a, b) {{
-      return [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0]
-      ];
-    }}
-    function chooseBasisAxes(basis, frame, bone, direction, fallbackForwardAxis) {{
-      const axes = [basisAxisAt(basis, frame, bone, 0), basisAxisAt(basis, frame, bone, 1), basisAxisAt(basis, frame, bone, 2)].map(norm3);
-      let forwardIndex = fallbackForwardAxis;
-      let forwardDot = dot3(axes[forwardIndex], direction);
-      if (len3(direction) > 1e-5) {{
-        let best = -1;
-        for (let i = 0; i < 3; i++) {{
-          const d = dot3(axes[i], direction);
-          if (Math.abs(d) > best) {{
-            best = Math.abs(d);
-            forwardIndex = i;
-            forwardDot = d;
-          }}
-        }}
-      }}
-      let forward = axes[forwardIndex].slice();
-      if (forwardDot < 0) forward = mul3(forward, -1);
-      const remaining = [0, 1, 2].filter(i => i !== forwardIndex);
-      let upIndex = remaining[0];
-      if (Math.abs(axes[remaining[1]][1]) > Math.abs(axes[upIndex][1])) upIndex = remaining[1];
-      let up = axes[upIndex].slice();
-      if (up[1] < 0) up = mul3(up, -1);
-      const side = norm3(cross3(up, forward));
-      return {{ forward: norm3(forward), side, up: norm3(up) }};
-    }}
-    function chooseHandAxes(basis, frame, bone, guide) {{
-      const axes = [basisAxisAt(basis, frame, bone, 0), basisAxisAt(basis, frame, bone, 1), basisAxisAt(basis, frame, bone, 2)].map(norm3);
-      let forward = axes[0].slice();
-      if (guide !== null && len3(guide) > 1e-5 && dot3(forward, guide) < 0) forward = mul3(forward, -1);
-      const upAxis = motion.source_up_axis === 3 ? 1 : 2;
-      let up = axes[upAxis].slice();
-      const side = norm3(cross3(up, forward));
-      return {{ forward: norm3(forward), side, up: norm3(up) }};
-    }}
 
     function rotateProject(p) {{
       const scale = Number(scaleInput.value) || 1;
@@ -459,11 +414,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawFootBlock(arr, basis, ankle, toe, offsetX, color, alpha) {{
       const foot = posAt(arr, frame, ankle, offsetX);
       const toePos = posAt(arr, frame, toe, offsetX);
+      let up = basisAxisAt(basis, frame, ankle, 0);
+      let forward = basisAxisAt(basis, frame, ankle, 1);
+      const sideAxis = basisAxisAt(basis, frame, ankle, 2);
       const toeVector = sub3(toePos, foot);
-      const axes = chooseBasisAxes(basis, frame, ankle, toeVector, 1);
-      const forward = axes.forward;
-      const up = axes.up;
-      const sideAxis = axes.side;
+      if (dot3(forward, toeVector) < 0) forward = mul3(forward, -1);
+      if (up[1] < 0) up = mul3(up, -1);
       const ballDistance = Math.max(0.10, Math.min(0.28, Math.abs(dot3(toeVector, forward))));
       const heelLength = 0.07;
       const length = ballDistance + heelLength;
@@ -479,11 +435,12 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawToeBlock(arr, basis, ankle, toe, offsetX, color, alpha) {{
       const foot = posAt(arr, frame, ankle, offsetX);
       const toePos = posAt(arr, frame, toe, offsetX);
+      let forward = basisAxisAt(basis, frame, toe, 0);
+      let up = basisAxisAt(basis, frame, toe, 1);
+      const sideAxis = basisAxisAt(basis, frame, toe, 2);
       const toeVector = sub3(toePos, foot);
-      const axes = chooseBasisAxes(basis, frame, toe, toeVector, 0);
-      const forward = axes.forward;
-      const up = axes.up;
-      const sideAxis = axes.side;
+      if (dot3(forward, toeVector) < 0) forward = mul3(forward, -1);
+      if (up[1] < 0) up = mul3(up, -1);
       const toeLength = 0.065;
       const c = add3(add3(toePos, mul3(forward, toeLength * 0.5)), mul3(up, -0.006));
       drawOrientedBox(c, forward, sideAxis, up, [toeLength, 0.11, 0.064], color, "rgba(236, 218, 202, 0.34)", alpha);
@@ -493,18 +450,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawHandBox(arr, basis, spec, offsetX, color, alpha) {{
       const bone = spec.bone;
       const hand = posAt(arr, frame, bone, offsetX);
-      let guide = null;
+      let forward = basisAxisAt(basis, frame, bone, 0);
+      const sideAxis = basisAxisAt(basis, frame, bone, 1);
+      let up = basisAxisAt(basis, frame, bone, 2);
       if (spec.mid !== undefined) {{
-        guide = sub3(posAt(arr, frame, spec.mid, offsetX), hand);
+        const fingerVector = sub3(posAt(arr, frame, spec.mid, offsetX), hand);
+        if (dot3(forward, fingerVector) < 0) forward = mul3(forward, -1);
       }}
-      if ((guide === null || len3(guide) < 1e-5) && spec.parent !== undefined) {{
-        guide = sub3(hand, posAt(arr, frame, spec.parent, offsetX));
-      }}
-      if (guide === null || len3(guide) < 1e-5) guide = basisAxisAt(basis, frame, bone, 0);
-      const axes = chooseHandAxes(basis, frame, bone, guide);
-      const forward = axes.forward;
-      const up = axes.up;
-      const sideAxis = axes.side;
+      if (up[1] < 0) up = mul3(up, -1);
       const c = add3(add3(hand, mul3(forward, 0.052)), mul3(up, -0.0025));
       drawOrientedBox(c, forward, up, sideAxis, [0.125, 0.115, 0.038], color, "rgba(236, 218, 202, 0.38)", alpha);
       drawAxisTick(c, forward, 0.08, color);
@@ -868,7 +821,6 @@ def make_payload(
         "bone_names": clip.body_names,
         "parents": clip.parents_body.cpu().numpy().astype(int).tolist(),
         "root_index": int(clip.pelvis),
-        "source_up_axis": int(clip.source_up_axis),
         "initial_frame": int(min(max(2, gt_pos.shape[0] // 2), gt_pos.shape[0] - 1)),
         "bounds": {"min": bounds_min.tolist(), "max": bounds_max.tolist()},
         "gt_b64": base64.b64encode(np.ascontiguousarray(gt_pos, dtype=np.float32).tobytes()).decode("ascii"),

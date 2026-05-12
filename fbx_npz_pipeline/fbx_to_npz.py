@@ -164,9 +164,28 @@ def load_scene(path: Path) -> tuple["fbx.FbxManager", "fbx.FbxScene"]:
     return manager, scene
 
 
+def should_convert_axis_to_maya_y_up(axis_system: dict[str, int]) -> bool:
+    return not (
+        axis_system["up_axis"] == 2
+        and axis_system["up_sign"] == 1
+        and axis_system["front_axis"] == 2
+        and axis_system["front_sign"] == 1
+        and axis_system["coord_axis"] == 0
+    )
+
+
+def normalize_scene_axis_system(scene: "fbx.FbxScene") -> tuple[dict[str, int], dict[str, int], bool]:
+    source_axis_system = get_axis_system(scene)
+    converted = should_convert_axis_to_maya_y_up(source_axis_system)
+    if converted:
+        fbx.FbxAxisSystem.MayaYUp.ConvertScene(scene)
+    return source_axis_system, get_axis_system(scene), converted
+
+
 def extract_fbx_to_npz(input_fbx: Path, output_npz: Path, report_json: Path | None) -> dict:
     manager, scene = load_scene(input_fbx)
     try:
+        source_axis_system, axis_system, axis_converted_to_maya_y_up = normalize_scene_axis_system(scene)
         nodes = collect_skeleton_nodes(scene)
         if not nodes:
             raise RuntimeError("No skeleton or animated transform nodes found.")
@@ -255,11 +274,16 @@ def extract_fbx_to_npz(input_fbx: Path, output_npz: Path, report_json: Path | No
             default_lcl_scale[ji] = fbx_vec3_to_np(node.LclScaling.Get())
 
         output_npz.parent.mkdir(parents=True, exist_ok=True)
-        axis_system = get_axis_system(scene)
         system_unit = get_system_unit(scene)
         np.savez_compressed(
             output_npz,
             source_fbx=np.array(str(input_fbx)),
+            source_axis_up_axis=np.array(source_axis_system["up_axis"], dtype=np.int32),
+            source_axis_up_sign=np.array(source_axis_system["up_sign"], dtype=np.int32),
+            source_axis_front_axis=np.array(source_axis_system["front_axis"], dtype=np.int32),
+            source_axis_front_sign=np.array(source_axis_system["front_sign"], dtype=np.int32),
+            source_axis_coord_axis=np.array(source_axis_system["coord_axis"], dtype=np.int32),
+            axis_converted_to_maya_y_up=np.array(axis_converted_to_maya_y_up, dtype=np.bool_),
             axis_up_axis=np.array(axis_system["up_axis"], dtype=np.int32),
             axis_up_sign=np.array(axis_system["up_sign"], dtype=np.int32),
             axis_front_axis=np.array(axis_system["front_axis"], dtype=np.int32),
@@ -300,7 +324,9 @@ def extract_fbx_to_npz(input_fbx: Path, output_npz: Path, report_json: Path | No
             "fps": fps_value,
             "bones": joint_count,
             "root_bones": [bone_names[i].item() for i, p in enumerate(parents) if p < 0],
+            "source_axis_system": source_axis_system,
             "axis_system": axis_system,
+            "axis_converted_to_maya_y_up": axis_converted_to_maya_y_up,
             "system_unit": system_unit,
             "first_bones": bone_names[: min(20, joint_count)].tolist(),
             "arrays": {
