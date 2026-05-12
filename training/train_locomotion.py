@@ -1383,6 +1383,7 @@ class LiveTrainingBridge:
                 phase=np.asarray([phase]),
                 train_total=np.asarray([float(train_total)], dtype=np.float32),
                 fps=np.asarray([float(clip.fps)], dtype=np.float32),
+                source_up_axis=np.asarray([int(clip.source_up_axis)], dtype=np.int32),
                 body_names=np.asarray(clip.body_names),
                 parents=np.asarray(clip.parents_body, dtype=np.int64),
                 pred_pos=pred_pos.astype(np.float32, copy=False),

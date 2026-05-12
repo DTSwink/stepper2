@@ -245,6 +245,16 @@ HTML_TEMPLATE = r"""<!doctype html>
       return {{ forward: norm3(forward), side, up: norm3(up) }};
     }}
 
+    function chooseHandAxes(bone, guide) {{
+      const basis = [basisAxisAt(frame, bone, 0), basisAxisAt(frame, bone, 1), basisAxisAt(frame, bone, 2)].map(norm3);
+      let forward = basis[0].slice();
+      if (guide !== null && len3(guide) > 1e-5 && dot3(forward, guide) < 0) forward = mul3(forward, -1);
+      const upAxis = motion.axis && motion.axis.up_axis === 3 ? 1 : 2;
+      let up = basis[upAxis].slice();
+      let side = norm3(cross3(up, forward));
+      return {{ forward: norm3(forward), side, up: norm3(up) }};
+    }}
+
     function isHelperName(name) {{
       return name.includes("_twist_") ||
         name.startsWith("ik_") ||
@@ -413,7 +423,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (guide === null || len3(guide) < 1e-5) {{
         guide = basisAxisAt(frame, bone, 0);
       }}
-      const axes = chooseBasisAxes(bone, guide, 0);
+      const axes = chooseHandAxes(bone, guide);
       const forward = axes.forward;
       const up = axes.up;
       const sideAxis = axes.side;

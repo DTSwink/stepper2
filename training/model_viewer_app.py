@@ -2950,7 +2950,12 @@ class ModelViewerApp(tk.Tk):
             if hand is None:
                 continue
             center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
-                positions, rotations, hand, name_to_index.get(mid_name), name_to_index.get(parent_name)
+                positions,
+                rotations,
+                hand,
+                name_to_index.get(mid_name),
+                name_to_index.get(parent_name),
+                actor.clip.source_up_axis if actor.clip is not None else 2,
             )
             score = self.collider_box_hit_score(x, y, center, axis_x, axis_y, axis_z, dims)
             if score is not None:
@@ -3610,6 +3615,7 @@ class ModelViewerApp(tk.Tk):
                     hand,
                     name_to_index.get(mid_name),
                     name_to_index.get(parent_name),
+                    actor.clip.source_up_axis if actor.clip is not None else 2,
                     draw_color,
                     alpha,
                 )
@@ -3884,6 +3890,30 @@ class ModelViewerApp(tk.Tk):
             side /= side_len
         return forward, side, up
 
+    @staticmethod
+    def hand_axes_from_source(
+        basis: np.ndarray,
+        guide: np.ndarray,
+        source_up_axis: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        basis = np.asarray(basis, dtype=np.float32)
+        lengths = np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-8)
+        basis = basis / lengths
+        forward = basis[0].copy()
+        guide = np.asarray(guide, dtype=np.float32)
+        if float(np.linalg.norm(guide)) > 1e-8 and dot3(forward, guide) < 0.0:
+            forward *= -1.0
+        up_axis = 1 if int(source_up_axis) == 3 else 2
+        up = basis[up_axis].copy()
+        side = np.cross(up, forward).astype(np.float32)
+        side_len = float(np.linalg.norm(side))
+        if side_len <= 1e-8:
+            fallback_axis = 2 if up_axis == 1 else 1
+            side = basis[fallback_axis].copy()
+        else:
+            side /= side_len
+        return forward, side, up
+
     def foot_box_specs(
         self, positions: np.ndarray, rotations: np.ndarray, ankle: int, toe: int
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float]]]:
@@ -3912,6 +3942,7 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
+        source_up_axis: int = 2,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float]]:
         hand_pos = positions[hand]
         guide = rotations[hand, 0].copy()
@@ -3922,7 +3953,7 @@ class ModelViewerApp(tk.Tk):
             length = float(np.linalg.norm(forearm_vector))
             if length > 1e-6:
                 guide = forearm_vector / length
-        forward, side_axis, up = self.basis_axes_from_direction(rotations[hand], guide, 0)
+        forward, side_axis, up = self.hand_axes_from_source(rotations[hand], guide, source_up_axis)
         dims = self.hand_dimensions()
         center = add3(add3(hand_pos, mul3(forward, dims[0] * 0.5)), mul3(up, -0.0025))
         return center, forward, up, side_axis, dims
@@ -3940,10 +3971,13 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
+        source_up_axis: int,
         color: str,
         alpha: float = 1.0,
     ) -> None:
-        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(positions, rotations, hand, mid, parent)
+        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
+            positions, rotations, hand, mid, parent, source_up_axis
+        )
         self.gl_draw_box(center, axis_x, axis_y, axis_z, dims, color, alpha)
 
     def gl_draw_controller_trajectory(self) -> None:
@@ -4426,6 +4460,7 @@ class ModelViewerApp(tk.Tk):
                     hand,
                     name_to_index.get(mid_name),
                     name_to_index.get(parent_name),
+                    actor.clip.source_up_axis if actor.clip is not None else 2,
                     actor.color,
                 )
 
@@ -4529,9 +4564,12 @@ class ModelViewerApp(tk.Tk):
         hand: int,
         mid: int | None,
         parent: int | None,
+        source_up_axis: int,
         color: str,
     ) -> None:
-        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(positions, rotations, hand, mid, parent)
+        center, axis_x, axis_y, axis_z, dims = self.hand_box_spec(
+            positions, rotations, hand, mid, parent, source_up_axis
+        )
         self.draw_oriented_box(center, axis_x, axis_y, axis_z, dims, color)
 
     def draw_oriented_box(

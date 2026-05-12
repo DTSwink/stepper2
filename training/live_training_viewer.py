@@ -66,6 +66,51 @@ def mul3(a: np.ndarray, s: float) -> np.ndarray:
     return np.asarray(a, dtype=np.float32) * float(s)
 
 
+def basis_axes_from_direction(
+    basis: np.ndarray,
+    direction: np.ndarray,
+    fallback_forward_axis: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    basis = np.asarray(basis, dtype=np.float32)
+    basis = basis / np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-8)
+    direction = np.asarray(direction, dtype=np.float32)
+    if float(np.linalg.norm(direction)) > 1e-8:
+        direction_n = direction / float(np.linalg.norm(direction))
+        dots = basis @ direction_n
+        forward_index = int(np.argmax(np.abs(dots)))
+        forward = basis[forward_index].copy()
+        if float(dots[forward_index]) < 0.0:
+            forward *= -1.0
+    else:
+        forward_index = int(fallback_forward_axis)
+        forward = basis[forward_index].copy()
+    remaining = [i for i in range(3) if i != forward_index]
+    up_index = max(remaining, key=lambda i: abs(float(basis[i, 1])))
+    up = basis[up_index].copy()
+    if float(up[1]) < 0.0:
+        up *= -1.0
+    side = unit_vec(np.cross(up, forward), basis[[i for i in remaining if i != up_index][0]])
+    return unit_vec(forward, basis[forward_index]), side, unit_vec(up, basis[up_index])
+
+
+def hand_axes_from_source(
+    basis: np.ndarray,
+    guide: np.ndarray,
+    source_up_axis: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    basis = np.asarray(basis, dtype=np.float32)
+    basis = basis / np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-8)
+    forward = basis[0].copy()
+    guide = np.asarray(guide, dtype=np.float32)
+    if float(np.linalg.norm(guide)) > 1e-8 and dot3(forward, guide) < 0.0:
+        forward *= -1.0
+    up_axis = 1 if int(source_up_axis) == 3 else 2
+    up = basis[up_axis].copy()
+    fallback_axis = 2 if up_axis == 1 else 1
+    side = unit_vec(np.cross(up, forward), basis[fallback_axis])
+    return unit_vec(forward, basis[0]), side, unit_vec(up, basis[up_axis])
+
+
 def replace_with_retry(tmp: Path, target: Path, attempts: int = 12, delay_seconds: float = 0.01) -> bool:
     for attempt in range(attempts):
         try:
@@ -104,6 +149,7 @@ class LiveSnapshot:
     phase: str
     train_total: float
     fps: float
+    source_up_axis: int
     body_names: list[str]
     parents: list[int]
     pred_pos: np.ndarray
@@ -295,6 +341,7 @@ class LiveTrainingViewer(tk.Tk):
                     phase=str(arrays["phase"][0]),
                     train_total=float(arrays["train_total"][0]),
                     fps=float(arrays["fps"][0]),
+                    source_up_axis=int(arrays["source_up_axis"][0]) if "source_up_axis" in arrays.files else 2,
                     body_names=body_names,
                     parents=parents,
                     pred_pos=arrays["pred_pos"].astype(np.float32),
@@ -617,7 +664,7 @@ class LiveTrainingViewer(tk.Tk):
             hand = name_to_index.get(hand_name)
             parent = name_to_index.get(parent_name)
             if hand is not None:
-                self.draw_hand_box(positions, rotations, hand, parent, color, alpha * 0.62)
+                self.draw_hand_box(positions, rotations, hand, parent, snapshot.source_up_axis, color, alpha * 0.62)
 
     def segment_radius(self, a: str, b: str) -> float:
         pair = f"{a}/{b}"
@@ -694,43 +741,35 @@ class LiveTrainingViewer(tk.Tk):
     def draw_foot_boxes(self, positions: np.ndarray, rotations: np.ndarray, ankle: int, toe: int, color: str, alpha: float) -> None:
         foot = positions[ankle]
         toe_pos = positions[toe]
-        up = rotations[ankle, 0].copy()
-        forward = rotations[ankle, 1].copy()
-        side_axis = rotations[ankle, 2].copy()
         toe_vector = sub3(toe_pos, foot)
-        if dot3(forward, toe_vector) < 0:
-            forward = mul3(forward, -1)
-        if float(up[1]) < 0:
-            up = mul3(up, -1)
+        forward, side_axis, up = basis_axes_from_direction(rotations[ankle], toe_vector, 1)
         foot_dims = (0.17, 0.11, 0.064)
         toe_dims = (0.065, 0.11, 0.064)
         heel_back = add3(toe_pos, mul3(forward, -foot_dims[0]))
         center = add3(add3(heel_back, mul3(forward, foot_dims[0] * 0.5)), mul3(up, -0.006))
         self.draw_box(center, forward, side_axis, up, foot_dims, color, alpha)
-        toe_forward = rotations[toe, 0].copy()
-        toe_up = rotations[toe, 1].copy()
-        toe_side = rotations[toe, 2].copy()
-        if dot3(toe_forward, toe_vector) < 0:
-            toe_forward = mul3(toe_forward, -1)
-        if float(toe_up[1]) < 0:
-            toe_up = mul3(toe_up, -1)
+        toe_forward, toe_side, toe_up = basis_axes_from_direction(rotations[toe], toe_vector, 0)
         toe_center = add3(add3(toe_pos, mul3(toe_forward, toe_dims[0] * 0.5)), mul3(toe_up, -0.006))
         self.draw_box(toe_center, toe_forward, toe_side, toe_up, toe_dims, color, alpha)
 
-    def draw_hand_box(self, positions: np.ndarray, rotations: np.ndarray, hand: int, parent: int | None, color: str, alpha: float) -> None:
+    def draw_hand_box(
+        self,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+        hand: int,
+        parent: int | None,
+        source_up_axis: int,
+        color: str,
+        alpha: float,
+    ) -> None:
         hand_pos = positions[hand]
-        forward = rotations[hand, 0].copy()
-        side_axis = rotations[hand, 1].copy()
-        up = rotations[hand, 2].copy()
+        guide = rotations[hand, 0].copy()
         if parent is not None:
             forearm_vector = sub3(hand_pos, positions[parent])
             length = float(np.linalg.norm(forearm_vector))
             if length > 1e-6:
-                forward = forearm_vector / length
-                side_axis = unit_vec(np.cross(up, forward), side_axis)
-                up = unit_vec(np.cross(forward, side_axis), up)
-        if float(up[1]) < 0:
-            up = mul3(up, -1)
+                guide = forearm_vector / length
+        forward, side_axis, up = hand_axes_from_source(rotations[hand], guide, source_up_axis)
         dims = (0.09, 0.068, 0.032)
         center = add3(add3(hand_pos, mul3(forward, dims[0] * 0.5)), mul3(up, -0.0025))
         self.draw_box(center, forward, up, side_axis, dims, color, alpha)
