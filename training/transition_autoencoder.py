@@ -36,6 +36,7 @@ class AEConfig:
     seed: int = 1234
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     input_noise_std: float = 0.0
+    std_floor: float = 1e-4
     target_loss_reduction: float = 0.995
     stall_patience_epochs: int = 120
     min_delta: float = 1e-6
@@ -244,7 +245,7 @@ def train(args: argparse.Namespace) -> None:
     clips = tl.load_clips(folder, locomotion_cfg)
     clean = collect_clean_features(clips, locomotion_cfg, device)
     mean = clean.mean(dim=0)
-    std = clean.std(dim=0).clamp_min(1e-4)
+    std = clean.std(dim=0).clamp_min(cfg.std_floor)
     x_norm = normalise(clean, mean, std).to(device)
     mean = mean.to(device)
     std = std.to(device)

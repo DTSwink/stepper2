@@ -269,3 +269,40 @@ Result:
 - Best epoch: `319`
 - Matches the prior adaptive LR best exactly within logged precision.
 - Shared comparison HTML now points at this verification checkpoint.
+
+## 2026-05-12 - Pure Delta-AE Prior Diagnosis
+
+Goal: rerun the delta-transition AE setup without supervised losses in the
+model objective, then investigate why it previously failed to match the
+supervised autoregressive result.
+
+Findings:
+
+- Old AE normalization used `std_floor = 1e-4`. Many delta-feature channels
+  have tiny or zero variance, so generated off-manifold changes in those
+  channels dominated the AE gradient and made training brittle.
+- Using the AE loss directly with MSE required very small learning rates; the
+  model could improve K=1, but K=8 drifted badly.
+- Matching the AE training loss shape with `--ae-score-loss huber` helped
+  stability, but the decisive fix was raising the AE normalization floor.
+- New useful prior setup: delta AE with `--std-floor 0.01`, model AE score with
+  `--ae-score-loss huber`, and pure-AE checkpoint selection via
+  `--best-metric ae_score`.
+
+Reference metrics from `visualize_model.py` on `testcasc.npz`:
+
+| Run | Objective | Rollout trained | One-step avg joint error | Full autoreg avg joint error | Full autoreg final joint error |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `scheduled_k8_adaptive_verify_20260512_201402` | supervised | K8 | `0.004423 m` | `0.007902 m` | `0.023608 m` |
+| `ae_pure_probe_20260512_212626_k248_huber_lr3e6` | pure AE, old std floor | K8 | not rendered | about `0.06 m` train-window RMSE | poor |
+| `ae_pure_probe_20260512_213304_stdfloor001_k248_huber_lr3e6` | pure AE, std floor `0.01` | K8 | `0.002231 m` | `0.017890 m` | `0.034383 m` |
+| `ae_pure_probe_20260512_213848_stdfloor001_k16_huber_lr2e6` | pure AE, std floor `0.01` | K16 | `0.002234 m` | `0.013934 m` | `0.026468 m` |
+| `ae_pure_probe_20260512_214146_stdfloor001_k32_huber_lr1e6` | pure AE, std floor `0.01` | K32 | `0.002257 m` | `0.009502 m` | `0.020027 m` |
+
+Interpretation: the pure AE framework can now reach supervised-level local
+transition accuracy and near-supervised full-rollout accuracy on this clip. The
+remaining gap is mostly long-horizon drift: the AE scores transition realism,
+not exact phase/state alignment. Increasing rollout K helps because the model
+must keep its own generated states inside the AE transition manifold for longer.
+
+The shared comparison HTML currently points to the K32 pure-AE run above.

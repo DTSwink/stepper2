@@ -4,13 +4,14 @@ param(
     [switch]$RebuildNpzFinal,
     [int]$HiddenDim = 512,
     [int]$LatentDim = 64,
+    [double]$AEStdFloor = 0.01,
+    [ValidateSet("mse", "huber")]
+    [string]$AEScoreLoss = "huber",
     [int]$BatchSize = 64,
-    [int]$K1WarmupEpochs = 900,
-    [int]$K1PolishEpochs = 700,
-    [int]$AutoregEpochs = 900,
-    [int]$K1WarmupSeconds = 130,
-    [int]$K1PolishSeconds = 120,
-    [int]$AutoregSeconds = 260,
+    [int]$K1Epochs = 800,
+    [int]$AutoregEpochs = 260,
+    [int]$K1Seconds = 140,
+    [int]$AutoregSeconds = 180,
     [int]$SaveLiveEveryEpochs = 0,
     [switch]$LiveViewer,
     [string]$Prefix = ("delta_ae_scratch_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -64,7 +65,7 @@ try {
         param(
             [string]$Stage,
             [string]$Name,
-            [string[]]$Args
+            [string[]]$StageArgs
         )
         $RunDir = Join-Path $Runs $Name
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
@@ -72,8 +73,9 @@ try {
         $ErrPath = Join-Path $RunDir "console.err.log"
         $Start = Get-Date
         $Sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $CleanArgs = @($StageArgs | Where-Object { $null -ne $_ -and $_ -ne "" })
         $Process = Start-Process -FilePath $Python `
-            -ArgumentList $Args `
+            -ArgumentList $CleanArgs `
             -WorkingDirectory $Root `
             -RedirectStandardOutput $LogPath `
             -RedirectStandardError $ErrPath `
@@ -93,8 +95,7 @@ try {
     }
 
     $AERun = "${Prefix}_ae"
-    $K1WarmupRun = "${Prefix}_k1_lr1e5"
-    $K1PolishRun = "${Prefix}_k1_lr5e6"
+    $K1Run = "${Prefix}_k1_ae"
     $AutoregRun = "${Prefix}_autoreg_k8"
 
     Run-Stage "transition_ae" $AERun @(
@@ -103,6 +104,7 @@ try {
         "--run-name", $AERun,
         "--latent-dim", "$LatentDim",
         "--hidden-dim", "$HiddenDim",
+        "--std-floor", "$AEStdFloor",
         "--learning-rate", "1e-3",
         "--max-epochs", "2000",
         "--target-loss-reduction", "0.995",
@@ -113,61 +115,46 @@ try {
 
     $AECkpt = "training/runs/$AERun/checkpoints/checkpoint_best.pt"
 
-    Run-Stage "model_k1_warmup" $K1WarmupRun @(
+    Run-Stage "model_k1" $K1Run @(
         $ModelTrain,
         "--folder-path", $DatasetPath,
         "--prior-checkpoint", $AECkpt,
-        "--run-name", $K1WarmupRun,
+        "--run-name", $K1Run,
         "--hidden-dim", "$HiddenDim",
-        "--learning-rate", "1e-5",
+        "--learning-rate", "3e-6",
         "--batch-size", "$BatchSize",
         "--rollout-schedule", "1",
-        "--max-epochs", "$K1WarmupEpochs",
-        "--max-train-seconds", "$K1WarmupSeconds",
+        "--max-epochs", "$K1Epochs",
+        "--max-train-seconds", "$K1Seconds",
         "--save-live-every-epochs", "0",
-        "--best-metric", "joint_rmse",
+        "--best-metric", "ae_score",
+        "--ae-score-loss", $AEScoreLoss,
+        "--no-contact-physics-losses",
         "--device", "cuda"
     )
 
-    $K1WarmupCkpt = "training/runs/$K1WarmupRun/checkpoints/checkpoint_best.pt"
-
-    Run-Stage "model_k1_polish" $K1PolishRun @(
-        $ModelTrain,
-        "--folder-path", $DatasetPath,
-        "--prior-checkpoint", $AECkpt,
-        "--resume-checkpoint", $K1WarmupCkpt,
-        "--run-name", $K1PolishRun,
-        "--hidden-dim", "$HiddenDim",
-        "--learning-rate", "5e-6",
-        "--batch-size", "$BatchSize",
-        "--rollout-schedule", "1",
-        "--max-epochs", "$K1PolishEpochs",
-        "--max-train-seconds", "$K1PolishSeconds",
-        "--save-live-every-epochs", "0",
-        "--best-metric", "joint_rmse",
-        "--device", "cuda"
-    )
-
-    $K1PolishCkpt = "training/runs/$K1PolishRun/checkpoints/checkpoint_best.pt"
+    $K1Ckpt = "training/runs/$K1Run/checkpoints/checkpoint_best.pt"
 
     $AutoregArgs = @(
         $ModelTrain,
         "--folder-path", $DatasetPath,
         "--prior-checkpoint", $AECkpt,
-        "--resume-checkpoint", $K1PolishCkpt,
+        "--resume-checkpoint", $K1Ckpt,
         "--run-name", $AutoregRun,
         "--hidden-dim", "$HiddenDim",
-        "--learning-rate", "5e-6",
+        "--learning-rate", "3e-6",
         "--batch-size", "$BatchSize",
         "--rollout-schedule", "2,4,8",
-        "--curriculum-max-epochs-per-stage", "240",
-        "--curriculum-stall-patience-epochs", "80",
+        "--curriculum-max-epochs-per-stage", "80",
+        "--curriculum-stall-patience-epochs", "40",
         "--curriculum-min-epochs", "30",
         "--max-epochs", "$AutoregEpochs",
         "--max-train-seconds", "$AutoregSeconds",
         "--save-live-every-epochs", "$SaveLiveEveryEpochs",
         "--live-npz-path", $ViewerNpz,
-        "--best-metric", "joint_rmse",
+        "--best-metric", "ae_score",
+        "--ae-score-loss", $AEScoreLoss,
+        "--no-contact-physics-losses",
         "--device", "cuda"
     )
     if ($LiveViewer) {
@@ -182,8 +169,7 @@ try {
     Write-Output "fbx_path=$FbxPath"
     Write-Output "npz_final=$DatasetPath"
     Write-Output "ae_run=$AERun"
-    Write-Output "k1_warmup_run=$K1WarmupRun"
-    Write-Output "k1_polish_run=$K1PolishRun"
+    Write-Output "k1_run=$K1Run"
     Write-Output "autoreg_run=$AutoregRun"
     Write-Output "final_checkpoint=$FinalCkpt"
     Write-Output "final_viewer=$FinalHtml"

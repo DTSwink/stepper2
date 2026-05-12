@@ -52,10 +52,21 @@ def load_prior(path: Path, device: torch.device):
     return model, ckpt
 
 
-def ae_score(prior, mean, std, features: torch.Tensor) -> torch.Tensor:
+def ae_score(
+    prior,
+    mean,
+    std,
+    features: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
     x = (features - mean) / std
     recon = prior(x)
-    return F.mse_loss(recon, x, reduction="none").mean(dim=-1).mean()
+    if loss_type == "huber":
+        error = F.huber_loss(recon, x, reduction="none", delta=huber_delta)
+    else:
+        error = F.mse_loss(recon, x, reduction="none")
+    return error.mean(dim=-1).mean()
 
 
 def run_batch_ae(
@@ -111,7 +122,7 @@ def run_batch_ae(
             features = tae.transition_feature_from_next_pose(
                 clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
             )
-            score = ae_score(prior, prior_mean, prior_std, features)
+            score = ae_score(prior, prior_mean, prior_std, features, cfg.ae_score_loss, cfg.ae_huber_delta)
             step_loss = cfg.ae_loss_weight * score
             term_mask = torch.zeros(cur_idx.shape[0], dtype=torch.bool, device=device)
             if cfg.enable_contact_physics_losses:
@@ -239,6 +250,8 @@ def train(args: argparse.Namespace) -> None:
     cfg.alpha11_contact_height = args.alpha11_contact_height
     cfg.alpha12_termination = args.alpha12_termination
     cfg.ae_loss_weight = args.ae_loss_weight
+    cfg.ae_score_loss = args.ae_score_loss
+    cfg.ae_huber_delta = args.ae_huber_delta
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
     if cfg.allow_tf32 and device.type == "cuda":
@@ -273,6 +286,8 @@ def train(args: argparse.Namespace) -> None:
         "output_dim": output_dim,
         "ae_prior_checkpoint": str(tl.resolve_path(args.prior_checkpoint)),
         "loss_type": "pure_transition_ae_prior",
+        "ae_score_loss": args.ae_score_loss,
+        "ae_huber_delta": args.ae_huber_delta,
     }
 
     schedule = tuple(k for k in cfg.rollout_schedule if k <= min(clip.T - 2 for clip in clips)) or (1,)
@@ -386,7 +401,9 @@ def main() -> None:
     parser.add_argument("--curriculum-min-delta", type=float, default=1e-6)
     parser.add_argument("--max-train-seconds", type=float, default=0.0)
     parser.add_argument("--resume-checkpoint", default=None)
-    parser.add_argument("--best-metric", choices=("ae_score", "joint_rmse", "ee_rmse", "output_mse"), default="joint_rmse")
+    parser.add_argument("--best-metric", choices=("ae_score", "joint_rmse", "ee_rmse", "output_mse"), default="ae_score")
+    parser.add_argument("--ae-score-loss", choices=("mse", "huber"), default="mse")
+    parser.add_argument("--ae-huber-delta", type=float, default=1.0)
     parser.add_argument("--save-live-every-epochs", type=int, default=20)
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--live-npz-path", default="data/npz_final/testcasc.npz")
