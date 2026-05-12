@@ -30,12 +30,48 @@ For GPU training:
 Recommended K8 Isaac-style supervised run:
 
 ```powershell
-.\.tools\python310\python.exe .\training\train_locomotion.py --folder-path data/fbx/npz_final --device cuda --training-loop agents --agent-sampling coverage --rollout-schedule 1,2,4,8 --max-epochs 320 --batch-size 64 --learning-rate 1e-4 --no-compile
+.\.tools\python310\python.exe .\training\train_locomotion.py --folder-path data/fbx/npz_final --device cuda --training-loop agents --agent-sampling coverage --rollout-schedule 1,2,4,8 --curriculum-max-epochs-per-stage 70 --curriculum-stall-patience-epochs 35 --max-epochs 320 --batch-size 64 --learning-rate 1e-4 --lr-schedule adaptive_plateau --lr-min-factor 0.05 --lr-plateau-patience-epochs 12 --lr-plateau-factor 0.7 --no-compile
 ```
 
 Use `--agent-sampling coverage` for small clips. It resets rollout agents across
 the valid start frames uniformly, which avoids the noisy duplicate/missed starts
 you get from pure random reset on tiny datasets.
+
+At the end of every training run, `training/runs/model_comparisons/model_comparison.html`
+is refreshed from that run's `checkpoint_best.pt` and source NPZ. Use
+`--no-update-comparison-on-exit` for batch sweeps where you do not want the
+shared comparison page overwritten.
+
+The recommended learning-rate schedule is `adaptive_plateau`: each new rollout
+K starts at `1e-4`, then the trainer lowers LR only when the monitored loss
+stops improving for several epochs. This keeps the schedule useful for
+placeholder experiments where future datasets and clip lengths are still
+unknown. The LR floor is `5e-6`.
+
+Live training viewer:
+
+```powershell
+.\.tools\python310\python.exe .\training\train_locomotion.py --folder-path data/fbx/npz_final --device cuda --training-loop agents --agent-sampling coverage
+```
+
+The trainer launches `live_training_viewer.py` by default. The window starts in
+headless mode with a `Visualise` button. While headless, no pose snapshots are
+serialized and no OpenGL rendering is requested by the training process. Click
+`Visualise` to see up to four rollout agents in a 2x2 grid; the button then
+changes to `Headless`, which disables snapshot capture again.
+
+The desktop shortcut `Stepper Live Training` starts the recommended K8
+coverage-agent run with visualisation already enabled. It uses
+`training/launch_live_k8_visual.ps1` and writes a timestamped run under
+`training/runs/desktop_live_k8_*`.
+
+The viewer also has a `Stop experiment` button. It asks the trainer to exit
+cleanly after the current small training unit, preserving normal shutdown and
+checkpoint behavior. A tiny loss graph at the bottom reads one scalar row per
+epoch from `live_training/loss_history.csv`; this is intentionally separate from
+the heavier pose snapshot path. Drag the horizontal splitter above the graph to
+give it more vertical room while inspecting a run. Use `--no-live-viewer` for
+fully unattended/scripted runs.
 
 `torch.compile` is enabled by default and self-tests before training. If the
 local PyTorch build cannot compile, for example because Triton is unavailable on

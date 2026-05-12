@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 # Put the files you want to compare here. Relative paths are resolved from the
-# stepper project root.
-npz_path = "data/npz_final/testcasc.npz"
-checkpoint_path = "training/runs/cascadeur_amp_k32_final/checkpoints/checkpoint_best_k32.pt"
+# stepper project root. Leave npz_path/checkpoint_path empty to use the newest
+# training run's checkpoint_best.pt and the source NPZ recorded in that checkpoint.
+npz_path = ""
+checkpoint_path = ""
 output_path = "training/runs/model_comparisons/model_comparison.html"
 
 import argparse
@@ -653,6 +654,52 @@ def resolve_path(path_text: str) -> Path:
     return path.resolve()
 
 
+def resolve_optional_path(path_text: str | None) -> Path | None:
+    if path_text is None or not str(path_text).strip():
+        return None
+    return resolve_path(str(path_text))
+
+
+def find_latest_checkpoint() -> Path:
+    run_root = PROJECT_ROOT / "training" / "runs"
+    run_dirs = [path for path in run_root.iterdir() if path.is_dir()] if run_root.exists() else []
+    candidates: list[tuple[float, Path, Path]] = []
+    for run_dir in run_dirs:
+        ckpt_dir = run_dir / "checkpoints"
+        if not ckpt_dir.exists():
+            continue
+        checkpoints = [p for p in ckpt_dir.glob("checkpoint_*.pt") if p.is_file()]
+        if not checkpoints:
+            continue
+        newest_mtime = max(p.stat().st_mtime for p in checkpoints)
+        preferred = ckpt_dir / "checkpoint_best.pt"
+        if not preferred.exists():
+            preferred = ckpt_dir / "checkpoint_last.pt"
+        if preferred.exists():
+            candidates.append((newest_mtime, run_dir, preferred))
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoints found under {run_root}")
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    return candidates[0][2].resolve()
+
+
+def infer_npz_path(ckpt: dict, checkpoint: Path) -> Path:
+    metadata = ckpt.get("metadata", {})
+    source_paths = metadata.get("source_npz_paths", [])
+    if source_paths:
+        return resolve_path(str(source_paths[0]))
+    npz_folder = metadata.get("npz_folder")
+    if npz_folder:
+        folder = resolve_path(str(npz_folder))
+        npz_files = sorted(folder.glob("*.npz"))
+        if npz_files:
+            return npz_files[0].resolve()
+    raise ValueError(
+        "No --npz-path was provided and the checkpoint does not record a usable source NPZ "
+        f"({checkpoint})"
+    )
+
+
 def apply_config_dict(cfg: tl.TrainConfig, values: dict) -> None:
     valid = {field.name for field in fields(tl.TrainConfig)}
     for key, value in values.items():
@@ -809,12 +856,12 @@ def main() -> None:
     parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args()
 
-    npz = resolve_path(args.npz_path)
-    checkpoint = resolve_path(args.checkpoint_path)
+    checkpoint = resolve_optional_path(args.checkpoint_path) or find_latest_checkpoint()
     output = resolve_path(args.output_path)
     device = torch.device(args.device)
 
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    npz = resolve_optional_path(args.npz_path) or infer_npz_path(ckpt, checkpoint)
     cfg = tl.TrainConfig()
     apply_config_dict(cfg, ckpt.get("config", {}))
     cfg.device = str(device)
@@ -831,6 +878,8 @@ def main() -> None:
     write_html(payload, output, title)
 
     print(f"wrote {output}")
+    print(f"checkpoint {checkpoint}")
+    print(f"npz {npz}")
     print(f"frames {payload['frame_count']} bones {payload['bone_count']} fps {payload['fps']:.0f}")
     print(f"one_step_mean_joint_error_start {float(error_tf[0]):.6f}")
     print(f"one_step_mean_joint_error_end {float(error_tf[-1]):.6f}")

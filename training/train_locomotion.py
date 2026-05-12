@@ -5,8 +5,12 @@ from __future__ import annotations
 folder_path = "data/fbx/npz_final"
 
 import argparse
+import json
 import math
+import os
 import random
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -43,6 +47,15 @@ class TrainConfig:
     num_hidden_layers: int = 2
     activation: str = "GELU"
     learning_rate: float = 1e-4
+    lr_schedule: str = "adaptive_plateau"
+    lr_min_factor: float = 0.05
+    lr_stage_decay: float = 1.0
+    lr_warmup_epochs: int = 0
+    lr_plateau_factor: float = 0.7
+    lr_plateau_patience_epochs: int = 12
+    lr_plateau_threshold: float = 1e-3
+    lr_plateau_cooldown_epochs: int = 0
+    lr_reset_on_rollout_advance: bool = True
     weight_decay: float = 0.0
     batch_size: int = 64
     max_epochs: int = 2000
@@ -93,6 +106,14 @@ class TrainConfig:
     zero_contact_state: bool = False
     training_loop: str = "sampled"
     agent_sampling: str = "random"
+    live_viewer: bool = True
+    live_viewer_max_agents: int = 4
+    live_viewer_start_visualizing: bool = False
+    live_viewer_close_on_exit: bool = False
+    update_comparison_on_exit: bool = True
+    comparison_output_path: str = "training/runs/model_comparisons/model_comparison.html"
+    comparison_device: str = "cpu"
+    comparison_max_frames: int = 0
     enable_early_termination: bool = False
     restart_on_termination: bool = True
     freefall_body_height_offset_m: float = 0.0
@@ -268,7 +289,6 @@ class MotionClip:
             self.toe_indices.append(self.body_names.index(toe_name))
         self.foot_indices_tensor = torch.tensor(self.foot_indices, dtype=torch.long)
         self.toe_indices_tensor = torch.tensor(self.toe_indices, dtype=torch.long)
-
         full_to_body = {full_i: body_i for body_i, full_i in enumerate(self.keep_full)}
         parents_body = []
         for full_i in self.keep_full:
@@ -835,11 +855,53 @@ def run_batch(
     rollout_k: int,
     device: torch.device,
     train: bool,
+    live_bridge: LiveTrainingBridge | None = None,
+    epoch: int = 0,
+    phase: str = "train",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     clip_indices, starts = batch
     # Group by clip so variable skeleton metadata remains simple and explicit.
     total_loss = torch.zeros((), device=device)
     accum: dict[str, torch.Tensor] = {}
+    live_rows = set(range(min(live_bridge.max_agents, int(clip_indices.shape[0])))) if live_bridge is not None else set()
+    live_sequences: dict[int, dict[str, list[np.ndarray]]] = {}
+    live_clip: MotionClip | None = None
+
+    def append_live_frame(
+        clip: MotionClip,
+        rows: list[int],
+        local_rows: list[int],
+        frame_idx: torch.Tensor,
+        pose: dict[str, torch.Tensor],
+    ) -> None:
+        nonlocal live_clip
+        if live_bridge is None or not local_rows:
+            return
+        if live_clip is None:
+            live_clip = clip
+        if live_clip is not clip:
+            return
+        with torch.no_grad():
+            local_t = torch.tensor(local_rows, dtype=torch.long, device=device)
+            idx_sel = frame_idx.index_select(0, local_t)
+            pose_sel = index_pose(pose, local_t)
+            tensors = clip.tensors(device)
+            root_pos = tensors["root_pos"].index_select(0, idx_sel)
+            root_rot = tensors["root_rot"].index_select(0, idx_sel)
+            pred_pos, pred_rot, _canon = fk_from_pose(clip, root_pos, root_rot, pose_sel, device)
+            gt_pos = tensors["global_pos"].index_select(0, idx_sel)
+            gt_rot = tensors["global_rot"].index_select(0, idx_sel)
+            pred_pos_np = pred_pos.detach().cpu().numpy()
+            pred_rot_np = pred_rot.detach().cpu().numpy()
+            gt_pos_np = gt_pos.detach().cpu().numpy()
+            gt_rot_np = gt_rot.detach().cpu().numpy()
+        for i, row in enumerate(rows):
+            seq = live_sequences.setdefault(row, {"pred_pos": [], "pred_rot": [], "gt_pos": [], "gt_rot": []})
+            seq["pred_pos"].append(pred_pos_np[i])
+            seq["pred_rot"].append(pred_rot_np[i])
+            seq["gt_pos"].append(gt_pos_np[i])
+            seq["gt_rot"].append(gt_rot_np[i])
+
     groups = {}
     for row, ci in enumerate(clip_indices.tolist()):
         groups.setdefault(ci, []).append(row)
@@ -857,6 +919,9 @@ def run_batch(
             clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device
         )
         alive = torch.ones(start.shape[0], device=device)
+        live_local_rows = [local_i for local_i, row in enumerate(rows) if row in live_rows]
+        live_global_rows = [rows[local_i] for local_i in live_local_rows]
+        append_live_frame(clip, live_global_rows, live_local_rows, cur_idx, cur_pose)
 
         group_loss = torch.zeros((), device=device)
         for step in range(rollout_k):
@@ -881,6 +946,7 @@ def run_batch(
                 device,
                 alive if cfg.enable_early_termination else None,
             )
+            append_live_frame(clip, live_global_rows, live_local_rows, target_idx, next_pose)
             group_loss = group_loss + step_loss / rollout_k
             for key, value in parts.items():
                 accum[key] = accum.get(key, torch.zeros((), device=device)) + value / rollout_k
@@ -929,6 +995,29 @@ def run_batch(
     total_loss = total_loss / max(1, group_count)
     scalars = {k: float(v.detach().cpu() / max(1, group_count)) for k, v in accum.items()}
     scalars["total"] = float(total_loss.detach().cpu())
+    if live_bridge is not None and live_clip is not None and live_sequences:
+        ordered_rows = sorted(live_sequences)[: live_bridge.max_agents]
+        frame_count = min(len(live_sequences[row]["pred_pos"]) for row in ordered_rows)
+        if frame_count > 0:
+            live_bridge.write_snapshot(
+                clip=live_clip,
+                epoch=epoch,
+                rollout_k=rollout_k,
+                phase=phase,
+                train_total=scalars["total"],
+                pred_pos=np.stack([
+                    np.stack(live_sequences[row]["pred_pos"][:frame_count], axis=0) for row in ordered_rows
+                ], axis=0),
+                pred_rot=np.stack([
+                    np.stack(live_sequences[row]["pred_rot"][:frame_count], axis=0) for row in ordered_rows
+                ], axis=0),
+                gt_pos=np.stack([
+                    np.stack(live_sequences[row]["gt_pos"][:frame_count], axis=0) for row in ordered_rows
+                ], axis=0),
+                gt_rot=np.stack([
+                    np.stack(live_sequences[row]["gt_rot"][:frame_count], axis=0) for row in ordered_rows
+                ], axis=0),
+            )
     return total_loss, scalars
 
 
@@ -965,6 +1054,77 @@ def parse_rollout_schedule(text: str) -> tuple[int, ...]:
     return values
 
 
+def learning_rate_for_epoch(cfg: TrainConfig, epoch: int, stage_epoch: int, rollout_idx: int) -> float:
+    base_lr = float(cfg.learning_rate)
+    if cfg.lr_warmup_epochs > 0 and epoch <= cfg.lr_warmup_epochs:
+        return base_lr * max(1.0 / cfg.lr_warmup_epochs, epoch / cfg.lr_warmup_epochs)
+    min_factor = max(0.0, min(1.0, float(cfg.lr_min_factor)))
+    schedule = cfg.lr_schedule
+    if schedule in ("constant", "adaptive_plateau"):
+        factor = 1.0
+    elif schedule == "stage_decay":
+        factor = float(cfg.lr_stage_decay) ** rollout_idx
+    elif schedule == "cosine":
+        denom = max(1, cfg.max_epochs - max(0, cfg.lr_warmup_epochs))
+        progress = min(1.0, max(0.0, (epoch - max(0, cfg.lr_warmup_epochs)) / denom))
+        factor = min_factor + 0.5 * (1.0 - min_factor) * (1.0 + math.cos(math.pi * progress))
+    elif schedule == "stage_cosine":
+        stage_len = max(1, int(cfg.curriculum_max_epochs_per_stage))
+        progress = min(1.0, max(0.0, (stage_epoch - 1) / max(1, stage_len - 1)))
+        cosine = min_factor + 0.5 * (1.0 - min_factor) * (1.0 + math.cos(math.pi * progress))
+        factor = (float(cfg.lr_stage_decay) ** rollout_idx) * cosine
+    else:
+        raise ValueError(f"unknown lr_schedule={schedule!r}")
+    return max(base_lr * min_factor, base_lr * factor)
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+@dataclass
+class AdaptiveLrState:
+    best: float = float("inf")
+    bad_epochs: int = 0
+    cooldown: int = 0
+
+
+def reset_adaptive_lr(optimizer: torch.optim.Optimizer, cfg: TrainConfig) -> AdaptiveLrState:
+    set_optimizer_lr(optimizer, cfg.learning_rate)
+    return AdaptiveLrState()
+
+
+def step_adaptive_lr(
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+    state: AdaptiveLrState,
+    metric: float,
+) -> tuple[AdaptiveLrState, bool]:
+    if not math.isfinite(metric):
+        return state, False
+    improved = state.best == float("inf") or metric < state.best * (1.0 - cfg.lr_plateau_threshold)
+    if improved:
+        state.best = metric
+        state.bad_epochs = 0
+        return state, False
+    if state.cooldown > 0:
+        state.cooldown -= 1
+        return state, False
+    state.bad_epochs += 1
+    if state.bad_epochs < cfg.lr_plateau_patience_epochs:
+        return state, False
+    old_lr = float(optimizer.param_groups[0]["lr"])
+    min_lr = float(cfg.learning_rate) * max(0.0, min(1.0, float(cfg.lr_min_factor)))
+    new_lr = max(min_lr, old_lr * float(cfg.lr_plateau_factor))
+    state.bad_epochs = 0
+    state.cooldown = max(0, int(cfg.lr_plateau_cooldown_epochs))
+    if new_lr >= old_lr - 1e-16:
+        return state, False
+    set_optimizer_lr(optimizer, new_lr)
+    return state, True
+
+
 def save_checkpoint(path: Path, model, optimizer, epoch: int, best_val: float, rollout_k: int, cfg, metadata) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint_payload(model, optimizer, epoch, best_val, rollout_k, cfg, metadata), path)
@@ -992,6 +1152,53 @@ def clone_checkpoint_payload(payload: dict) -> dict:
 def save_payload(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+def update_model_comparison_html(clip_path: Path, ckpt_dir: Path, cfg: TrainConfig) -> None:
+    checkpoint = ckpt_dir / "checkpoint_best.pt"
+    if not checkpoint.exists():
+        checkpoint = ckpt_dir / "checkpoint_last.pt"
+    if not checkpoint.exists():
+        print("model comparison refresh skipped: no checkpoint was written", flush=True)
+        return
+
+    output = resolve_path(cfg.comparison_output_path)
+    script = PROJECT_ROOT / "training" / "visualize_model.py"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--npz-path",
+        str(clip_path),
+        "--checkpoint-path",
+        str(checkpoint),
+        "--output-path",
+        str(output),
+        "--device",
+        str(cfg.comparison_device),
+    ]
+    if cfg.comparison_max_frames > 0:
+        cmd.extend(["--max-frames", str(cfg.comparison_max_frames)])
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"model comparison refresh failed: {exc}", flush=True)
+        return
+    if result.returncode != 0:
+        print(f"model comparison refresh failed with exit code {result.returncode}", flush=True)
+        if result.stderr.strip():
+            print(result.stderr.strip(), flush=True)
+        return
+    print(
+        f"model comparison refreshed output={output} checkpoint={checkpoint}",
+        flush=True,
+    )
 
 
 class TimingProfiler:
@@ -1040,6 +1247,166 @@ class TimingProfiler:
         path.write_text("\n".join(",".join(row) for row in rows) + "\n", encoding="utf-8")
 
 
+def replace_with_retry(tmp: Path, target: Path, attempts: int = 12, delay_seconds: float = 0.01) -> bool:
+    for attempt in range(attempts):
+        try:
+            tmp.replace(target)
+            return True
+        except PermissionError:
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return False
+
+
+def write_json_atomic(path: Path, data: dict) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return replace_with_retry(tmp, path)
+
+
+class LiveTrainingBridge:
+    def __init__(self, run_dir: Path, cfg: TrainConfig) -> None:
+        self.run_dir = run_dir
+        self.cfg = cfg
+        self.live_dir = run_dir / "live_training"
+        self.control_path = self.live_dir / "control.json"
+        self.snapshot_path = self.live_dir / "snapshot.npz"
+        self.status_path = self.live_dir / "status.json"
+        self.loss_history_path = self.live_dir / "loss_history.csv"
+        self.process: subprocess.Popen | None = None
+        self.visualize = bool(cfg.live_viewer_start_visualizing)
+        self.stop_requested = False
+        self.control_mtime = 0.0
+        self.max_agents = max(1, int(cfg.live_viewer_max_agents))
+        self.loss_history_file = None
+
+    def start(self) -> None:
+        self.live_dir.mkdir(parents=True, exist_ok=True)
+        if not self.loss_history_path.exists():
+            self.loss_history_path.write_text("epoch,elapsed_seconds,rollout_k,train_total\n", encoding="utf-8")
+        self.loss_history_file = self.loss_history_path.open("a", encoding="utf-8", buffering=1)
+        write_json_atomic(
+            self.control_path,
+            {
+                "visualize": bool(self.cfg.live_viewer_start_visualizing),
+                "show_ground_truth": True,
+                "stop": False,
+                "updated_at": time.time(),
+            },
+        )
+        script = PROJECT_ROOT / "training" / "live_training_viewer.py"
+        cmd = [sys.executable, str(script), "--run-dir", str(self.run_dir)]
+        if self.cfg.live_viewer_start_visualizing:
+            cmd.append("--start-visualizing")
+        stdout = open(self.live_dir / "viewer_stdout.log", "a", encoding="utf-8")
+        stderr = open(self.live_dir / "viewer_stderr.log", "a", encoding="utf-8")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=stdout,
+                stderr=stderr,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            print(f"live training viewer disabled: {exc}", flush=True)
+            self.process = None
+
+    def poll_control(self) -> bool:
+        try:
+            mtime = self.control_path.stat().st_mtime
+            data = json.loads(self.control_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            self.visualize = False
+            self.stop_requested = False
+            return False
+        self.control_mtime = mtime
+        self.visualize = bool(data.get("visualize", False))
+        self.stop_requested = bool(data.get("stop", False))
+        return self.visualize
+
+    def write_loss_point(self, epoch: int, rollout_k: int, train_total: float, elapsed_seconds: float) -> None:
+        if self.loss_history_file is None:
+            return
+        try:
+            self.loss_history_file.write(
+                f"{int(epoch)},{float(elapsed_seconds):.6f},{int(rollout_k)},{float(train_total):.9g}\n"
+            )
+        except OSError:
+            pass
+
+    def write_status(self, epoch: int, rollout_k: int, train_total: float | None = None) -> None:
+        _ok = write_json_atomic(
+            self.status_path,
+            {
+                "epoch": int(epoch),
+                "rollout_k": int(rollout_k),
+                "train_total": None if train_total is None else float(train_total),
+                "updated_at": time.time(),
+            },
+        )
+
+    def write_snapshot(
+        self,
+        *,
+        clip: "MotionClip",
+        epoch: int,
+        rollout_k: int,
+        phase: str,
+        train_total: float,
+        pred_pos: np.ndarray,
+        pred_rot: np.ndarray,
+        gt_pos: np.ndarray,
+        gt_rot: np.ndarray,
+    ) -> None:
+        tmp = self.snapshot_path.with_suffix(".npz.tmp")
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("wb") as f:
+            np.savez(
+                f,
+                epoch=np.asarray([int(epoch)], dtype=np.int64),
+                rollout_k=np.asarray([int(rollout_k)], dtype=np.int64),
+                phase=np.asarray([phase]),
+                train_total=np.asarray([float(train_total)], dtype=np.float32),
+                fps=np.asarray([float(clip.fps)], dtype=np.float32),
+                body_names=np.asarray(clip.body_names),
+                parents=np.asarray(clip.parents_body, dtype=np.int64),
+                pred_pos=pred_pos.astype(np.float32, copy=False),
+                pred_rot=pred_rot.astype(np.float32, copy=False),
+                gt_pos=gt_pos.astype(np.float32, copy=False),
+                gt_rot=gt_rot.astype(np.float32, copy=False),
+            )
+        replace_with_retry(tmp, self.snapshot_path)
+
+    def close(self) -> None:
+        if self.loss_history_file is not None:
+            try:
+                self.loss_history_file.close()
+            except OSError:
+                pass
+            self.loss_history_file = None
+        if self.cfg.live_viewer_close_on_exit and self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+
+
+def index_pose(pose: dict[str, torch.Tensor], indices: torch.Tensor) -> dict[str, torch.Tensor]:
+    out = {}
+    max_index = int(indices.max().item()) if indices.numel() > 0 else -1
+    for key, value in pose.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] > max_index:
+            out[key] = value.index_select(0, indices)
+        else:
+            out[key] = value
+    return out
+
+
 def train(args: argparse.Namespace) -> None:
     process_start_time = time.perf_counter()
     cfg = TrainConfig()
@@ -1054,6 +1421,24 @@ def train(args: argparse.Namespace) -> None:
         cfg.num_workers = args.num_workers
     if args.learning_rate is not None:
         cfg.learning_rate = args.learning_rate
+    if args.lr_schedule is not None:
+        cfg.lr_schedule = args.lr_schedule
+    if args.lr_min_factor is not None:
+        cfg.lr_min_factor = args.lr_min_factor
+    if args.lr_stage_decay is not None:
+        cfg.lr_stage_decay = args.lr_stage_decay
+    if args.lr_warmup_epochs is not None:
+        cfg.lr_warmup_epochs = max(0, int(args.lr_warmup_epochs))
+    if args.lr_plateau_factor is not None:
+        cfg.lr_plateau_factor = args.lr_plateau_factor
+    if args.lr_plateau_patience_epochs is not None:
+        cfg.lr_plateau_patience_epochs = max(1, int(args.lr_plateau_patience_epochs))
+    if args.lr_plateau_threshold is not None:
+        cfg.lr_plateau_threshold = args.lr_plateau_threshold
+    if args.lr_plateau_cooldown_epochs is not None:
+        cfg.lr_plateau_cooldown_epochs = max(0, int(args.lr_plateau_cooldown_epochs))
+    if args.lr_reset_on_rollout_advance is not None:
+        cfg.lr_reset_on_rollout_advance = bool(args.lr_reset_on_rollout_advance)
     if args.val_fraction is not None:
         cfg.val_fraction = args.val_fraction
     if args.predict_residual is not None:
@@ -1100,6 +1485,22 @@ def train(args: argparse.Namespace) -> None:
         cfg.training_loop = args.training_loop
     if args.agent_sampling is not None:
         cfg.agent_sampling = args.agent_sampling
+    if args.live_viewer is not None:
+        cfg.live_viewer = bool(args.live_viewer)
+    if args.live_viewer_max_agents is not None:
+        cfg.live_viewer_max_agents = max(1, int(args.live_viewer_max_agents))
+    if args.live_viewer_start_visualizing:
+        cfg.live_viewer_start_visualizing = True
+    if args.live_viewer_close_on_exit:
+        cfg.live_viewer_close_on_exit = True
+    if args.update_comparison_on_exit is not None:
+        cfg.update_comparison_on_exit = bool(args.update_comparison_on_exit)
+    if args.comparison_output_path is not None:
+        cfg.comparison_output_path = args.comparison_output_path
+    if args.comparison_device is not None:
+        cfg.comparison_device = args.comparison_device
+    if args.comparison_max_frames is not None:
+        cfg.comparison_max_frames = max(0, int(args.comparison_max_frames))
     if args.enable_early_termination:
         cfg.enable_early_termination = True
     if args.no_restart_on_termination:
@@ -1252,10 +1653,16 @@ def train(args: argparse.Namespace) -> None:
 
     run_dir = resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
+    live_bridge = None
+    if cfg.live_viewer:
+        with profiler.section("setup/live_viewer_launch"):
+            live_bridge = LiveTrainingBridge(run_dir, cfg)
+            live_bridge.start()
     with profiler.section("setup/tensorboard_writer"):
         writer = SummaryWriter(run_dir / "tb")
     metadata = {
         "npz_folder": str(npz_folder),
+        "source_npz_paths": [str(clip.path) for clip in clips],
         "body_names": clips[0].body_names,
         "parents_body": clips[0].parents_body.tolist(),
         "pelvis_index": clips[0].pelvis,
@@ -1298,6 +1705,8 @@ def train(args: argparse.Namespace) -> None:
     target_reached_epoch = None
     target_reached_seconds = None
     pending_best_payload = None
+    stop_requested = False
+    adaptive_lr_state = reset_adaptive_lr(optimizer, cfg) if cfg.lr_schedule == "adaptive_plateau" else None
 
     def flush_pending_best() -> None:
         nonlocal pending_best_payload
@@ -1310,16 +1719,45 @@ def train(args: argparse.Namespace) -> None:
         pending_best_payload = None
 
     for epoch in range(1, cfg.max_epochs + 1):
+        if live_bridge is not None:
+            live_bridge.poll_control()
+            if live_bridge.stop_requested:
+                print(f"live viewer stop requested before epoch={epoch}", flush=True)
+                break
         epoch_start = time.perf_counter()
+        stage_epoch = epoch - stage_start_epoch + 1
+        if cfg.lr_schedule == "adaptive_plateau":
+            current_lr = float(optimizer.param_groups[0]["lr"])
+        else:
+            current_lr = learning_rate_for_epoch(cfg, epoch, stage_epoch, rollout_idx)
+            set_optimizer_lr(optimizer, current_lr)
         model.train()
         train_parts = []
         train_iter = [current_agent_batch()] if cfg.training_loop == "agents" else train_loader
         pbar = tqdm(train_iter, desc=f"epoch {epoch} train K={rollout_k}", leave=False, disable=not cfg.show_progress)
         for batch in pbar:
+            live_capture = None
+            if live_bridge is not None:
+                live_bridge.poll_control()
+                if live_bridge.stop_requested:
+                    stop_requested = True
+                    break
+                live_capture = live_bridge if live_bridge.visualize else None
             with profiler.section("train/zero_grad"):
                 optimizer.zero_grad(set_to_none=True)
             with profiler.section("train/forward_loss"):
-                loss, scalars = run_batch(model, clips, batch, cfg, rollout_k, device, train=True)
+                loss, scalars = run_batch(
+                    model,
+                    clips,
+                    batch,
+                    cfg,
+                    rollout_k,
+                    device,
+                    train=True,
+                    live_bridge=live_capture,
+                    epoch=epoch,
+                    phase="train",
+                )
             with profiler.section("train/backward"):
                 loss.backward()
             with profiler.section("train/clip_grad"):
@@ -1331,6 +1769,10 @@ def train(args: argparse.Namespace) -> None:
             train_parts.append(scalars)
             if cfg.show_progress:
                 pbar.set_postfix(loss=f"{scalars['total']:.4f}")
+
+        if stop_requested and not train_parts:
+            print(f"live viewer stop requested during epoch={epoch}", flush=True)
+            break
 
         model.eval()
         val_parts = []
@@ -1349,6 +1791,9 @@ def train(args: argparse.Namespace) -> None:
         train_total = mean_scalar(train_parts, "total")
         val_total = mean_scalar(val_parts, "total")
         elapsed_seconds = time.perf_counter() - start_time
+        if live_bridge is not None:
+            live_bridge.write_loss_point(epoch, rollout_k, train_total, elapsed_seconds)
+            live_bridge.write_status(epoch, rollout_k, train_total)
         epoch_seconds = time.perf_counter() - epoch_start
         if baseline_val is None:
             baseline_val = val_total
@@ -1384,7 +1829,7 @@ def train(args: argparse.Namespace) -> None:
                 writer.add_scalar(f"loss/train_{key}", mean_scalar(train_parts, key), epoch)
                 writer.add_scalar(f"loss/validation_{key}", mean_scalar(val_parts, key), epoch)
             writer.add_scalar("curriculum/rollout_k", rollout_k, epoch)
-            writer.add_scalar("optim/learning_rate", optimizer.param_groups[0]["lr"], epoch)
+            writer.add_scalar("optim/learning_rate", current_lr, epoch)
             writer.add_scalar("timing/epoch_seconds", epoch_seconds, epoch)
             writer.add_scalar("timing/elapsed_seconds", elapsed_seconds, epoch)
             writer.add_scalar("timing/validation_loss_reduction", reduction, epoch)
@@ -1416,7 +1861,7 @@ def train(args: argparse.Namespace) -> None:
                     metadata,
                 )
 
-        stage_epochs = epoch - stage_start_epoch + 1
+        stage_epochs = stage_epoch
         can_advance_by_loss = (
             val_total <= cfg.curriculum_threshold
             and stage_epochs >= cfg.curriculum_min_epochs
@@ -1440,6 +1885,7 @@ def train(args: argparse.Namespace) -> None:
             or can_advance_by_stall
         )
         was_final_stage = rollout_idx == len(schedule) - 1
+        lr_reduced = False
         if should_advance and rollout_idx < len(schedule) - 1:
             flush_pending_best()
             reason = "loss" if stable_epochs >= cfg.curriculum_patience_epochs else "epoch_cap"
@@ -1454,6 +1900,9 @@ def train(args: argparse.Namespace) -> None:
                 reset_agent_state(rollout_k)
             best_val = float("inf")
             stage_start_epoch = epoch + 1
+            if cfg.lr_schedule == "adaptive_plateau" and cfg.lr_reset_on_rollout_advance:
+                adaptive_lr_state = reset_adaptive_lr(optimizer, cfg)
+                current_lr = cfg.learning_rate
             val_sample_text = "disabled" if val_loader is None else str(len(val_loader.dataset))
             if cfg.training_loop == "agents":
                 train_sample_text = (
@@ -1469,11 +1918,14 @@ def train(args: argparse.Namespace) -> None:
             )
             stable_epochs = 0
             stall_epochs = 0
+        elif cfg.lr_schedule == "adaptive_plateau" and adaptive_lr_state is not None:
+            adaptive_lr_state, lr_reduced = step_adaptive_lr(optimizer, cfg, adaptive_lr_state, val_total)
 
         print(
             f"epoch={epoch:04d} K={rollout_k:02d} train={train_total:.6f} "
             f"val={val_total:.6f} best={best_val:.6f} "
             f"reduction={reduction * 100.0:.2f}% stall={stall_epochs} "
+            f"lr={current_lr:.3g}{'->' + format(optimizer.param_groups[0]['lr'], '.3g') if lr_reduced else ''} "
             f"epoch_s={epoch_seconds:.2f} elapsed_s={elapsed_seconds:.2f}",
             flush=True,
         )
@@ -1502,6 +1954,9 @@ def train(args: argparse.Namespace) -> None:
                 flush=True,
             )
             break
+        if stop_requested:
+            print(f"live viewer stop requested after epoch={epoch}", flush=True)
+            break
 
     with profiler.section("logging/tensorboard_close"):
         writer.close()
@@ -1510,6 +1965,9 @@ def train(args: argparse.Namespace) -> None:
         save_checkpoint(ckpt_dir / "checkpoint_last.pt", model, optimizer, epoch, best_val, rollout_k, cfg, metadata)
     total_seconds = time.perf_counter() - start_time
     profiler.write_csv(run_dir / "timing_profile.csv", time.perf_counter() - process_start_time)
+    if cfg.update_comparison_on_exit:
+        with profiler.section("postprocess/update_model_comparison"):
+            update_model_comparison_html(clips[0].path, ckpt_dir, cfg)
     if target_reached_epoch is None and baseline_val is not None and target_val is not None:
         print(
             f"target_loss_reduction={cfg.target_loss_reduction * 100.0:.2f}% not reached "
@@ -1521,6 +1979,8 @@ def train(args: argparse.Namespace) -> None:
             f"timing_summary target_epoch={target_reached_epoch} "
             f"target_elapsed_s={target_reached_seconds:.2f} total_elapsed_s={total_seconds:.2f}"
         )
+    if live_bridge is not None:
+        live_bridge.close()
 
 
 def main() -> None:
@@ -1532,6 +1992,19 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "cosine", "stage_decay", "stage_cosine", "adaptive_plateau"),
+        default=None,
+    )
+    parser.add_argument("--lr-min-factor", type=float, default=None)
+    parser.add_argument("--lr-stage-decay", type=float, default=None)
+    parser.add_argument("--lr-warmup-epochs", type=int, default=None)
+    parser.add_argument("--lr-plateau-factor", type=float, default=None)
+    parser.add_argument("--lr-plateau-patience-epochs", type=int, default=None)
+    parser.add_argument("--lr-plateau-threshold", type=float, default=None)
+    parser.add_argument("--lr-plateau-cooldown-epochs", type=int, default=None)
+    parser.add_argument("--lr-reset-on-rollout-advance", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--val-fraction", type=float, default=None)
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=None)
@@ -1561,6 +2034,14 @@ def main() -> None:
     parser.add_argument("--zero-contact-state", action="store_true")
     parser.add_argument("--training-loop", choices=("sampled", "agents"), default=None)
     parser.add_argument("--agent-sampling", choices=("random", "coverage"), default=None)
+    parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--live-viewer-max-agents", type=int, default=None)
+    parser.add_argument("--live-viewer-start-visualizing", action="store_true")
+    parser.add_argument("--live-viewer-close-on-exit", action="store_true")
+    parser.add_argument("--update-comparison-on-exit", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--comparison-output-path", default=None)
+    parser.add_argument("--comparison-device", default=None)
+    parser.add_argument("--comparison-max-frames", type=int, default=None)
     parser.add_argument("--enable-early-termination", action="store_true")
     parser.add_argument("--no-restart-on-termination", action="store_true")
     parser.add_argument("--freefall-body-height-offset-m", type=float, default=None)

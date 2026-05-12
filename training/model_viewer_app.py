@@ -3936,6 +3936,9 @@ class ModelViewerApp(tk.Tk):
         actor = self.selected_controller_actor()
         if actor is None:
             return
+        if not self.controller_enabled_var.get():
+            self.gl_draw_authored_root_trajectory(actor)
+            return
         root = self.actor_root_world(actor)
         if root is None:
             return
@@ -3974,6 +3977,52 @@ class ModelViewerApp(tk.Tk):
                 GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
                 GL.glEnd()
                 last = point
+        finally:
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glPopAttrib()
+
+    def authored_root_trajectory_points(self, actor: Actor) -> list[np.ndarray]:
+        if actor.clip is None:
+            return []
+        settings = self.controller_settings()
+        frame = max(0, min(actor.clip.T - 1, int(round(float(self.frame)))))
+        fps = max(1.0, float(actor.clip.fps))
+        steps = max(1, min(48, int(math.ceil(settings.trajectory_seconds / settings.trajectory_step_seconds))))
+        dt = settings.trajectory_seconds / steps
+        points = []
+        for step in range(0, steps + 1):
+            sample_frame = max(0, min(actor.clip.T - 1, int(round(frame + step * dt * fps))))
+            root = actor.clip.root_pos[sample_frame].detach().cpu().numpy().astype(np.float32) + actor.offset
+            points.append(np.asarray([root[0], FOOT_CONTACT_CONFIG.ground_y + 0.018, root[2]], dtype=np.float32))
+        return points
+
+    def gl_draw_authored_root_trajectory(self, actor: Actor) -> None:
+        points = self.authored_root_trajectory_points(actor)
+        if len(points) < 2:
+            return
+        GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT | GL.GL_LINE_BIT | GL.GL_POINT_BIT)
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDepthMask(GL.GL_FALSE)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glEnable(GL.GL_LINE_SMOOTH)
+        try:
+            GL.glColor4f(0.42, 1.0, 0.78, 0.82)
+            GL.glLineWidth(2.0)
+            for idx in range(1, len(points)):
+                if idx % 2 == 1:
+                    last = points[idx - 1]
+                    point = points[idx]
+                    GL.glBegin(GL.GL_LINES)
+                    GL.glVertex3f(float(last[0]), float(last[1]), float(last[2]))
+                    GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+                    GL.glEnd()
+                GL.glPointSize(5.0 if idx < len(points) - 1 else 7.0)
+                point = points[idx]
+                GL.glBegin(GL.GL_POINTS)
+                GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+                GL.glEnd()
         finally:
             GL.glDepthMask(GL.GL_TRUE)
             GL.glPopAttrib()
