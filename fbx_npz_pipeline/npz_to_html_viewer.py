@@ -207,6 +207,43 @@ HTML_TEMPLATE = r"""<!doctype html>
     function mul3(a, s) {{ return [a[0] * s, a[1] * s, a[2] * s]; }}
     function dot3(a, b) {{ return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }}
     function len3(a) {{ return Math.max(1e-6, Math.hypot(a[0], a[1], a[2])); }}
+    function norm3(a) {{
+      const l = len3(a);
+      return [a[0] / l, a[1] / l, a[2] / l];
+    }}
+    function cross3(a, b) {{
+      return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+      ];
+    }}
+
+    function chooseBasisAxes(bone, direction, fallbackForwardAxis) {{
+      const basis = [basisAxisAt(frame, bone, 0), basisAxisAt(frame, bone, 1), basisAxisAt(frame, bone, 2)].map(norm3);
+      let forwardIndex = fallbackForwardAxis;
+      let forwardDot = dot3(basis[forwardIndex], direction);
+      if (len3(direction) > 1e-5) {{
+        let best = -1;
+        for (let i = 0; i < 3; i++) {{
+          const d = dot3(basis[i], direction);
+          if (Math.abs(d) > best) {{
+            best = Math.abs(d);
+            forwardIndex = i;
+            forwardDot = d;
+          }}
+        }}
+      }}
+      let forward = basis[forwardIndex].slice();
+      if (forwardDot < 0) forward = mul3(forward, -1);
+      const remaining = [0, 1, 2].filter(i => i !== forwardIndex);
+      let upIndex = remaining[0];
+      if (Math.abs(basis[remaining[1]][1]) > Math.abs(basis[upIndex][1])) upIndex = remaining[1];
+      let up = basis[upIndex].slice();
+      if (up[1] < 0) up = mul3(up, -1);
+      let side = norm3(cross3(up, forward));
+      return {{ forward: norm3(forward), side, up: norm3(up) }};
+    }}
 
     function isHelperName(name) {{
       return name.includes("_twist_") ||
@@ -266,8 +303,8 @@ HTML_TEMPLATE = r"""<!doctype html>
     ].filter(v => v.ankle !== undefined && v.toe !== undefined);
 
     const handSpecs = [
-      {{ bone: nameToIndex.get("hand_l"), mid: nameToIndex.get("middle_03_l"), side: "l" }},
-      {{ bone: nameToIndex.get("hand_r"), mid: nameToIndex.get("middle_03_r"), side: "r" }}
+      {{ bone: nameToIndex.get("hand_l"), mid: nameToIndex.get("middle_03_l"), parent: nameToIndex.get("lowerarm_l"), side: "l" }},
+      {{ bone: nameToIndex.get("hand_r"), mid: nameToIndex.get("middle_03_r"), parent: nameToIndex.get("lowerarm_r"), side: "r" }}
     ].filter(v => v.bone !== undefined);
 
     function colorFor(name) {{
@@ -331,12 +368,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawFootBlock(ankle, toe, side) {{
       const foot = posAt(frame, ankle);
       const toePos = posAt(frame, toe);
-      let up = basisAxisAt(frame, ankle, 0);
-      let forward = basisAxisAt(frame, ankle, 1);
-      const sideAxis = basisAxisAt(frame, ankle, 2);
       const toeVector = sub3(toePos, foot);
-      if (dot3(forward, toeVector) < 0) forward = mul3(forward, -1);
-      if (up[1] < 0) up = mul3(up, -1);
+      const axes = chooseBasisAxes(ankle, toeVector, 1);
+      const forward = axes.forward;
+      const up = axes.up;
+      const sideAxis = axes.side;
 
       const ballDistance = Math.max(10, Math.min(28, Math.abs(dot3(toeVector, forward))));
       const heelLength = 7.0;
@@ -353,12 +389,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawToeBlock(ankle, toe) {{
       const foot = posAt(frame, ankle);
       const toePos = posAt(frame, toe);
-      let forward = basisAxisAt(frame, toe, 0);
-      let up = basisAxisAt(frame, toe, 1);
-      const sideAxis = basisAxisAt(frame, toe, 2);
       const toeVector = sub3(toePos, foot);
-      if (dot3(forward, toeVector) < 0) forward = mul3(forward, -1);
-      if (up[1] < 0) up = mul3(up, -1);
+      const axes = chooseBasisAxes(toe, toeVector, 0);
+      const forward = axes.forward;
+      const up = axes.up;
+      const sideAxis = axes.side;
       const toeLength = 6.5;
       const center = add3(add3(toePos, mul3(forward, toeLength * 0.5)), mul3(up, -0.6));
       drawOrientedBox(center, forward, sideAxis, up, [toeLength, 11.0, 6.4], colorFor(names[toe]), "rgba(236, 218, 202, 0.34)");
@@ -368,14 +403,20 @@ HTML_TEMPLATE = r"""<!doctype html>
     function drawHandBox(spec) {{
       const bone = spec.bone;
       const hand = posAt(frame, bone);
-      let forward = basisAxisAt(frame, bone, 0);
-      const sideAxis = basisAxisAt(frame, bone, 1);
-      let up = basisAxisAt(frame, bone, 2);
+      let guide = null;
       if (spec.mid !== undefined) {{
-        const fingerVector = sub3(posAt(frame, spec.mid), hand);
-        if (dot3(forward, fingerVector) < 0) forward = mul3(forward, -1);
+        guide = sub3(posAt(frame, spec.mid), hand);
       }}
-      if (up[1] < 0) up = mul3(up, -1);
+      if ((guide === null || len3(guide) < 1e-5) && spec.parent !== undefined) {{
+        guide = sub3(hand, posAt(frame, spec.parent));
+      }}
+      if (guide === null || len3(guide) < 1e-5) {{
+        guide = basisAxisAt(frame, bone, 0);
+      }}
+      const axes = chooseBasisAxes(bone, guide, 0);
+      const forward = axes.forward;
+      const up = axes.up;
+      const sideAxis = axes.side;
       const center = add3(add3(hand, mul3(forward, 5.2)), mul3(up, -0.25));
       drawOrientedBox(center, forward, up, sideAxis, [12.5, 11.5, 3.8], colorFor(names[bone]), "rgba(236, 218, 202, 0.38)");
       drawAxisTick(center, forward, 8, colorFor(names[bone]));
@@ -628,12 +669,12 @@ def canonicalize_for_view(data: np.lib.npyio.NpzFile, positions: np.ndarray) -> 
 
     if up_axis == 3:
         # FBX Z-up/Unreal-style source -> viewer/training Y-up convention:
-        # canonical x = source y, canonical y = source z, canonical z = source x.
-        perm = [1, 2, 0]
-        positions = positions[..., perm].copy()
-        basis = basis[..., :, perm].copy()
+        # canonical x = source x, canonical y = source z, canonical z = -source y.
+        p = np.asarray([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        positions = (positions @ p).copy()
+        basis = (p.T @ basis @ p).copy()
         axis_info["canonicalized"] = True
-        axis_info["mapping"] = "z_up_to_y_up_yzx"
+        axis_info["mapping"] = "z_up_to_y_up_xz_minus_y"
 
     return positions, basis, axis_info
 

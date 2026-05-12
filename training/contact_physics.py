@@ -28,6 +28,38 @@ def normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return v / torch.clamp(torch.linalg.norm(v, dim=-1, keepdim=True), min=eps)
 
 
+def basis_axes_from_direction(
+    basis: torch.Tensor,
+    direction: torch.Tensor,
+    fallback_forward_axis: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    basis = normalize(basis)
+    direction_n = normalize(direction)
+    dots = (basis * direction_n.unsqueeze(-2)).sum(dim=-1)
+    forward_index = torch.argmax(torch.abs(dots), dim=-1)
+    if fallback_forward_axis >= 0:
+        direction_len = torch.linalg.norm(direction, dim=-1)
+        fallback = torch.full_like(forward_index, int(fallback_forward_axis))
+        forward_index = torch.where(direction_len > 1e-8, forward_index, fallback)
+
+    gather_index = forward_index[:, None, None].expand(-1, 1, 3)
+    forward = basis.gather(1, gather_index).squeeze(1)
+    forward_dot = dots.gather(1, forward_index[:, None])
+    forward = torch.where(forward_dot < 0.0, -forward, forward)
+
+    up_score = torch.abs(basis[:, :, 1])
+    up_score = up_score.masked_fill(
+        torch.arange(3, device=basis.device).unsqueeze(0) == forward_index.unsqueeze(1),
+        -1.0,
+    )
+    up_index = torch.argmax(up_score, dim=-1)
+    up = basis.gather(1, up_index[:, None, None].expand(-1, 1, 3)).squeeze(1)
+    up = torch.where(up[:, 1:2] < 0.0, -up, up)
+
+    side = normalize(torch.cross(up, forward, dim=-1))
+    return normalize(forward), side, normalize(up)
+
+
 def box_lowest_point_signed_height(
     center: torch.Tensor,
     axis_x: torch.Tensor,
@@ -54,26 +86,12 @@ def foot_toe_box_specs(
     toe = positions[:, toe_index]
     toe_vec = toe - foot
 
-    up = rotations[:, foot_index, 0].clone()
-    forward = rotations[:, foot_index, 1].clone()
-    side = rotations[:, foot_index, 2].clone()
-    forward = torch.where((forward * toe_vec).sum(dim=-1, keepdim=True) < 0.0, -forward, forward)
-    up = torch.where(up[:, 1:2] < 0.0, -up, up)
-    forward = normalize(forward)
-    side = normalize(side)
-    up = normalize(up)
+    forward, side, up = basis_axes_from_direction(rotations[:, foot_index], toe_vec, 1)
     foot_dims = (cfg.foot_length, cfg.foot_width, cfg.foot_height)
     heel_back = toe - forward * cfg.foot_length
     foot_center = heel_back + forward * (cfg.foot_length * 0.5) + up * cfg.sole_vertical_offset
 
-    toe_forward = rotations[:, toe_index, 0].clone()
-    toe_up = rotations[:, toe_index, 1].clone()
-    toe_side = rotations[:, toe_index, 2].clone()
-    toe_forward = torch.where((toe_forward * toe_vec).sum(dim=-1, keepdim=True) < 0.0, -toe_forward, toe_forward)
-    toe_up = torch.where(toe_up[:, 1:2] < 0.0, -toe_up, toe_up)
-    toe_forward = normalize(toe_forward)
-    toe_side = normalize(toe_side)
-    toe_up = normalize(toe_up)
+    toe_forward, toe_side, toe_up = basis_axes_from_direction(rotations[:, toe_index], toe_vec, 0)
     toe_dims = (cfg.toe_length, cfg.toe_width, cfg.toe_height)
     toe_center = toe + toe_forward * (cfg.toe_length * 0.5) + toe_up * cfg.sole_vertical_offset
     return [

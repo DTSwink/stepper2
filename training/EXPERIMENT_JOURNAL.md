@@ -306,3 +306,32 @@ not exact phase/state alignment. Increasing rollout K helps because the model
 must keep its own generated states inside the AE transition manifold for longer.
 
 The shared comparison HTML currently points to the K32 pure-AE run above.
+
+## 2026-05-12 - UE5 FBX Axis Compatibility
+
+Problem: a UE5 FBX under `ue5/test` reported a Z-up axis system while the
+Cascadeur FBX files report Y-up. The old read-time canonicalization only worked
+for the Cascadeur-style data and made UE5 FK reconstruction and collider
+orientation visibly wrong.
+
+Fix:
+
+- Z-up UE5 sources are now canonicalized as
+  `canonical = [source_x, source_z, -source_y]`, which makes source `-Y`
+  become training/viewer `+Z` forward.
+- Rotation matrices are transformed with the matching row-vector change of
+  basis, `R_canonical = P^-1 R_source P`.
+- Foot/toe collider axes are now selected from the actual bone basis using the
+  foot-to-ball vector plus the vertical axis, instead of hardcoding Cascadeur
+  foot axes.
+- Hand colliders now choose their width/up axes from the actual hand basis after
+  choosing a forward guide from fingers or forearm direction.
+
+Verification:
+
+- Cascadeur `testcasc.npz` FK reconstruction stayed unchanged at about
+  `0.0017 m` mean position error.
+- UE5 `M_Neutral_Walk_Loop_F.npz` FK reconstruction improved from about
+  `1.34 m` mean position error to about `0.0061 m`.
+- The regenerated UE5 NPZ now loads with root motion along canonical `+Z` and
+  contact counts `contactL=69`, `contactR=68`.

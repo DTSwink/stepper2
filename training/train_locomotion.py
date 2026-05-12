@@ -244,17 +244,24 @@ def axis_up_axis(arrays: np.lib.npyio.NpzFile) -> int:
 
 def canonicalize_positions(pos: torch.Tensor, up_axis: int) -> torch.Tensor:
     if up_axis == 3:
-        return pos[..., [1, 2, 0]]
+        # UE/FBX Z-up convention in this project: source +Z is vertical and
+        # source -Y is forward. Convert to the training convention: +Y up,
+        # +Z forward, preserving a right-handed row-vector basis.
+        return torch.stack((pos[..., 0], pos[..., 2], -pos[..., 1]), dim=-1)
     return pos
 
 
 def canonicalize_rotations(rot: torch.Tensor, up_axis: int) -> torch.Tensor:
     if up_axis != 3:
         return rot
-    # Row-vector convention, p_c = p_s P, R_c = P^-1 R_s P.
-    perm = torch.tensor([1, 2, 0], dtype=torch.long, device=rot.device)
-    inv = torch.tensor([2, 0, 1], dtype=torch.long, device=rot.device)
-    return rot.index_select(-2, inv).index_select(-1, perm)
+    # Row-vector convention. With p_c = p_s P, rotations transform as
+    # R_c = P^-1 R_s P.
+    p = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        dtype=rot.dtype,
+        device=rot.device,
+    )
+    return p.transpose(0, 1) @ rot @ p
 
 
 class MotionClip:

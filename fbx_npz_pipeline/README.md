@@ -69,6 +69,20 @@ from the NPZ directly, so it avoids Blender/BVH bone-axis issues, but the final
 authority for game fidelity should still be the later `NPZ -> FBX -> Unreal`
 round trip.
 
+## Coordinate Conventions
+
+The raw NPZ keeps the FBX SDK-evaluated transforms untouched for round-tripping.
+Training, contact generation, and viewers canonicalize only at read time:
+
+- Cascadeur exports in this project report Y-up, so the data is used directly.
+- UE5 exports report Z-up, so it is mapped to the training convention with
+  `canonical = [source_x, source_z, -source_y]`.
+
+Rotation matrices use the FBX row-vector convention, so the same UE5 conversion
+is applied as `R_canonical = P^-1 R_source P`. Foot and hand collider axes are
+chosen from the actual bone basis and nearby anatomy instead of assuming one
+fixed Cascadeur bone-axis layout.
+
 ## Rebuilding FBX Files
 
 Rebuild an FBX animation from an NPZ using a matching template/reference FBX:

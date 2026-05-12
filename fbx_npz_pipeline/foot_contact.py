@@ -24,6 +24,10 @@ class FootContactConfig:
 
 DEFAULT_CONFIG = FootContactConfig()
 CONTACT_NAMES = np.asarray(["contactL", "contactR"])
+Z_UP_TO_Y_UP = np.asarray(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+    dtype=np.float32,
+)
 
 
 def _normalize_axis(axis: np.ndarray) -> np.ndarray:
@@ -35,7 +39,7 @@ def _normalize_axis(axis: np.ndarray) -> np.ndarray:
 def canonicalize_positions(positions: np.ndarray, up_axis: int) -> np.ndarray:
     positions = np.asarray(positions, dtype=np.float32)
     if int(up_axis) == 3:
-        return positions[..., [1, 2, 0]].copy()
+        return (positions @ Z_UP_TO_Y_UP).copy()
     return positions.copy()
 
 
@@ -43,9 +47,42 @@ def canonicalize_rotations(rotations: np.ndarray, up_axis: int) -> np.ndarray:
     rotations = np.asarray(rotations, dtype=np.float32)
     if int(up_axis) != 3:
         return rotations.copy()
-    # Same row-vector convention as training/model_viewer_app.py:
-    # source Z-up -> canonical Y-up, with x=source y, y=source z, z=source x.
-    return rotations[..., :, [1, 2, 0]].copy()
+    # Row-vector convention: p_c = p_s P, so R_c = P^-1 R_s P.
+    return (Z_UP_TO_Y_UP.T @ rotations @ Z_UP_TO_Y_UP).copy()
+
+
+def _basis_axes_from_direction(
+    basis: np.ndarray,
+    direction: np.ndarray,
+    fallback_forward_axis: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    basis = _normalize_axis(np.asarray(basis, dtype=np.float32))
+    direction = np.asarray(direction, dtype=np.float32)
+    direction_len = float(np.linalg.norm(direction))
+    if direction_len > 1e-8:
+        direction = direction / direction_len
+        dots = basis @ direction
+        forward_index = int(np.argmax(np.abs(dots)))
+        forward = basis[forward_index].copy()
+        if float(dots[forward_index]) < 0.0:
+            forward *= -1.0
+    else:
+        forward_index = int(fallback_forward_axis)
+        forward = basis[forward_index].copy()
+
+    remaining = [i for i in range(3) if i != forward_index]
+    up_index = max(remaining, key=lambda i: abs(float(basis[i, 1])))
+    up = basis[up_index].copy()
+    if float(up[1]) < 0.0:
+        up *= -1.0
+
+    side = np.cross(up, forward).astype(np.float32)
+    side_len = float(np.linalg.norm(side))
+    if side_len <= 1e-8:
+        side = basis[[i for i in remaining if i != up_index][0]].copy()
+    else:
+        side /= side_len
+    return _normalize_axis(forward), _normalize_axis(side), _normalize_axis(up)
 
 
 def box_lowest_point_signed_height(
@@ -157,31 +194,13 @@ def foot_toe_box_specs(
     toe_pos = np.asarray(positions[toe_index], dtype=np.float32)
     toe_vector = toe_pos - foot
 
-    up = np.asarray(rotations[foot_index, 0], dtype=np.float32).copy()
-    forward = np.asarray(rotations[foot_index, 1], dtype=np.float32).copy()
-    side = np.asarray(rotations[foot_index, 2], dtype=np.float32).copy()
-    if float(np.dot(forward, toe_vector)) < 0.0:
-        forward *= -1.0
-    if float(up[1]) < 0.0:
-        up *= -1.0
-    forward = _normalize_axis(forward)
-    side = _normalize_axis(side)
-    up = _normalize_axis(up)
+    forward, side, up = _basis_axes_from_direction(rotations[foot_index], toe_vector, 1)
 
     foot_dims = (config.foot_length, config.foot_width, config.foot_height)
     heel_back = toe_pos - forward * config.foot_length
     foot_center = heel_back + forward * (config.foot_length * 0.5) + up * config.sole_vertical_offset
 
-    toe_forward = np.asarray(rotations[toe_index, 0], dtype=np.float32).copy()
-    toe_up = np.asarray(rotations[toe_index, 1], dtype=np.float32).copy()
-    toe_side = np.asarray(rotations[toe_index, 2], dtype=np.float32).copy()
-    if float(np.dot(toe_forward, toe_vector)) < 0.0:
-        toe_forward *= -1.0
-    if float(toe_up[1]) < 0.0:
-        toe_up *= -1.0
-    toe_forward = _normalize_axis(toe_forward)
-    toe_side = _normalize_axis(toe_side)
-    toe_up = _normalize_axis(toe_up)
+    toe_forward, toe_side, toe_up = _basis_axes_from_direction(rotations[toe_index], toe_vector, 0)
 
     toe_dims = (config.toe_length, config.toe_width, config.toe_height)
     toe_center = toe_pos + toe_forward * (config.toe_length * 0.5) + toe_up * config.sole_vertical_offset
