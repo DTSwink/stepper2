@@ -63,6 +63,16 @@ http://127.0.0.1:8017/model_comparison.html
 The HTML is regenerated only when the browser requests or refreshes that URL,
 so training no longer pays the cost of repeatedly rendering the viewer.
 
+Standalone side viewer:
+
+```powershell
+.\training\launch_model_viewer_app.ps1
+```
+
+Use Open File to add NPZ actors or checkpoint actors. Checkpoint actors generate
+motion on demand during playback; select a model actor in the outliner and use
+Set Model Source NPZ to choose the source trajectory it should condition on.
+
 Checkpoints are written to:
 
 ```text

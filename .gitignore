@@ -31,6 +31,10 @@ console.err.log
 pipeline_stdout.log
 pipeline_stderr.log
 timing_profile.csv
+training/*debug*.png
+training/*_test.png
+training/*overlay*.png
+training/viewer_settings_*.png
 
 # Abandoned adversarial experiments kept locally for reference
 training/train_locomotion_amp.py

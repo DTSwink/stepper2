@@ -2,3 +2,6 @@ torch
 numpy
 tqdm
 tensorboard
+Pillow
+PyOpenGL
+pyopengltk

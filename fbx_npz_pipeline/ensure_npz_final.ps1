@@ -11,6 +11,7 @@ $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Python = Join-Path $ProjectRoot ".tools\python310\python.exe"
 $Converter = Join-Path $PSScriptRoot "fbx_to_npz.py"
 $Pruner = Join-Path $PSScriptRoot "prune_npz_skeleton.py"
+$Contacts = Join-Path $PSScriptRoot "add_foot_contacts.py"
 
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Local Python was not found at $Python"
@@ -49,6 +50,8 @@ if (Test-Path -LiteralPath $FinalDir) {
 }
 
 if ($FinalFiles.Count -gt 0 -and -not $Force) {
+    Write-Output "Refreshing foot contacts -> $FinalDir"
+    & $Python $Contacts $FinalDir --report (Join-Path $ReportDir "contacts")
     Write-Output "Using existing npz_final: $FinalDir"
     Write-Output "NPZ_FINAL_DIR=$FinalDir"
     return
@@ -64,6 +67,9 @@ foreach ($Fbx in $FbxFiles) {
 }
 
 Write-Output "Pruning raw NPZ folder -> $FinalDir"
-& $Python $Pruner $RawDir -o $FinalDir --report (Join-Path $ReportDir "npz_final")
+& $Python $Pruner $RawDir -o $FinalDir --report (Join-Path $ReportDir "pruned")
+
+Write-Output "Adding foot contacts -> $FinalDir"
+& $Python $Contacts $FinalDir --report (Join-Path $ReportDir "contacts")
 
 Write-Output "NPZ_FINAL_DIR=$FinalDir"

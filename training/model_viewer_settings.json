@@ -1,0 +1,27 @@
+{
+  "camera": {
+    "yaw": -0.10199999999999898,
+    "pitch": 0.4680000000000003,
+    "distance": 3.0498295444648296,
+    "target": [
+      -0.01463172398507595,
+      0.9171452522277832,
+      0.038552165031433105
+    ],
+    "locked": true
+  },
+  "colliders": {
+    "foot_length": 0.15,
+    "foot_width": 0.11,
+    "foot_height": 0.051,
+    "toe_length": 0.065,
+    "toe_width": 0.11,
+    "toe_height": 0.05,
+    "hand_length": 0.11,
+    "hand_width": 0.083,
+    "hand_height": 0.032
+  },
+  "startup": {
+    "source_npz_path": "data/fbx/npz_final/testcasc.npz"
+  }
+}
