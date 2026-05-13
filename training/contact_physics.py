@@ -107,6 +107,12 @@ def foot_lowest_heights_and_points(
     toe_indices: tuple[int, int],
     cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the lowest vertical foot/toe collider point for height checks.
+
+    This is intentionally separate from sliding. Sliding is measured by
+    `foot_slide_speeds`, which solves for the best 2D sole point over the whole
+    foot/toe rectangle instead of reusing this lowest point.
+    """
     heights = []
     points = []
     for foot_index, toe_index in zip(foot_indices, toe_indices):
@@ -166,6 +172,7 @@ def sole_rect_slide_distance(
     prev_spec: tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[float, float, float]],
     cur_spec: tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[float, float, float]],
 ) -> torch.Tensor:
+    """Return the best horizontal slide of any point on the sole rectangle."""
     _n0, prev_center, prev_forward, prev_side, prev_up, prev_dims = prev_spec
     _n1, cur_center, cur_forward, cur_side, cur_up, cur_dims = cur_spec
     dims = tuple(min(a, b) for a, b in zip(prev_dims, cur_dims))
@@ -183,6 +190,22 @@ def sole_rect_slide_distance(
     return dist
 
 
+def sole_rect_contact_point_distance(
+    prev_spec: tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[float, float, float]],
+    cur_spec: tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple[float, float, float]],
+) -> torch.Tensor:
+    """Return the best full 3D velocity distance of any point on the sole rectangle."""
+    _n0, prev_center, prev_forward, prev_side, prev_up, prev_dims = prev_spec
+    _n1, cur_center, cur_forward, cur_side, cur_up, cur_dims = cur_spec
+    dims = tuple(min(a, b) for a, b in zip(prev_dims, cur_dims))
+    prev_sole = prev_center - prev_up * (prev_dims[2] * 0.5)
+    cur_sole = cur_center - cur_up * (cur_dims[2] * 0.5)
+    a = torch.stack((cur_forward - prev_forward, cur_side - prev_side), dim=-1)
+    b = cur_sole - prev_sole
+    dist, _u, _v = _rect_min_distance(a, b, dims[0] * 0.5, dims[1] * 0.5)
+    return dist
+
+
 def foot_slide_speeds(
     prev_positions: torch.Tensor,
     prev_rotations: torch.Tensor,
@@ -193,11 +216,37 @@ def foot_slide_speeds(
     fps: float,
     cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
 ) -> torch.Tensor:
+    """Return exact 2D sole slide speed for each foot.
+
+    For each side this evaluates both the foot and toe sole rectangles, solves
+    the tiny constrained least-squares problem in ground-plane XZ for each, and
+    returns the smaller speed. Lowest-point height is not used here.
+    """
     speeds = []
     for foot_index, toe_index in zip(foot_indices, toe_indices):
         prev_specs = foot_toe_box_specs(prev_positions, prev_rotations, foot_index, toe_index, cfg)
         cur_specs = foot_toe_box_specs(cur_positions, cur_rotations, foot_index, toe_index, cfg)
         distances = [sole_rect_slide_distance(a, b) for a, b in zip(prev_specs, cur_specs)]
+        speeds.append(torch.stack(distances, dim=-1).amin(dim=-1) * float(fps))
+    return torch.stack(speeds, dim=-1)
+
+
+def foot_contact_point_speeds(
+    prev_positions: torch.Tensor,
+    prev_rotations: torch.Tensor,
+    cur_positions: torch.Tensor,
+    cur_rotations: torch.Tensor,
+    foot_indices: tuple[int, int],
+    toe_indices: tuple[int, int],
+    fps: float,
+    cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
+) -> torch.Tensor:
+    """Return the minimum full 3D speed of any persistent foot/toe sole point."""
+    speeds = []
+    for foot_index, toe_index in zip(foot_indices, toe_indices):
+        prev_specs = foot_toe_box_specs(prev_positions, prev_rotations, foot_index, toe_index, cfg)
+        cur_specs = foot_toe_box_specs(cur_positions, cur_rotations, foot_index, toe_index, cfg)
+        distances = [sole_rect_contact_point_distance(a, b) for a, b in zip(prev_specs, cur_specs)]
         speeds.append(torch.stack(distances, dim=-1).amin(dim=-1) * float(fps))
     return torch.stack(speeds, dim=-1)
 

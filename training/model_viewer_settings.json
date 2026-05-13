@@ -11,17 +11,27 @@
     "locked": true
   },
   "colliders": {
-    "foot_length": 0.15,
-    "foot_width": 0.11,
+    "foot_length": 0.175,
+    "foot_width": 0.12,
     "foot_height": 0.051,
-    "toe_length": 0.065,
-    "toe_width": 0.11,
-    "toe_height": 0.05,
+    "toe_length": 0.048,
+    "toe_width": 0.12,
+    "toe_height": 0.049,
     "hand_length": 0.11,
     "hand_width": 0.083,
     "hand_height": 0.032
   },
   "startup": {
     "source_npz_path": "data/fbx/npz_final/testcasc.npz"
+  },
+  "controller": {
+    "max_speed_mps": 1.8,
+    "acceleration_response": 9.0,
+    "deceleration_response": 11.0,
+    "turn_rate_dps": 240.0,
+    "left_deadzone": 0.24,
+    "right_deadzone": 0.26,
+    "trajectory_seconds": 1.0,
+    "trajectory_step_seconds": 0.16
   }
 }

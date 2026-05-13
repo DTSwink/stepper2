@@ -83,6 +83,19 @@ is applied as `R_canonical = P^-1 R_source P`. Foot and hand collider axes are
 chosen from the actual bone basis and nearby anatomy instead of assuming one
 fixed Cascadeur bone-axis layout.
 
+## Foot Contact Metrics
+
+Contact generation stores both height and slide diagnostics, but they are not
+the same point calculation:
+
+- `contact_height_m` and `contact_lowest_point_m` come from the absolute lowest
+  point on either the foot collider or toe collider. This is the value used for
+  contact height, hovering, and penetration checks.
+- `contact_speed_mps` comes from `contact_slide_distance_m`. That slide distance
+  is the minimum 2D ground-plane displacement over every same-local-point on the
+  continuous foot sole rectangle and toe sole rectangle, then the smaller foot
+  vs toe result is used. It is not based on the lowest collider point.
+
 ## Rebuilding FBX Files
 
 Rebuild an FBX animation from an NPZ using a matching template/reference FBX:

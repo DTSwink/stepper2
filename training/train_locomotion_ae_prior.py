@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+import random
 import subprocess
 import sys
 import time
@@ -237,6 +238,8 @@ def train(args: argparse.Namespace) -> None:
     cfg.zero_init_output = args.zero_init_output
     cfg.run_name = args.run_name
     cfg.device = args.device
+    cfg.training_loop = args.training_loop
+    cfg.agent_sampling = args.agent_sampling
     cfg.enable_contact_physics_losses = not args.no_contact_physics_losses
     cfg.enable_early_termination = args.enable_early_termination
     cfg.restart_on_termination = not args.no_restart_on_termination
@@ -293,14 +296,61 @@ def train(args: argparse.Namespace) -> None:
     schedule = tuple(k for k in cfg.rollout_schedule if k <= min(clip.T - 2 for clip in clips)) or (1,)
     rollout_idx = 0
     rollout_k = schedule[rollout_idx]
-    loader = DataLoader(
-        tl.MotionIndexDataset(clips, cfg, "train", rollout_k),
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
+    agent_rng = random.Random(cfg.seed + 4817)
+    agent_coverage_order: list[tuple[int, int]] = []
+    agent_coverage_cursor = 0
+
+    def make_loader(max_rollout: int) -> tuple[tl.MotionIndexDataset, DataLoader]:
+        dataset = tl.MotionIndexDataset(clips, cfg, "train", max_rollout)
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
+        return dataset, loader
+
+    def reset_agent_coverage_order(dataset: tl.MotionIndexDataset) -> None:
+        nonlocal agent_coverage_order, agent_coverage_cursor
+        agent_coverage_order = list(dataset.items)
+        agent_rng.shuffle(agent_coverage_order)
+        agent_coverage_cursor = 0
+
+    def coverage_agent_start(dataset: tl.MotionIndexDataset) -> tuple[int, int]:
+        nonlocal agent_coverage_cursor
+        if not agent_coverage_order or agent_coverage_cursor >= len(agent_coverage_order):
+            reset_agent_coverage_order(dataset)
+        item = agent_coverage_order[agent_coverage_cursor]
+        agent_coverage_cursor += 1
+        return item
+
+    def random_agent_start(max_rollout: int, clip_index: int | None = None) -> tuple[int, int]:
+        ci = agent_rng.randrange(len(clips)) if clip_index is None else int(clip_index)
+        max_start = max(1, clips[ci].T - max_rollout - 1)
+        return ci, agent_rng.randint(1, max_start)
+
+    def agent_batch(dataset: tl.MotionIndexDataset, max_rollout: int) -> tuple[torch.Tensor, torch.Tensor]:
+        clip_ids = []
+        starts = []
+        fixed_clip = None
+        if args.agent_batch_clips == 1 and cfg.agent_sampling == "random":
+            fixed_clip = agent_rng.randrange(len(clips))
+        for _ in range(cfg.batch_size):
+            if cfg.agent_sampling == "coverage":
+                ci, start = coverage_agent_start(dataset)
+            else:
+                ci, start = random_agent_start(max_rollout, fixed_clip)
+            clip_ids.append(ci)
+            starts.append(start)
+        return torch.tensor(clip_ids, dtype=torch.long), torch.tensor(starts, dtype=torch.long)
+
+    dataset, loader = make_loader(rollout_k)
+    print(
+        f"pure_ae run={cfg.run_name} prior={args.prior_checkpoint} K={rollout_k} "
+        f"samples={len(dataset)} loop={cfg.training_loop}",
+        flush=True,
     )
-    print(f"pure_ae run={cfg.run_name} prior={args.prior_checkpoint} K={rollout_k} samples={len(loader.dataset)}", flush=True)
     best = math.inf
     stalls = 0
     stage_start_epoch = 1
@@ -308,7 +358,11 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(1, cfg.max_epochs + 1):
         parts = []
         model.train()
-        for batch in loader:
+        if cfg.training_loop == "agents":
+            train_iter = [agent_batch(dataset, rollout_k) for _ in range(max(1, args.agent_batches_per_epoch))]
+        else:
+            train_iter = loader
+        for batch in train_iter:
             loss, scalars = run_batch_ae(model, prior, prior_mean, prior_std, clips, batch, cfg, rollout_k, device)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -363,17 +417,12 @@ def train(args: argparse.Namespace) -> None:
         if can_advance and rollout_idx < len(schedule) - 1:
             rollout_idx += 1
             rollout_k = schedule[rollout_idx]
-            loader = DataLoader(
-                tl.MotionIndexDataset(clips, cfg, "train", rollout_k),
-                batch_size=cfg.batch_size,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=device.type == "cuda",
-            )
+            dataset, loader = make_loader(rollout_k)
+            reset_agent_coverage_order(dataset)
             best = math.inf
             stalls = 0
             stage_start_epoch = epoch + 1
-            print(f"advanced rollout_k={rollout_k} samples={len(loader.dataset)}", flush=True)
+            print(f"advanced rollout_k={rollout_k} samples={len(dataset)}", flush=True)
         if args.max_train_seconds > 0 and time.perf_counter() - start_time >= args.max_train_seconds:
             print(f"max_train_seconds reached {args.max_train_seconds}", flush=True)
             break
@@ -393,6 +442,15 @@ def main() -> None:
     parser.add_argument("--num-hidden-layers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--training-loop", choices=("sampled", "agents"), default="sampled")
+    parser.add_argument("--agent-sampling", choices=("random", "coverage"), default="random")
+    parser.add_argument("--agent-batches-per-epoch", type=int, default=1)
+    parser.add_argument(
+        "--agent-batch-clips",
+        type=int,
+        default=1,
+        help="With random agent sampling, 1 means each batch samples starts from one randomly chosen clip.",
+    )
     parser.add_argument("--max-epochs", type=int, default=500)
     parser.add_argument("--rollout-schedule", default="1")
     parser.add_argument("--curriculum-max-epochs-per-stage", type=int, default=120)

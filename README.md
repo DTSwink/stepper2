@@ -86,6 +86,24 @@ Generated data, UE/Cascadeur animation assets, checkpoints, TensorBoard logs, an
    python .\training\visualize_best.py
    ```
 
+## Foot Contact Metrics
+
+Foot height and foot slide are deliberately different measurements:
+
+- Height/penetration uses the absolute lowest point on the foot or toe collider.
+- Source contact labels use 2D slide speed, which does not use that lowest
+  point. It solves the best same-local-point ground-plane displacement over the
+  continuous foot sole rectangle and toe sole rectangle, then uses the smaller
+  distance.
+- Training contact slide loss uses the same continuous sole-point idea, but
+  minimizes full 3D velocity for the persistent point on the foot or toe sole.
+  This penalizes upward/lateral/forward motion together when the model predicts
+  contact.
+- Constraint-only experiments currently use a much stricter pinned contact-point
+  speed threshold (`0.005 m/s`) than the source contact labelling threshold
+  (`0.350 m/s`), because the former is a planted-foot constraint while the
+  latter is only a permissive label detector.
+
 ## Dependencies
 
 Install the Python dependencies listed in `training/requirements.txt`. Autodesk FBX SDK Python bindings are required for FBX import/export.

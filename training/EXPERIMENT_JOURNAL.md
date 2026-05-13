@@ -335,3 +335,80 @@ Verification:
   `1.34 m` mean position error to about `0.0061 m`.
 - The regenerated UE5 NPZ now loads with root motion along canonical `+Z` and
   contact counts `contactL=69`, `contactR=68`.
+
+## 2026-05-13 - Contact Metric Clarification
+
+Confirmed the contact pipeline keeps foot height and foot slide as separate
+measurements:
+
+- Height/penetration uses `foot_lowest_heights_and_points`, i.e. the absolute
+  lowest point on either the foot collider or toe collider.
+- Sliding uses `foot_slide_speeds`, which does not reuse the lowest point. It
+  solves the continuous 2D sole-rectangle minimization in ground-plane XZ for
+  both the foot and toe collider and takes the smaller distance.
+
+This distinction matters for future contact losses: source contact detection can
+stay 2D, but a pinned-foot training loss should punish the full velocity of the
+chosen persistent contact point.
+
+Follow-up: changed the training contact-slide loss to use
+`foot_contact_point_speeds`. It solves the same continuous sole-rectangle
+problem over the foot and toe, but minimizes full 3D displacement of the
+persistent local point instead of only ground-plane XZ displacement. The
+existing pinned height threshold was not tightened.
+
+Next constraint-only pass tightened the pinned contact rule:
+
+- at least one generated contact must reach probability `0.8`;
+- pinned contact-point speed threshold is `0.005 m/s`;
+- COM must stay within `0.50 m` horizontally of the mean foot location;
+- COM must stay within `0.75 m` horizontally of the root.
+
+Pinned hover/slide terms now use a hard generated-contact mask. If a foot is
+classified as pinned, it pays the full hover/slide loss; the loss is no longer
+discounted by the contact probability.
+
+The hard pin mask is binary/full-price: once contact probability reaches the
+`0.8` threshold, hover/slide losses are not discounted by contact probability.
+Contact logits are trained by the separate "at least one foot pinned" margin
+loss plus a constraint-only bad-contact gate. The bad-contact gate only updates
+the contact output: if a generated foot is hovering or sliding, high contact
+probability for that foot is discouraged. The foot physics losses themselves
+still charge the pose full price whenever the hard pin is on.
+
+An experimental `best_foot` mode was added for the constraint-only trainer. In
+that mode the geometry selects the lower-violation foot as the pin candidate,
+charges that selected foot the full hover/slide loss, and trains contact logits
+to report the selected contact. This is still not supervised by source contact
+labels; it is a derived geometric target used to avoid the discontinuous
+"which foot should be pinned?" chicken-and-egg during pure constraint training.
+
+## 2026-05-13 - Pose-Aware AE Prior Recheck On Old Clip
+
+After abandoning the constraint-only direction for now, the old `data/fbx`
+`testcasc` clip was regenerated into `data/fbx/npz_final` and the AE prior
+workflow was rechecked.
+
+Delta-only reference rerun:
+
+- Run: `ae_delta_oldclip_verify_20260513_131331_autoreg_k32`
+- Objective: pure delta-transition AE score, no contact physics losses.
+- One-step average joint error: `0.002284 m`
+- Full autoregressive average joint error: `0.009183 m`
+- Full autoregressive final joint error: `0.018618 m`
+
+Pose-aware AE rerun:
+
+- Run: `ae_poseaware_oldclip_verify_20260513_132510_k32`
+- Objective: full transition AE score, no contact physics losses.
+- AE feature dimension: `877`
+- Latent dimension: `128`
+- One-step average joint error: `0.002332 m`
+- Full autoregressive average joint error: `0.006659 m`
+- Full autoregressive final joint error: `0.004274 m`
+- Full autoregressive max joint error: `0.011938 m`
+
+Interpretation: adding pose context to the AE prior preserved one-step accuracy
+and greatly reduced long-rollout drift on the old single walking clip. This is
+the strongest pure-AE result so far on that clip, and it remains free of direct
+DeepMimic-style supervised pose loss.

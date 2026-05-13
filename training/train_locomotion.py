@@ -754,6 +754,7 @@ def compute_losses(
     term_severity = torch.zeros((b,), dtype=pred_pose["pelvis_pos"].dtype, device=device)
     foot_heights = torch.zeros((b, 2), dtype=pred_pose["pelvis_pos"].dtype, device=device)
     foot_speeds = torch.zeros_like(foot_heights)
+    foot_horizontal_speeds = torch.zeros_like(foot_heights)
     freefall_rel = torch.zeros((b,), dtype=pred_pose["pelvis_pos"].dtype, device=device)
 
     if cfg.enable_contact_physics_losses:
@@ -767,7 +768,11 @@ def compute_losses(
         or cfg.alpha12_termination != 0.0
         or (
             cfg.enable_contact_physics_losses
-            and (cfg.alpha8_foot_penetration != 0.0 or cfg.alpha9_foot_sliding != 0.0 or cfg.alpha11_contact_height != 0.0)
+            and (
+                cfg.alpha8_foot_penetration != 0.0
+                or cfg.alpha9_foot_sliding != 0.0
+                or cfg.alpha11_contact_height != 0.0
+            )
         )
     )
     need_freefall = cfg.alpha10_freefall != 0.0 or cfg.enable_freefall_termination
@@ -779,7 +784,10 @@ def compute_losses(
         foot_heights, _lowest_points = cp.foot_lowest_heights_and_points(
             pred_global_pos, pred_global_rot, foot_indices, toe_indices, geom
         )
-        foot_speeds = cp.foot_slide_speeds(
+        foot_speeds = cp.foot_contact_point_speeds(
+            cur_global_pos, cur_global_rot, pred_global_pos, pred_global_rot, foot_indices, toe_indices, clip.fps, geom
+        )
+        foot_horizontal_speeds = cp.foot_slide_speeds(
             cur_global_pos, cur_global_rot, pred_global_pos, pred_global_rot, foot_indices, toe_indices, clip.fps, geom
         )
         foot_penetration = weighted_batch_mean(F.relu(-foot_heights).square(), sample_weight)
@@ -842,6 +850,7 @@ def compute_losses(
         "contact_prob_mean": contact_prob.detach().mean(),
         "foot_height_min": foot_heights.detach().amin(),
         "foot_speed_mean": foot_speeds.detach().mean(),
+        "foot_horizontal_speed_mean": foot_horizontal_speeds.detach().mean(),
         "freefall_relative_error": freefall_rel.detach().mean(),
     }
     next_pose = {
@@ -1828,6 +1837,7 @@ def train(args: argparse.Namespace) -> None:
                 "contact_prob_mean",
                 "foot_height_min",
                 "foot_speed_mean",
+                "foot_horizontal_speed_mean",
                 ])
             if cfg.alpha10_freefall != 0.0 or cfg.enable_freefall_termination or cfg.freefall_body_height_offset_m != 0.0:
                 loss_log_keys.extend(["freefall", "freefall_relative_error"])

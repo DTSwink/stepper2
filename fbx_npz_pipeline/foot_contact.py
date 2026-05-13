@@ -7,14 +7,14 @@ import numpy as np
 
 @dataclass(frozen=True)
 class FootContactConfig:
-    # Hard-set from training/model_viewer_settings.json on 2026-05-12.
+    # Hard-set from training/model_viewer_settings.json on 2026-05-13.
     # Values are meters, after the FBX centimeter data is scaled by 0.01.
-    foot_length: float = 0.150
-    foot_width: float = 0.110
+    foot_length: float = 0.175
+    foot_width: float = 0.120
     foot_height: float = 0.051
-    toe_length: float = 0.065
-    toe_width: float = 0.110
-    toe_height: float = 0.050
+    toe_length: float = 0.048
+    toe_width: float = 0.120
+    toe_height: float = 0.049
     sole_vertical_offset: float = -0.006
     position_unit_scale: float = 0.01
     ground_y: float = 0.0
@@ -196,13 +196,27 @@ def foot_toe_box_specs(
     toe_pos = np.asarray(positions[toe_index], dtype=np.float32)
     toe_vector = toe_pos - foot
 
-    forward, side, up = _basis_axes_from_direction(rotations[foot_index], toe_vector, 1)
+    foot_basis = _normalize_axis(np.asarray(rotations[foot_index], dtype=np.float32))
+    up = foot_basis[0].copy()
+    forward = foot_basis[1].copy()
+    side = foot_basis[2].copy()
+    if float(np.dot(forward, toe_vector)) < 0.0:
+        forward *= -1.0
+    if float(up[1]) < 0.0:
+        up *= -1.0
 
     foot_dims = (config.foot_length, config.foot_width, config.foot_height)
     heel_back = toe_pos - forward * config.foot_length
     foot_center = heel_back + forward * (config.foot_length * 0.5) + up * config.sole_vertical_offset
 
-    toe_forward, toe_side, toe_up = _basis_axes_from_direction(rotations[toe_index], toe_vector, 0)
+    toe_basis = _normalize_axis(np.asarray(rotations[toe_index], dtype=np.float32))
+    toe_forward = toe_basis[0].copy()
+    toe_up = toe_basis[1].copy()
+    toe_side = toe_basis[2].copy()
+    if float(np.dot(toe_forward, toe_vector)) < 0.0:
+        toe_forward *= -1.0
+    if float(toe_up[1]) < 0.0:
+        toe_up *= -1.0
 
     toe_dims = (config.toe_length, config.toe_width, config.toe_height)
     toe_center = toe_pos + toe_forward * (config.toe_length * 0.5) + toe_up * config.sole_vertical_offset

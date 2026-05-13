@@ -7,7 +7,7 @@ import threading
 import time
 import tkinter as tk
 import ctypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -34,6 +34,7 @@ if str(FBX_PIPELINE_DIR) not in sys.path:
 import train_locomotion as tl
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
+    FootContactConfig,
     box_lowest_point_signed_height,
     foot_lowest_ground_height,
     foot_sole_slide_distance,
@@ -67,12 +68,12 @@ FLAT_PITCH = 0.35 / 0.55
 NEUTRAL_PITCH = 0.48
 MIN_CAMERA_DISTANCE = 0.01
 CAMERA_TRANSITION_SECONDS = 0.22
-DEFAULT_FOOT_LENGTH = 0.17
-DEFAULT_FOOT_WIDTH = 0.11
-DEFAULT_FOOT_HEIGHT = 0.064
-DEFAULT_TOE_LENGTH = 0.065
-DEFAULT_TOE_WIDTH = 0.11
-DEFAULT_TOE_HEIGHT = 0.064
+DEFAULT_FOOT_LENGTH = 0.175
+DEFAULT_FOOT_WIDTH = 0.12
+DEFAULT_FOOT_HEIGHT = 0.051
+DEFAULT_TOE_LENGTH = 0.048
+DEFAULT_TOE_WIDTH = 0.12
+DEFAULT_TOE_HEIGHT = 0.049
 DEFAULT_HAND_LENGTH = 0.09
 DEFAULT_HAND_WIDTH = 0.068
 DEFAULT_HAND_HEIGHT = 0.032
@@ -1824,7 +1825,7 @@ class ModelViewerApp(tk.Tk):
         actor = self.selected_controller_actor() or self.selected_actor()
         if actor is None:
             return
-        root = self.actor_root_world(actor)
+        root = self.actor_follow_root_world(actor)
         if root is None:
             return
         self.cancel_camera_transition()
@@ -1853,7 +1854,8 @@ class ModelViewerApp(tk.Tk):
         if actor is None or not actor.visible:
             self.set_follow_cam_actor(None)
             return False
-        root = self.actor_root_world(actor)
+        self.cancel_camera_transition()
+        root = self.actor_follow_root_world(actor)
         if root is None:
             return False
         old_target = self.camera_target().copy()
@@ -2043,6 +2045,24 @@ class ModelViewerApp(tk.Tk):
         root = actor.clip.root_pos[frame_i].detach().cpu().numpy().astype(np.float32)
         return (root + actor.offset).astype(np.float32)
 
+    def actor_follow_root_world(self, actor: Actor) -> np.ndarray | None:
+        if actor.kind == "model" and actor.controller_active and actor.controller_root_anchor is not None:
+            return (actor.controller_root_anchor + actor.controller_root_offset + actor.offset).astype(np.float32)
+        if actor.clip is None:
+            return self.actor_root_world(actor)
+        max_frame = max(0, actor.clip.T - 1)
+        frame = max(0.0, min(float(self.frame), float(max_frame)))
+        base = int(math.floor(frame))
+        nxt = min(max_frame, base + 1)
+        t = frame - base
+        root_a = actor.clip.root_pos[base].detach().cpu().numpy().astype(np.float32)
+        if nxt == base or t <= 1e-5:
+            root = root_a
+        else:
+            root_b = actor.clip.root_pos[nxt].detach().cpu().numpy().astype(np.float32)
+            root = (root_a * (1.0 - t) + root_b * t).astype(np.float32)
+        return (root + actor.offset).astype(np.float32)
+
     def camera_pan_scale(self) -> float:
         distance = self.camera_distance()
         viewport = max(1, self.canvas.winfo_width(), self.canvas.winfo_height())
@@ -2186,7 +2206,7 @@ class ModelViewerApp(tk.Tk):
         self.last_tick = now
         drew = False
         controller_moved = self.update_controller_root_motion(dt)
-        follow_moved = self.update_follow_camera_target()
+        follow_moved = False
         if self.playing:
             self.playback_accumulator = min(0.08, self.playback_accumulator + dt)
             target_step = 1.0 / TARGET_PLAYBACK_FPS
@@ -2198,10 +2218,13 @@ class ModelViewerApp(tk.Tk):
                 steps += 1
             if steps > 0:
                 self.update_timeline()
+                follow_moved = self.update_follow_camera_target()
                 self.draw()
                 drew = True
             if steps >= max_substeps:
                 self.playback_accumulator = min(self.playback_accumulator, target_step)
+        if not drew:
+            follow_moved = self.update_follow_camera_target()
         if (self.camera_transition is not None or controller_moved or follow_moved) and not drew:
             self.draw()
         self.schedule_next_tick()
@@ -3255,23 +3278,24 @@ class ModelViewerApp(tk.Tk):
         sides = self.foot_contact_sides(name_to_index)
         if not sides:
             return ""
+        config = self.foot_contact_config()
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         source_mode = bool(self.foot_contact_from_source_var.get())
         lines = [f"{actor.name} contact {'source' if source_mode else 'computed'}"]
         for side_index, contact_name, foot_index, toe_index in sides:
             height, point, _part = foot_lowest_ground_height(
-                positions, rotations, foot_index, toe_index, FOOT_CONTACT_CONFIG
+                positions, rotations, foot_index, toe_index, config
             )
             speed = self.foot_contact_speed_mps(actor, frame, foot_index, toe_index, point)
             if source_mode:
                 contact = self.actor_source_contact(actor, frame, side_index)
             else:
-                contact = bool(is_foot_contact(height, speed, FOOT_CONTACT_CONFIG))
+                contact = bool(is_foot_contact(height, speed, config))
             side = "L" if contact_name.endswith("L") else "R"
             mark = "on " if contact else "off"
             lines.append(
-                f"{side} {mark}  h {height:+.3f} / {FOOT_CONTACT_CONFIG.height_threshold_m:.3f}  "
-                f"v {speed:.3f} / {FOOT_CONTACT_CONFIG.horizontal_speed_threshold_mps:.3f}"
+                f"{side} {mark}  h {height:+.3f} / {config.height_threshold_m:.3f}  "
+                f"v {speed:.3f} / {config.horizontal_speed_threshold_mps:.3f}"
             )
         return "\n".join(lines)
 
@@ -4038,6 +4062,20 @@ class ModelViewerApp(tk.Tk):
                 sides.append((side_index, _contact_name, foot_index, toe_index))
         return sides
 
+    def foot_contact_config(self) -> FootContactConfig:
+        try:
+            return replace(
+                FOOT_CONTACT_CONFIG,
+                foot_length=max(0.001, float(self.foot_length_var.get())),
+                foot_width=max(0.001, float(self.foot_width_var.get())),
+                foot_height=max(0.001, float(self.foot_height_var.get())),
+                toe_length=max(0.001, float(self.toe_length_var.get())),
+                toe_width=max(0.001, float(self.toe_width_var.get())),
+                toe_height=max(0.001, float(self.toe_height_var.get())),
+            )
+        except (AttributeError, tk.TclError, ValueError):
+            return FOOT_CONTACT_CONFIG
+
     def foot_contact_point_for_frame(
         self, actor: Actor, frame: int, foot_index: int, toe_index: int
     ) -> np.ndarray | None:
@@ -4045,7 +4083,9 @@ class ModelViewerApp(tk.Tk):
         if pose is None:
             return None
         positions, rotations = pose
-        _height, point, _part = foot_lowest_ground_height(positions, rotations, foot_index, toe_index, FOOT_CONTACT_CONFIG)
+        _height, point, _part = foot_lowest_ground_height(
+            positions, rotations, foot_index, toe_index, self.foot_contact_config()
+        )
         return point.astype(np.float32)
 
     def foot_contact_speed_mps(
@@ -4073,7 +4113,7 @@ class ModelViewerApp(tk.Tk):
             cur_rotations,
             foot_index,
             toe_index,
-            FOOT_CONTACT_CONFIG,
+            self.foot_contact_config(),
         )
         return float(distance * float(actor.clip.fps))
 
@@ -4157,6 +4197,7 @@ class ModelViewerApp(tk.Tk):
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         draw_height = bool(self.show_foot_height_var.get())
         draw_contact = bool(self.show_foot_contact_var.get())
+        config = self.foot_contact_config()
         GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT | GL.GL_LINE_BIT | GL.GL_POINT_BIT)
         GL.glDisable(GL.GL_LIGHTING)
         GL.glDisable(GL.GL_TEXTURE_2D)
@@ -4169,27 +4210,27 @@ class ModelViewerApp(tk.Tk):
             from_source = bool(self.foot_contact_from_source_var.get())
             for side_index, _contact_name, foot_index, toe_index in sides:
                 height, point, _part = foot_lowest_ground_height(
-                    positions, rotations, foot_index, toe_index, FOOT_CONTACT_CONFIG
+                    positions, rotations, foot_index, toe_index, config
                 )
                 speed = self.foot_contact_speed_mps(actor, frame, foot_index, toe_index, point)
                 if from_source:
                     contact = self.actor_source_contact(actor, frame, side_index)
                 else:
-                    contact = bool(is_foot_contact(height, speed, FOOT_CONTACT_CONFIG))
+                    contact = bool(is_foot_contact(height, speed, config))
                 color = (0.28, 1.0, 0.46, 0.98) if contact else (1.0, 0.16, 0.18, 0.98)
                 if draw_contact:
                     GL.glLineWidth(3.0)
                     GL.glColor4f(*color)
                     for part, center, axis_x, axis_y, axis_z, dims in foot_toe_box_specs(
-                        positions, rotations, foot_index, toe_index, FOOT_CONTACT_CONFIG
+                        positions, rotations, foot_index, toe_index, config
                     ):
                         _lowest_point, _signed_height = box_lowest_point_signed_height(
-                            center, axis_x, axis_y, axis_z, dims, FOOT_CONTACT_CONFIG.ground_y
+                            center, axis_x, axis_y, axis_z, dims, config.ground_y
                         )
                         self.gl_draw_wire_box(center, axis_x, axis_y, axis_z, dims)
                 if draw_height:
                     ground = np.asarray(
-                        [point[0], FOOT_CONTACT_CONFIG.ground_y + 0.003, point[2]], dtype=np.float32
+                        [point[0], config.ground_y + 0.003, point[2]], dtype=np.float32
                     )
                     line_color = (1.0, 0.22, 0.22, 0.96) if height < 0.0 else (0.62, 0.94, 1.0, 0.96)
                     GL.glLineWidth(2.5)
@@ -4217,6 +4258,13 @@ class ModelViewerApp(tk.Tk):
 
     def gl_draw_actor_shadows_cached(self, actor: Actor, positions: np.ndarray, rotations: np.ndarray) -> None:
         if actor.clip is None or not self.volumes_var.get():
+            return
+        if self.playing or (actor.kind == "model" and actor.controller_active):
+            cached = self.shadow_lists.pop(actor.actor_id, None)
+            if cached is not None:
+                _cached_frame, _cached_generation, list_id = cached
+                GL.glDeleteLists(list_id, 1)
+            self.gl_draw_actor_shadows(actor, positions, rotations)
             return
         frame_key = self.actor_shadow_frame_key(actor)
         cached = self.shadow_lists.get(actor.actor_id)
