@@ -520,7 +520,20 @@ Quick training check:
   - autoreg end `0.111904 m`
   - autoreg max `0.188114 m`
 
-Interpretation: the cyclic setup preserves the accepted style result while
-restoring random start coverage for full-window training. Average and end
-rollout errors improved slightly/meaningfully in the quick test; max error is
-slightly worse, so future longer cyclic runs should still be judged visually.
+Correction after visual inspection: this quick cyclic checkpoint is not an
+accepted replacement for the K119 result. It improved average/end joint drift,
+but it worsened foot clearance. The accepted K119 model has predicted lowest
+foot heights close to the source collider baseline:
+
+- Accepted K119 predicted min foot heights: left `-0.0510 m`, right `-0.0445 m`
+- Source min foot heights: left `-0.0471 m`, right `-0.0447 m`
+
+The cyclic quick K120 checkpoint went visibly deeper:
+
+- Cyclic quick K120 predicted min foot heights: left `-0.0791 m`, right
+  `-0.0862 m`
+
+Interpretation: the cyclic sampling implementation itself passed seam/index
+checks, but the short cyclic AE-only polish should not be considered better.
+Future acceptance checks must include foot-clearance/contact metrics in addition
+to joint drift and visual style.

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import contact_physics as cp
 import train_locomotion as tl
 import visualize_model as vm
 
@@ -163,6 +164,25 @@ def write_report(
     sample_frames = sorted({min(frame_count - 1, max(0, int(round(frac * (frame_count - 1))))) for frac in fractions})
     lo, hi = projection_bounds(gt_pos, pred_ar_pos)
     parents = clip.parents_body.cpu().numpy().astype(int)
+    gt_heights, _ = cp.foot_lowest_heights_and_points(
+        torch.tensor(gt_pos, dtype=torch.float32),
+        torch.tensor(_gt_rot, dtype=torch.float32),
+        tuple(clip.foot_indices),
+        tuple(clip.toe_indices),
+        cp.DEFAULT_GEOMETRY,
+    )
+    pred_heights, _ = cp.foot_lowest_heights_and_points(
+        torch.tensor(pred_ar_pos, dtype=torch.float32),
+        torch.tensor(_pred_ar_rot, dtype=torch.float32),
+        tuple(clip.foot_indices),
+        tuple(clip.toe_indices),
+        cp.DEFAULT_GEOMETRY,
+    )
+    gt_floor_penetration = (-gt_heights).clamp_min(0.0)
+    pred_floor_penetration = (-pred_heights).clamp_min(0.0)
+    extra_floor_penetration = (
+        pred_floor_penetration.max() - gt_floor_penetration.max()
+    ).clamp_min(0.0)
     svgs = [
         snapshot_svg(
             gt_pos,
@@ -188,6 +208,13 @@ def write_report(
         "autoregressive_mean_joint_error_avg": float(error_ar.mean()),
         "autoregressive_mean_joint_error_max": float(error_ar.max()),
         "autoregressive_mean_joint_error_end": float(error_ar[-1]),
+        "gt_min_foot_height_l_m": float(gt_heights[:, 0].min()),
+        "gt_min_foot_height_r_m": float(gt_heights[:, 1].min()),
+        "pred_min_foot_height_l_m": float(pred_heights[:, 0].min()),
+        "pred_min_foot_height_r_m": float(pred_heights[:, 1].min()),
+        "gt_floor_penetration_max_m": float(gt_floor_penetration.max()),
+        "pred_floor_penetration_max_m": float(pred_floor_penetration.max()),
+        "extra_floor_penetration_over_source_max_m": float(extra_floor_penetration),
         "updated_unix": time.time(),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -221,6 +248,8 @@ def write_report(
       <span>AR avg {metrics["autoregressive_mean_joint_error_avg"]:.4f} m</span>
       <span>AR end {metrics["autoregressive_mean_joint_error_end"]:.4f} m</span>
       <span>one-step avg {metrics["one_step_mean_joint_error_avg"]:.4f} m</span>
+      <span>foot pen max {metrics["pred_floor_penetration_max_m"]:.4f} m</span>
+      <span>extra over source {metrics["extra_floor_penetration_over_source_max_m"]:.4f} m</span>
     </div>
   </header>
   <main>{cards}</main>
