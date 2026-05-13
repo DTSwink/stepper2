@@ -35,6 +35,7 @@ class AEConfig:
     max_epochs: int = 2000
     seed: int = 1234
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    cyclic_animation: bool = False
     input_noise_std: float = 0.0
     std_floor: float = 1e-4
     target_loss_reduction: float = 0.995
@@ -138,7 +139,8 @@ def clean_transition_features(
 def collect_clean_features(clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device) -> torch.Tensor:
     chunks = []
     for clip in clips:
-        idx = torch.arange(1, clip.T - 1, dtype=torch.long, device=device)
+        stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - 1
+        idx = torch.arange(1, stop, dtype=torch.long, device=device)
         chunks.append(clean_transition_features(clip, idx, cfg, device).detach().cpu())
     return torch.cat(chunks, dim=0)
 
@@ -241,6 +243,7 @@ def train(args: argparse.Namespace) -> None:
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
     locomotion_cfg = tl.TrainConfig()
+    locomotion_cfg.cyclic_animation = cfg.cyclic_animation
     folder = tl.resolve_path(cfg.folder_path)
     clips = tl.load_clips(folder, locomotion_cfg)
     clean = collect_clean_features(clips, locomotion_cfg, device)

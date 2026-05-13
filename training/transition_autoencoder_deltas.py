@@ -110,7 +110,8 @@ def clean_transition_features(
 def collect_clean_features(clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device) -> torch.Tensor:
     chunks = []
     for clip in clips:
-        idx = torch.arange(1, clip.T - 1, dtype=torch.long, device=device)
+        stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - 1
+        idx = torch.arange(1, stop, dtype=torch.long, device=device)
         chunks.append(clean_transition_features(clip, idx, cfg, device).detach().cpu())
     return torch.cat(chunks, dim=0)
 

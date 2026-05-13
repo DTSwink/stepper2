@@ -445,3 +445,82 @@ keep producing a plausible walk.
 
 An optional low-learning-rate polish pass was started afterward, but the
 completed `K=119` result above is the accepted conclusion for this experiment.
+
+## 2026-05-13 - Visual Checkpoint Reports
+
+Naive frame distance to ground truth is no longer the main success criterion for
+AE-style runs, especially when repeated gait cycles can drift in phase while
+still looking correct. To make future experiments easier to judge, an
+asynchronous visual report sidecar was added.
+
+Design:
+
+- The trainer periodically writes `checkpoint_last.pt` as it already does.
+- `training/visual_reporter.py` runs as a separate process and watches that
+  checkpoint.
+- When a new checkpoint appears, the sidecar performs an autoregressive rollout
+  and writes five static overlay snapshots at `0%`, `25%`, `50%`, `75%`, and
+  `100%`.
+- The report lives at
+  `training/runs/<run_name>/visual_reports/latest/index.html`; older sampled
+  reports are copied to epoch-stamped folders.
+- The report also writes `metrics.json`, but the visual overlays are intended
+  to steer style/coherence decisions when direct ground-truth deltas are no
+  longer semantically decisive.
+
+Performance rule: this must stay outside the hot training path. Training never
+waits for the visual report process. If the sidecar is too slow, it skips stale
+states and renders only the latest saved checkpoint. The only training-side cost
+is the normal periodic `checkpoint_last.pt` write, and the whole feature can be
+disabled with `--no-visual-reporter`.
+
+## 2026-05-13 - Cyclic Animation Sampling
+
+Added a `--cyclic-animation` flag for loop-clean clips. The point is to avoid
+losing random frame initialization when the rollout window approaches the full
+clip length.
+
+Semantics:
+
+- The final frame is treated as the duplicated loop-closing frame.
+- Trainable starts cover `1..T-2`, i.e. the whole clip minus that duplicate
+  final frame.
+- Body pose indices wrap modulo `T-1`, so the target after frame `T-2` is frame
+  `0`.
+- Root motion does not jump back to frame `0`. The root transform past the end
+  is extrapolated by repeating the clip's own root-delta sequence. In practice,
+  the local root delta immediately after the seam matches the first local root
+  delta of the source clip.
+- If validation is disabled, the dataset now keeps the full start set instead
+  of silently reserving a validation fraction.
+
+Smoke checks on `ue5/test/npz_final/M_Neutral_Walk_Loop_F.npz`:
+
+- `T=121`, cyclic period `120`.
+- Cyclic train starts: `119`, matching `T-2`.
+- Logical frame `120` uses body pose frame `0` and root transform frame `120`.
+- The local root delta from logical `120 -> 121` matches source `0 -> 1` within
+  numerical precision.
+
+Quick training check:
+
+- Run prefix: `cyclic_quick_20260513_160336`
+- AE prior: cyclic pose-aware AE, `119` transitions, `80` epochs, about `7s`.
+- Controller: resumed from accepted
+  `ae_poseaware_ue5test_fullroll_20260513_142434_k119`, then ran a short cyclic
+  `K=120` polish with coverage agents for `20` epochs, about `113s`.
+- Non-cyclic accepted K119 reference:
+  - one-step avg `0.005601 m`
+  - autoreg avg `0.079561 m`
+  - autoreg end `0.157714 m`
+  - autoreg max `0.177733 m`
+- Cyclic quick K120 result:
+  - one-step avg `0.005397 m`
+  - autoreg avg `0.076966 m`
+  - autoreg end `0.111904 m`
+  - autoreg max `0.188114 m`
+
+Interpretation: the cyclic setup preserves the accepted style result while
+restoring random start coverage for full-window training. Average and end
+rollout errors improved slightly/meaningfully in the quick test; max error is
+slightly worse, so future longer cyclic runs should still be judged visually.

@@ -18,6 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import train_locomotion as tl
 import transition_autoencoder as tae
+from visual_report_bridge import VisualReportBridge
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -110,8 +111,7 @@ def run_batch_ae(
             pred_pose, raw_pose = tl.output_to_pose(raw_out, clip)
             target_idx = cur_idx + 1
             tensors = clip.tensors(device)
-            root_pos = tensors["root_pos"].index_select(0, target_idx.to(device))
-            root_rot = tensors["root_rot"].index_select(0, target_idx.to(device))
+            root_pos, root_rot, _yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
             pred_global_pos, _, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
             next_pose = {
                 "pelvis_pos": pred_pose["pelvis_pos"],
@@ -154,7 +154,7 @@ def run_batch_ae(
             scores.append(float(score.detach().cpu()))
             motion_sizes.append(float((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach().cpu()))
             target_pose = tl.get_pose_from_clip(clip, target_idx, device)
-            target_global_pos = tensors["global_pos"].index_select(0, target_idx.to(device))
+            target_global_pos, _target_global_rot = tl.global_from_clip(clip, target_idx, cfg, device)
             joint_rmses.append(float((pred_global_pos - target_global_pos).square().sum(dim=-1).mean().sqrt().detach().cpu()))
             ee_idx = tensors["end_effectors"]
             ee_rmses.append(
@@ -183,7 +183,7 @@ def run_batch_ae(
             )
             if cfg.enable_early_termination and cfg.restart_on_termination and step + 1 < rollout_k and bool(term_mask.any()):
                 remaining_steps = rollout_k - step - 1
-                max_start = max(1, clip.T - 1 - remaining_steps)
+                max_start = max(1, clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - 1 - remaining_steps)
                 restart_start = torch.randint(1, max_start + 1, cur_idx.shape, device=device)
                 restart_prev_idx = restart_start - 1
                 restart_cur_idx = restart_start
@@ -238,6 +238,7 @@ def train(args: argparse.Namespace) -> None:
     cfg.zero_init_output = args.zero_init_output
     cfg.run_name = args.run_name
     cfg.device = args.device
+    cfg.cyclic_animation = args.cyclic_animation
     cfg.training_loop = args.training_loop
     cfg.agent_sampling = args.agent_sampling
     cfg.enable_contact_physics_losses = not args.no_contact_physics_losses
@@ -278,6 +279,19 @@ def train(args: argparse.Namespace) -> None:
     run_dir = tl.resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
     writer = SummaryWriter(run_dir / "tb")
+    visual_report_bridge = None
+    if args.visual_reporter:
+        try:
+            visual_report_bridge = VisualReportBridge(
+                run_dir,
+                npz_path=clips[0].path,
+                interval_seconds=args.visual_report_interval_seconds,
+                device=args.visual_report_device,
+                max_frames=args.visual_report_max_frames,
+            )
+            visual_report_bridge.start()
+        except Exception as exc:
+            print(f"visual reporter disabled: {exc}", flush=True)
     metadata = {
         "npz_folder": str(folder),
         "body_names": clips[0].body_names,
@@ -293,7 +307,9 @@ def train(args: argparse.Namespace) -> None:
         "ae_huber_delta": args.ae_huber_delta,
     }
 
-    schedule = tuple(k for k in cfg.rollout_schedule if k <= min(clip.T - 2 for clip in clips)) or (1,)
+    schedule = tuple(
+        k for k in cfg.rollout_schedule if k <= min((clip.cyclic_period if cfg.cyclic_animation else clip.T - 2) for clip in clips)
+    ) or (1,)
     rollout_idx = 0
     rollout_k = schedule[rollout_idx]
     agent_rng = random.Random(cfg.seed + 4817)
@@ -327,7 +343,7 @@ def train(args: argparse.Namespace) -> None:
 
     def random_agent_start(max_rollout: int, clip_index: int | None = None) -> tuple[int, int]:
         ci = agent_rng.randrange(len(clips)) if clip_index is None else int(clip_index)
-        max_start = max(1, clips[ci].T - max_rollout - 1)
+        max_start = max(1, clips[ci].cyclic_period - 1 if cfg.cyclic_animation else clips[ci].T - max_rollout - 1)
         return ci, agent_rng.randint(1, max_start)
 
     def agent_batch(dataset: tl.MotionIndexDataset, max_rollout: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -395,7 +411,10 @@ def train(args: argparse.Namespace) -> None:
             best = selection_metric
             tl.save_checkpoint(ckpt_dir / "checkpoint_best.pt", model, opt, epoch, best, rollout_k, cfg, metadata)
             tl.save_checkpoint(ckpt_dir / f"checkpoint_best_k{rollout_k:02d}.pt", model, opt, epoch, best, rollout_k, cfg, metadata)
-        if args.save_live_every_epochs > 0 and epoch % args.save_live_every_epochs == 0:
+        save_live_period = args.save_live_every_epochs
+        if args.visual_reporter and save_live_period <= 0:
+            save_live_period = args.visual_report_save_every_epochs
+        if save_live_period > 0 and epoch % save_live_period == 0:
             last_path = ckpt_dir / "checkpoint_last.pt"
             tl.save_checkpoint(last_path, model, opt, epoch, best, rollout_k, cfg, metadata)
             refresh_live_viewer(args, last_path)
@@ -430,6 +449,8 @@ def train(args: argparse.Namespace) -> None:
     tl.save_checkpoint(last_path, model, opt, epoch, best, rollout_k, cfg, metadata)
     refresh_live_viewer(args, last_path)
     writer.close()
+    if visual_report_bridge is not None:
+        visual_report_bridge.close()
 
 
 def main() -> None:
@@ -438,6 +459,7 @@ def main() -> None:
     parser.add_argument("--prior-checkpoint", required=True)
     parser.add_argument("--run-name", default="locomotion_pure_ae")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--cyclic-animation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-hidden-layers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -466,6 +488,11 @@ def main() -> None:
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--live-npz-path", default="data/npz_final/testcasc.npz")
     parser.add_argument("--live-output-path", default="training/runs/model_comparisons/model_comparison.html")
+    parser.add_argument("--visual-reporter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--visual-report-save-every-epochs", type=int, default=20)
+    parser.add_argument("--visual-report-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--visual-report-device", default="cpu")
+    parser.add_argument("--visual-report-max-frames", type=int, default=180)
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-contact-physics-losses", action="store_true")

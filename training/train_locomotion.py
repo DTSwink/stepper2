@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 import body_mass
 import contact_physics as cp
+from visual_report_bridge import VisualReportBridge
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +43,7 @@ class TrainConfig:
     max_turn_rate_per_sec_scale: float = math.radians(720.0)
     pose_delta_scale: float = 2.0
     future_window_seconds: float = 0.25
+    cyclic_animation: bool = False
 
     hidden_dim: int = 512
     num_hidden_layers: int = 2
@@ -110,6 +112,10 @@ class TrainConfig:
     live_viewer_max_agents: int = 4
     live_viewer_start_visualizing: bool = False
     live_viewer_close_on_exit: bool = False
+    visual_reporter: bool = True
+    visual_report_interval_seconds: float = 60.0
+    visual_report_device: str = "cpu"
+    visual_report_max_frames: int = 180
     update_comparison_on_exit: bool = True
     comparison_output_path: str = "training/runs/model_comparisons/model_comparison.html"
     comparison_device: str = "cpu"
@@ -268,6 +274,7 @@ class MotionClip:
     def __init__(self, path: Path, cfg: TrainConfig):
         arrays = np.load(path)
         self.path = path
+        self.cyclic_animation = bool(cfg.cyclic_animation)
         self.source_up_axis = axis_up_axis(arrays)
         self.bone_names = [str(x) for x in arrays["bone_names"]]
         self.parents_full = arrays["parents"].astype(np.int64)
@@ -329,6 +336,8 @@ class MotionClip:
         self.root_rot = global_rot_full[:, root_index]
         self.root_yaw = heading_yaw_from_root(self.root_rot)
         self.root_heading_rot = yaw_to_row_matrix(self.root_yaw)
+        self.T = int(global_pos_full.shape[0])
+        self.cyclic_period = max(1, self.T - 1)
 
         keep = torch.tensor(self.keep_full, dtype=torch.long)
         self.global_pos = global_pos_full.index_select(1, keep)
@@ -348,7 +357,6 @@ class MotionClip:
         root_delta = self.global_pos - self.root_pos[:, None, :]
         self.canonical_pos = torch.einsum("tjc,tdc->tjd", root_delta, self.root_heading_rot)
 
-        self.T = int(global_pos_full.shape[0])
         self.J = len(self.body_names)
         self.Jn = len(self.non_pelvis)
         self.nonpelvis_map = {bone_index: i for i, bone_index in enumerate(self.non_pelvis)}
@@ -394,12 +402,12 @@ class MotionIndexDataset(Dataset):
     def __init__(self, clips: list[MotionClip], cfg: TrainConfig, split: str, max_rollout: int):
         self.items: list[tuple[int, int]] = []
         for ci, clip in enumerate(clips):
-            max_start = clip.T - max_rollout - 1
+            max_start = clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - max_rollout - 1
             if max_start < 1:
                 continue
             starts = list(range(1, max_start + 1))
             random.Random(cfg.seed + ci).shuffle(starts)
-            if cfg.val_fraction <= 0.0:
+            if cfg.disable_validation or cfg.val_fraction <= 0.0:
                 chosen = starts
             else:
                 val_count = max(1, int(round(len(starts) * cfg.val_fraction))) if len(starts) > 1 else 0
@@ -567,10 +575,8 @@ def apply_initial_body_height_offset(
     if offset == 0.0:
         return pose
     out = clone_pose(pose)
-    tensors = clip.tensors(device)
     idx_device = idx.to(device)
-    root_pos = tensors["root_pos"].index_select(0, idx_device)
-    root_rot = tensors["root_rot"].index_select(0, idx_device)
+    root_pos, root_rot, _yaw, _heading = root_state(clip, idx, cfg, device)
     world_delta = torch.zeros((idx_device.shape[0], 3), dtype=out["pelvis_pos"].dtype, device=device)
     world_delta[:, 1] = offset
     local_delta = torch.matmul(world_delta.unsqueeze(1), root_rot.transpose(-1, -2)).squeeze(1)
@@ -600,36 +606,105 @@ def maybe_apply_initial_offsets(
     return prev_pose, cur_pose
 
 
-def root_delta_feature(clip: MotionClip, prev_idx: torch.Tensor, cur_idx: torch.Tensor, cfg: TrainConfig, device) -> torch.Tensor:
+def logical_pose_index(clip: MotionClip, idx: torch.Tensor, device: torch.device) -> torch.Tensor:
+    idx = idx.to(device)
+    if not clip.cyclic_animation:
+        return idx
+    return torch.remainder(idx, clip.cyclic_period)
+
+
+def root_state(
+    clip: MotionClip,
+    idx: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tensors = clip.tensors(device)
-    prev_idx = prev_idx.to(device)
-    cur_idx = cur_idx.to(device)
-    prev_pos = tensors["root_pos"].index_select(0, prev_idx)
-    cur_pos = tensors["root_pos"].index_select(0, cur_idx)
-    prev_heading = tensors["root_heading_rot"].index_select(0, prev_idx)
+    idx = idx.to(device)
+    if not cfg.cyclic_animation:
+        pos = tensors["root_pos"].index_select(0, idx)
+        rot = tensors["root_rot"].index_select(0, idx)
+        yaw = tensors["root_yaw"].index_select(0, idx)
+        heading = tensors["root_heading_rot"].index_select(0, idx)
+        return pos, rot, yaw, heading
+
+    period = int(clip.cyclic_period)
+    base_idx = torch.remainder(idx, period)
+    cycles = torch.div(idx, period, rounding_mode="floor")
+    root_pos = tensors["root_pos"]
+    root_rot = tensors["root_rot"]
+    base_pos = root_pos.index_select(0, base_idx)
+    base_rot = root_rot.index_select(0, base_idx)
+
+    root0_pos = root_pos[0]
+    root0_rot = root_rot[0]
+    end_pos = root_pos[period]
+    end_rot = root_rot[period]
+    root0_inv = root0_rot.transpose(-1, -2)
+    base_rel_pos = torch.matmul((base_pos - root0_pos).unsqueeze(1), root0_inv).squeeze(1)
+    base_rel_rot = base_rot @ root0_inv
+    cycle_pos = torch.matmul((end_pos - root0_pos).unsqueeze(0), root0_inv).squeeze(0)
+    cycle_rot = end_rot @ root0_inv
+
+    rel_pos = base_rel_pos
+    rel_rot = base_rel_rot
+    max_cycles = int(cycles.max().detach().cpu()) if cycles.numel() else 0
+    for cycle in range(max_cycles):
+        mask = (cycles > cycle).reshape(-1, 1)
+        next_pos = torch.matmul(rel_pos.unsqueeze(1), cycle_rot).squeeze(1) + cycle_pos
+        next_rot = rel_rot @ cycle_rot
+        rel_pos = torch.where(mask, next_pos, rel_pos)
+        rel_rot = torch.where(mask.unsqueeze(-1), next_rot, rel_rot)
+
+    pos = torch.matmul(rel_pos.unsqueeze(1), root0_rot).squeeze(1) + root0_pos
+    rot = rel_rot @ root0_rot
+    yaw = heading_yaw_from_root(rot)
+    heading = yaw_to_row_matrix(yaw)
+    return pos, rot, yaw, heading
+
+
+def global_from_clip(
+    clip: MotionClip,
+    idx: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not cfg.cyclic_animation:
+        tensors = clip.tensors(device)
+        idx_device = idx.to(device)
+        return (
+            tensors["global_pos"].index_select(0, idx_device),
+            tensors["global_rot"].index_select(0, idx_device),
+        )
+    pose = get_pose_from_clip(clip, idx, device)
+    root_pos, root_rot, _yaw, _heading = root_state(clip, idx, cfg, device)
+    global_pos, global_rot, _canon = fk_from_pose(clip, root_pos, root_rot, pose, device)
+    return global_pos, global_rot
+
+
+def root_delta_feature(clip: MotionClip, prev_idx: torch.Tensor, cur_idx: torch.Tensor, cfg: TrainConfig, device) -> torch.Tensor:
+    prev_pos, _prev_rot, prev_yaw, prev_heading = root_state(clip, prev_idx, cfg, device)
+    cur_pos, _cur_rot, cur_yaw, _cur_heading = root_state(clip, cur_idx, cfg, device)
     delta_local = torch.matmul((cur_pos - prev_pos).unsqueeze(1), prev_heading.transpose(-1, -2)).squeeze(1)
     dx = delta_local[:, 0] / cfg.max_speed_scale_final
     dz = delta_local[:, 2] / cfg.max_speed_scale_final
-    yaw_delta = wrap_angle(tensors["root_yaw"].index_select(0, cur_idx) - tensors["root_yaw"].index_select(0, prev_idx))
+    yaw_delta = wrap_angle(cur_yaw - prev_yaw)
     dyaw = yaw_delta / cfg.max_turn_rate_scale_final
     return torch.stack((dx, dz, dyaw), dim=-1)
 
 
 def future_root_features(clip: MotionClip, cur_idx: torch.Tensor, cfg: TrainConfig, device) -> torch.Tensor:
     feats = []
-    tensors = clip.tensors(device)
     cur_idx = cur_idx.to(device)
-    cur_pos = tensors["root_pos"].index_select(0, cur_idx)
-    cur_heading = tensors["root_heading_rot"].index_select(0, cur_idx)
-    cur_yaw = tensors["root_yaw"].index_select(0, cur_idx)
+    cur_pos, _cur_rot, cur_yaw, cur_heading = root_state(clip, cur_idx, cfg, device)
     for k in range(1, cfg.future_window + 1):
-        fut_idx = torch.clamp(cur_idx + k, max=clip.T - 1)
-        fut_pos = tensors["root_pos"].index_select(0, fut_idx)
+        fut_idx = cur_idx + k if cfg.cyclic_animation else torch.clamp(cur_idx + k, max=clip.T - 1)
+        fut_pos, _fut_rot, fut_yaw, _fut_heading = root_state(clip, fut_idx, cfg, device)
         fut_local = torch.matmul((fut_pos - cur_pos).unsqueeze(1), cur_heading.transpose(-1, -2)).squeeze(1)
         scale_k = k * cfg.max_speed_scale_final
         dx = torch.clamp(fut_local[:, 0] / scale_k, -2.0, 2.0)
         dz = torch.clamp(fut_local[:, 2] / scale_k, -2.0, 2.0)
-        dyaw = wrap_angle(tensors["root_yaw"].index_select(0, fut_idx) - cur_yaw)
+        dyaw = wrap_angle(fut_yaw - cur_yaw)
         feats.append(torch.stack((dx, dz, torch.cos(dyaw), torch.sin(dyaw)), dim=-1))
     return torch.cat(feats, dim=-1)
 
@@ -654,7 +729,7 @@ def build_input(
 
 def get_pose_from_clip(clip: MotionClip, idx: torch.Tensor, device: torch.device) -> dict[str, torch.Tensor]:
     tensors = clip.tensors(device)
-    idx = idx.to(device)
+    idx = logical_pose_index(clip, idx, device)
     return {
         "pelvis_pos": tensors["pelvis_local_pos"].index_select(0, idx),
         "pelvis_rot6": tensors["pelvis_rot6"].index_select(0, idx),
@@ -695,22 +770,15 @@ def compute_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     b = target_idx.shape[0]
     tensors = clip.tensors(device)
-    target_idx_device = target_idx.to(device)
-    root_pos = tensors["root_pos"].index_select(0, target_idx_device)
-    root_rot = tensors["root_rot"].index_select(0, target_idx_device)
+    root_pos, root_rot, _target_yaw, _target_heading = root_state(clip, target_idx, cfg, device)
     pred_global_pos, pred_global_rot, pred_canon = fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
 
-    prev_idx_device = prev_idx.to(device)
-    cur_idx_device = cur_idx.to(device)
-    prev_root_pos = tensors["root_pos"].index_select(0, prev_idx_device)
-    prev_root_rot = tensors["root_rot"].index_select(0, prev_idx_device)
-    cur_root_pos = tensors["root_pos"].index_select(0, cur_idx_device)
-    cur_root_rot = tensors["root_rot"].index_select(0, cur_idx_device)
+    prev_root_pos, prev_root_rot, _prev_yaw, _prev_heading = root_state(clip, prev_idx, cfg, device)
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = root_state(clip, cur_idx, cfg, device)
     prev_global_pos, _prev_global_rot, _prev_canon = fk_from_pose(clip, prev_root_pos, prev_root_rot, prev_pose, device)
     cur_global_pos, cur_global_rot, _cur_canon = fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
 
-    target_global_pos = tensors["global_pos"].index_select(0, target_idx_device)
-    target_global_rot = tensors["global_rot"].index_select(0, target_idx_device)
+    target_global_pos, target_global_rot = global_from_clip(clip, target_idx, cfg, device)
 
     pelvis_loc = weighted_batch_mean(
         F.huber_loss(pred_pose["pelvis_pos"], target_pose["pelvis_pos"], reduction="none"), sample_weight
@@ -901,12 +969,9 @@ def run_batch(
             local_t = torch.tensor(local_rows, dtype=torch.long, device=device)
             idx_sel = frame_idx.index_select(0, local_t)
             pose_sel = index_pose(pose, local_t)
-            tensors = clip.tensors(device)
-            root_pos = tensors["root_pos"].index_select(0, idx_sel)
-            root_rot = tensors["root_rot"].index_select(0, idx_sel)
+            root_pos, root_rot, _yaw, _heading = root_state(clip, idx_sel, cfg, device)
             pred_pos, pred_rot, _canon = fk_from_pose(clip, root_pos, root_rot, pose_sel, device)
-            gt_pos = tensors["global_pos"].index_select(0, idx_sel)
-            gt_rot = tensors["global_rot"].index_select(0, idx_sel)
+            gt_pos, gt_rot = global_from_clip(clip, idx_sel, cfg, device)
             pred_pos_np = pred_pos.detach().cpu().numpy()
             pred_rot_np = pred_rot.detach().cpu().numpy()
             gt_pos_np = gt_pos.detach().cpu().numpy()
@@ -970,7 +1035,7 @@ def run_batch(
                 dead = term_mask.detach()
                 if cfg.restart_on_termination and step + 1 < rollout_k and bool(dead.any()):
                     remaining_steps = rollout_k - step - 1
-                    max_start = max(1, clip.T - 1 - remaining_steps)
+                    max_start = max(1, clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - 1 - remaining_steps)
                     restart_start = torch.randint(1, max_start + 1, cur_idx.shape, device=device)
                     restart_prev_idx = restart_start - 1
                     restart_cur_idx = restart_start
@@ -1432,6 +1497,8 @@ def train(args: argparse.Namespace) -> None:
     cfg.future_window_seconds = (
         args.future_window_seconds if args.future_window_seconds is not None else cfg.future_window_seconds
     )
+    if args.cyclic_animation is not None:
+        cfg.cyclic_animation = bool(args.cyclic_animation)
     if args.device is not None:
         cfg.device = args.device
     if args.num_workers is not None:
@@ -1510,6 +1577,14 @@ def train(args: argparse.Namespace) -> None:
         cfg.live_viewer_start_visualizing = True
     if args.live_viewer_close_on_exit:
         cfg.live_viewer_close_on_exit = True
+    if args.visual_reporter is not None:
+        cfg.visual_reporter = bool(args.visual_reporter)
+    if args.visual_report_interval_seconds is not None:
+        cfg.visual_report_interval_seconds = max(1.0, float(args.visual_report_interval_seconds))
+    if args.visual_report_device is not None:
+        cfg.visual_report_device = args.visual_report_device
+    if args.visual_report_max_frames is not None:
+        cfg.visual_report_max_frames = max(0, int(args.visual_report_max_frames))
     if args.update_comparison_on_exit is not None:
         cfg.update_comparison_on_exit = bool(args.update_comparison_on_exit)
     if args.comparison_output_path is not None:
@@ -1574,7 +1649,7 @@ def train(args: argparse.Namespace) -> None:
     profiler = TimingProfiler(cfg.profile_timing, device, cfg.profile_sync_cuda)
     with profiler.section("setup/load_npz_and_precompute"):
         clips = load_clips(npz_folder, cfg)
-    max_possible = min(clip.T - 2 for clip in clips)
+    max_possible = min((clip.cyclic_period if cfg.cyclic_animation else clip.T - 2) for clip in clips)
     schedule = tuple(k for k in cfg.rollout_schedule if k <= max_possible)
     if not schedule:
         schedule = (1,)
@@ -1601,7 +1676,7 @@ def train(args: argparse.Namespace) -> None:
 
     def random_agent_start(max_rollout: int) -> tuple[int, int]:
         ci = agent_rng.randrange(len(clips))
-        max_start = max(1, clips[ci].T - max_rollout - 1)
+        max_start = max(1, clips[ci].cyclic_period - 1 if cfg.cyclic_animation else clips[ci].T - max_rollout - 1)
         return ci, agent_rng.randint(1, max_start)
 
     def reset_agent_coverage_order() -> None:
@@ -1675,6 +1750,20 @@ def train(args: argparse.Namespace) -> None:
         with profiler.section("setup/live_viewer_launch"):
             live_bridge = LiveTrainingBridge(run_dir, cfg)
             live_bridge.start()
+    visual_report_bridge = None
+    if cfg.visual_reporter:
+        with profiler.section("setup/visual_reporter_launch"):
+            try:
+                visual_report_bridge = VisualReportBridge(
+                    run_dir,
+                    npz_path=clips[0].path,
+                    interval_seconds=cfg.visual_report_interval_seconds,
+                    device=cfg.visual_report_device,
+                    max_frames=cfg.visual_report_max_frames,
+                )
+                visual_report_bridge.start()
+            except Exception as exc:
+                print(f"visual reporter disabled: {exc}", flush=True)
     with profiler.section("setup/tensorboard_writer"):
         writer = SummaryWriter(run_dir / "tb")
     metadata = {
@@ -1999,6 +2088,8 @@ def train(args: argparse.Namespace) -> None:
         )
     if live_bridge is not None:
         live_bridge.close()
+    if visual_report_bridge is not None:
+        visual_report_bridge.close()
 
 
 def main() -> None:
@@ -2007,6 +2098,7 @@ def main() -> None:
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--future-window-seconds", type=float, default=None)
+    parser.add_argument("--cyclic-animation", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -2056,6 +2148,10 @@ def main() -> None:
     parser.add_argument("--live-viewer-max-agents", type=int, default=None)
     parser.add_argument("--live-viewer-start-visualizing", action="store_true")
     parser.add_argument("--live-viewer-close-on-exit", action="store_true")
+    parser.add_argument("--visual-reporter", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--visual-report-interval-seconds", type=float, default=None)
+    parser.add_argument("--visual-report-device", default=None)
+    parser.add_argument("--visual-report-max-frames", type=int, default=None)
     parser.add_argument("--update-comparison-on-exit", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--comparison-output-path", default=None)
     parser.add_argument("--comparison-device", default=None)

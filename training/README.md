@@ -109,6 +109,27 @@ http://127.0.0.1:8017/model_comparison.html
 The HTML is regenerated only when the browser requests or refreshes that URL,
 so training no longer pays the cost of repeatedly rendering the viewer.
 
+Asynchronous visual checkpoint reports:
+
+```powershell
+.\.tools\python310\python.exe .\training\visual_reporter.py --run-dir .\training\runs\YOUR_RUN_NAME --checkpoint-name checkpoint_last.pt
+```
+
+The supervised and AE-prior trainers launch this sidecar by default. It watches
+`checkpoint_last.pt`, rolls out the newest checkpoint in a separate process, and
+writes five static overlay snapshots at `0%`, `25%`, `50%`, `75%`, and `100%`
+to:
+
+```text
+training/runs/YOUR_RUN_NAME/visual_reports/latest/index.html
+```
+
+This is diagnostic only. The trainer never waits for the sidecar; if rendering
+falls behind, the sidecar skips stale checkpoints and catches the newest saved
+state. Use `--no-visual-reporter` to disable it entirely, or
+`--visual-report-interval-seconds`, `--visual-report-device`, and
+`--visual-report-max-frames` to tune cost.
+
 Standalone side viewer:
 
 ```powershell
@@ -129,6 +150,13 @@ The trainer uses the dataset root trajectory as authoritative. The network only
 predicts the next body pose; during rollout, the next root comes from the NPZ,
 FK recomputes joint canonical positions, and cleaned 6D rotations are fed back
 into the next step.
+
+For loop-clean gait clips, pass `--cyclic-animation`. In that mode, valid start
+frames cover the whole clip minus the duplicated final frame: `1..T-2`. Body
+pose targets wrap modulo `T-1`, while root transforms past the end continue by
+repeating the clip's per-frame root deltas. This keeps random frame
+initialization available even for full-clip rollouts, instead of forcing every
+long rollout to start near frame 0.
 
 By default, positions are scaled by `position_unit_scale = 0.01`, because the
 FBX/NPZ data is in Unreal-style centimeters while the speed constants are easier
