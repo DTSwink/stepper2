@@ -66,7 +66,7 @@ class TrainConfig:
     num_workers: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     allow_tf32: bool = True
-    use_torch_compile: bool = True
+    use_torch_compile: bool = False
     torch_compile_mode: str = "default"
     show_progress: bool = False
     save_last_every_epochs: int = 5
@@ -108,6 +108,7 @@ class TrainConfig:
     zero_contact_state: bool = False
     training_loop: str = "sampled"
     agent_sampling: str = "random"
+    agent_batch_clips: int = 1
     live_viewer: bool = True
     live_viewer_max_agents: int = 4
     live_viewer_start_visualizing: bool = False
@@ -1126,6 +1127,36 @@ def unwrap_compiled_model(model: nn.Module) -> nn.Module:
     return getattr(model, "_orig_mod", model)
 
 
+def apply_cuda_performance_settings(cfg: TrainConfig, device: torch.device) -> None:
+    if cfg.allow_tf32 and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def maybe_compile_model(
+    model: nn.Module,
+    input_dim: int,
+    cfg: TrainConfig,
+    device: torch.device,
+) -> tuple[nn.Module, bool]:
+    if not cfg.use_torch_compile:
+        return model, False
+    if not hasattr(torch, "compile"):
+        print("torch.compile disabled: this PyTorch build does not expose torch.compile")
+        return model, False
+    try:
+        compiled_model = torch.compile(model, mode=cfg.torch_compile_mode)
+        probe = torch.zeros(max(1, int(cfg.batch_size)), input_dim, device=device)
+        probe.requires_grad_(True)
+        out = compiled_model(probe)
+        out.square().mean().backward()
+        compiled_model.zero_grad(set_to_none=True)
+        return compiled_model, True
+    except Exception as exc:
+        print(f"torch.compile disabled after forward/backward probe: {exc}")
+        return model, False
+
+
 def parse_rollout_schedule(text: str) -> tuple[int, ...]:
     values = tuple(int(part.strip()) for part in text.split(",") if part.strip())
     if not values:
@@ -1569,6 +1600,8 @@ def train(args: argparse.Namespace) -> None:
         cfg.training_loop = args.training_loop
     if args.agent_sampling is not None:
         cfg.agent_sampling = args.agent_sampling
+    if args.agent_batch_clips is not None:
+        cfg.agent_batch_clips = max(0, int(args.agent_batch_clips))
     if args.live_viewer is not None:
         cfg.live_viewer = bool(args.live_viewer)
     if args.live_viewer_max_agents is not None:
@@ -1629,7 +1662,7 @@ def train(args: argparse.Namespace) -> None:
         cfg.writer_flush_every_epochs = args.writer_flush_every_epochs
     if args.run_name is not None:
         cfg.run_name = args.run_name
-    cfg.use_torch_compile = not args.no_compile
+    cfg.use_torch_compile = bool(args.compile) and not args.no_compile
     if args.compile_mode is not None:
         cfg.torch_compile_mode = args.compile_mode
     cfg.show_progress = args.progress
@@ -1674,8 +1707,8 @@ def train(args: argparse.Namespace) -> None:
     agent_coverage_order: list[tuple[int, int]] = []
     agent_coverage_cursor = 0
 
-    def random_agent_start(max_rollout: int) -> tuple[int, int]:
-        ci = agent_rng.randrange(len(clips))
+    def random_agent_start(max_rollout: int, clip_index: int | None = None) -> tuple[int, int]:
+        ci = agent_rng.randrange(len(clips)) if clip_index is None else int(clip_index)
         max_start = max(1, clips[ci].cyclic_period - 1 if cfg.cyclic_animation else clips[ci].T - max_rollout - 1)
         return ci, agent_rng.randint(1, max_start)
 
@@ -1700,11 +1733,14 @@ def train(args: argparse.Namespace) -> None:
         count = cfg.batch_size
         if cfg.agent_sampling == "coverage":
             count = min(cfg.batch_size, len(train_loader.dataset.items))
+        fixed_clip = None
+        if cfg.agent_sampling == "random" and cfg.agent_batch_clips == 1 and len(clips) > 1:
+            fixed_clip = agent_rng.randrange(len(clips))
         for _ in range(count):
             if cfg.agent_sampling == "coverage":
                 ci, start = coverage_agent_start()
             else:
-                ci, start = random_agent_start(max_rollout)
+                ci, start = random_agent_start(max_rollout, fixed_clip)
             clip_ids.append(ci)
             starts.append(start)
         agent_clip_indices = torch.tensor(clip_ids, dtype=torch.long)
@@ -1718,23 +1754,9 @@ def train(args: argparse.Namespace) -> None:
 
     with profiler.section("setup/model_optimizer_compile"):
         input_dim, output_dim = make_batch_dims(clips[0], cfg)
-        if cfg.allow_tf32 and device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        apply_cuda_performance_settings(cfg, device)
         model = MLPController(input_dim, output_dim, cfg).to(device)
-        compile_enabled = False
-        if cfg.use_torch_compile:
-            if hasattr(torch, "compile"):
-                try:
-                    compiled_model = torch.compile(model, mode=cfg.torch_compile_mode)
-                    with torch.no_grad():
-                        compiled_model(torch.zeros(1, input_dim, device=device))
-                    model = compiled_model
-                    compile_enabled = True
-                except Exception as exc:
-                    print(f"torch.compile disabled: {exc}")
-            else:
-                print("torch.compile disabled: this PyTorch build does not expose torch.compile")
+        model, compile_enabled = maybe_compile_model(model, input_dim, cfg, device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     if args.resume_checkpoint is not None:
         with profiler.section("setup/load_resume_checkpoint"):
@@ -1796,7 +1818,7 @@ def train(args: argparse.Namespace) -> None:
     if cfg.training_loop == "agents":
         train_sample_text = (
             f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
-            f"({cfg.agent_sampling})"
+            f"({cfg.agent_sampling}, agent_batch_clips={cfg.agent_batch_clips})"
         )
     else:
         train_sample_text = str(len(train_loader.dataset))
@@ -2014,7 +2036,7 @@ def train(args: argparse.Namespace) -> None:
             if cfg.training_loop == "agents":
                 train_sample_text = (
                     f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
-                    f"({cfg.agent_sampling})"
+                    f"({cfg.agent_sampling}, agent_batch_clips={cfg.agent_batch_clips})"
                 )
             else:
                 train_sample_text = str(len(train_loader.dataset))
@@ -2144,6 +2166,12 @@ def main() -> None:
     parser.add_argument("--zero-contact-state", action="store_true")
     parser.add_argument("--training-loop", choices=("sampled", "agents"), default=None)
     parser.add_argument("--agent-sampling", choices=("random", "coverage"), default=None)
+    parser.add_argument(
+        "--agent-batch-clips",
+        type=int,
+        default=None,
+        help="For random agent sampling, 1 keeps each batch on one clip for maximum vectorization; 0 allows mixed clips.",
+    )
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--live-viewer-max-agents", type=int, default=None)
     parser.add_argument("--live-viewer-start-visualizing", action="store_true")
@@ -2169,6 +2197,7 @@ def main() -> None:
     parser.add_argument("--writer-flush-every-epochs", type=int, default=None)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--compile", action="store_true", help="Try torch.compile after a forward/backward probe.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile.")
     parser.add_argument("--compile-mode", default=None, help="torch.compile mode, for example default or reduce-overhead.")
     parser.add_argument("--progress", action="store_true", help="Show per-epoch tqdm progress bars.")

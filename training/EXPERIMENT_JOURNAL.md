@@ -625,3 +625,61 @@ Forward and idle are tight. Lateral and backward motions drift more in exact
 pose phase, especially `RR`, but visual overlays remain coherent and gait-like.
 This is expected for the AE objective: it is style/transition-prior training,
 not direct frame-locked supervised imitation.
+
+## 2026-05-13 - Training Harness Performance Audit
+
+Goal: make the trainers harder to accidentally run in a slow configuration and
+remove diagnostic synchronization overhead that does not affect learning.
+
+Environment:
+
+- GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+- PyTorch: `2.11.0+cu126`
+- CUDA runtime reported by PyTorch: `12.6`
+- Installed `triton-windows==3.6.0.post26` so `torch.compile` can be tested on
+  Windows.
+
+Findings:
+
+- The multi-clip batch issue was a true absolute speed issue, not just an epoch
+  accounting shift. Mixed random-agent batches split one batch into many
+  per-clip rollout groups, causing many small FK/loss/backward paths.
+- `--agent-batch-clips 1` keeps random-agent batches on one clip and preserves
+  vectorization. This is now the default in the supervised trainer too.
+- `torch.compile` is technically available after installing `triton-windows`,
+  but it is not a speed win for these rollout trainers on this machine. Compile
+  cold-start is several seconds, and the K8 steady-state was not faster than
+  eager mode. The trainer now treats compile as opt-in and runs a forward plus
+  backward probe before accepting it.
+- The AE-prior trainer was forcing GPU/CPU synchronization for diagnostic
+  metrics inside every rollout step. Those metrics now accumulate on GPU and
+  synchronize once per batch. Ground-truth diagnostic RMSEs are sampled every
+  `--diagnostic-metrics-every-epochs` epochs by default instead of being
+  mandatory every epoch. The AE loss itself is unchanged.
+- Validation remains disabled by default; the benchmarked fast path uses
+  train-loss driven scheduling/checkpointing.
+
+Benchmarks, reporting/viewers disabled:
+
+- Supervised omni K8, random agents, `agent_batch_clips=1`: `3.74s` total wall
+  for 8 epochs, about `0.23-0.32s/epoch` after setup.
+- Supervised omni K8, random agents, `agent_batch_clips=0`: `40.84s` total wall
+  for 8 epochs, about `2.8-5.8s/epoch`.
+- Pure AE omni K8, random agents, `agent_batch_clips=1`: about `2.4s` training
+  elapsed for 8 epochs after setup.
+- Pure AE omni K8, random agents, `agent_batch_clips=0`: about `25.1s` training
+  elapsed for 8 epochs.
+- Pure AE omni K64 with diagnostic RMSE every epoch: `7.41s` total wall for 2
+  epochs.
+- Pure AE omni K64 with diagnostic RMSE disabled: `7.02s` total wall for 2
+  epochs. The larger win is avoiding per-step CPU sync; sparse diagnostics are
+  mostly a cleanliness/long-run safety improvement.
+
+Current default speed posture:
+
+- Eager CUDA training by default.
+- `--agent-batch-clips 1` by default for random-agent batches.
+- Live viewer starts headless and writes no pose snapshots until requested.
+- Visual reporter remains asynchronous and can be disabled with
+  `--no-visual-reporter` for timing sweeps.
+- Use `--compile` only for explicit compiler experiments.

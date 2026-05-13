@@ -242,6 +242,7 @@ def train(args: argparse.Namespace) -> None:
             setattr(cfg, field, value)
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
+    tl.apply_cuda_performance_settings(tl.TrainConfig(device=cfg.device), device)
     locomotion_cfg = tl.TrainConfig()
     locomotion_cfg.cyclic_animation = cfg.cyclic_animation
     folder = tl.resolve_path(cfg.folder_path)
@@ -274,7 +275,8 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
         perm = indices[torch.randperm(indices.numel(), device=device)]
-        losses = []
+        loss_sum = torch.zeros((), device=device)
+        loss_count = 0
         for start in range(0, perm.numel(), cfg.batch_size):
             batch = x_norm.index_select(0, perm[start : start + cfg.batch_size])
             noisy = batch
@@ -285,8 +287,9 @@ def train(args: argparse.Namespace) -> None:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            losses.append(float(loss.detach().cpu()))
-        train_loss = float(np.mean(losses))
+            loss_sum = loss_sum + loss.detach()
+            loss_count += 1
+        train_loss = float((loss_sum / max(1, loss_count)).cpu())
         if baseline is None:
             baseline = train_loss
             target = baseline * (1.0 - cfg.target_loss_reduction)

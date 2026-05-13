@@ -1,4 +1,5 @@
 torch
+triton-windows; platform_system == "Windows"
 numpy
 tqdm
 tensorboard

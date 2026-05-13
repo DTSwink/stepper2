@@ -81,17 +81,18 @@ def run_batch_ae(
     cfg: tl.TrainConfig,
     rollout_k: int,
     device: torch.device,
+    compute_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     clip_indices, starts = batch
     total_loss = torch.zeros((), device=device)
     groups = {}
     for row, ci in enumerate(clip_indices.tolist()):
         groups.setdefault(ci, []).append(row)
-    scores = []
-    motion_sizes = []
-    joint_rmses = []
-    ee_rmses = []
-    output_mses = []
+    scores: list[torch.Tensor] = []
+    motion_sizes: list[torch.Tensor] = []
+    joint_rmses: list[torch.Tensor] = []
+    ee_rmses: list[torch.Tensor] = []
+    output_mses: list[torch.Tensor] = []
 
     for ci, rows in groups.items():
         clip = clips[ci]
@@ -151,14 +152,14 @@ def run_batch_ae(
                 )
                 step_loss = step_loss + physics_loss
             group_loss = group_loss + step_loss / rollout_k
-            scores.append(float(score.detach().cpu()))
-            motion_sizes.append(float((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach().cpu()))
-            target_pose = tl.get_pose_from_clip(clip, target_idx, device)
-            target_global_pos, _target_global_rot = tl.global_from_clip(clip, target_idx, cfg, device)
-            joint_rmses.append(float((pred_global_pos - target_global_pos).square().sum(dim=-1).mean().sqrt().detach().cpu()))
-            ee_idx = tensors["end_effectors"]
-            ee_rmses.append(
-                float(
+            scores.append(score.detach())
+            motion_sizes.append((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach())
+            if compute_diagnostics:
+                target_pose = tl.get_pose_from_clip(clip, target_idx, device)
+                target_global_pos, _target_global_rot = tl.global_from_clip(clip, target_idx, cfg, device)
+                joint_rmses.append((pred_global_pos - target_global_pos).square().sum(dim=-1).mean().sqrt().detach())
+                ee_idx = tensors["end_effectors"]
+                ee_rmses.append(
                     (
                         pred_global_pos.index_select(1, ee_idx)
                         - target_global_pos.index_select(1, ee_idx)
@@ -168,19 +169,14 @@ def run_batch_ae(
                     .mean()
                     .sqrt()
                     .detach()
-                    .cpu()
                 )
-            )
-            output_mses.append(
-                float(
+                output_mses.append(
                     F.mse_loss(
                         tl.pose_target_output(next_pose),
                         tl.pose_target_output(target_pose),
                     )
                     .detach()
-                    .cpu()
                 )
-            )
             if cfg.enable_early_termination and cfg.restart_on_termination and step + 1 < rollout_k and bool(term_mask.any()):
                 remaining_steps = rollout_k - step - 1
                 max_start = max(1, clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - 1 - remaining_steps)
@@ -209,17 +205,23 @@ def run_batch_ae(
             cur_idx = target_idx
         total_loss = total_loss + group_loss
     total_loss = total_loss / max(1, len(groups))
+    def mean_metric(values: list[torch.Tensor]) -> float:
+        if not values:
+            return 0.0
+        return float(torch.stack(values).mean().cpu())
+
     return total_loss, {
         "total": float(total_loss.detach().cpu()),
-        "ae_score": float(np.mean(scores)) if scores else 0.0,
-        "canon_step_rms": float(np.mean(motion_sizes)) if motion_sizes else 0.0,
-        "joint_rmse": float(np.mean(joint_rmses)) if joint_rmses else 0.0,
-        "ee_rmse": float(np.mean(ee_rmses)) if ee_rmses else 0.0,
-        "output_mse": float(np.mean(output_mses)) if output_mses else 0.0,
+        "ae_score": mean_metric(scores),
+        "canon_step_rms": mean_metric(motion_sizes),
+        "joint_rmse": mean_metric(joint_rmses),
+        "ee_rmse": mean_metric(ee_rmses),
+        "output_mse": mean_metric(output_mses),
     }
 
 
 def train(args: argparse.Namespace) -> None:
+    process_start_time = time.perf_counter()
     cfg = tl.TrainConfig()
     cfg.hidden_dim = args.hidden_dim
     cfg.num_hidden_layers = args.num_hidden_layers
@@ -233,7 +235,8 @@ def train(args: argparse.Namespace) -> None:
     cfg.curriculum_min_epochs = args.curriculum_min_epochs
     cfg.val_fraction = 0.0
     cfg.disable_validation = True
-    cfg.use_torch_compile = False
+    cfg.use_torch_compile = bool(args.compile) and not args.no_compile
+    cfg.torch_compile_mode = args.compile_mode
     cfg.predict_residual = args.predict_residual
     cfg.zero_init_output = args.zero_init_output
     cfg.run_name = args.run_name
@@ -258,23 +261,25 @@ def train(args: argparse.Namespace) -> None:
     cfg.ae_huber_delta = args.ae_huber_delta
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
-    if cfg.allow_tf32 and device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    tl.apply_cuda_performance_settings(cfg, device)
+    profiler = tl.TimingProfiler(args.profile_timing, device, args.profile_sync_cuda)
 
     folder = tl.resolve_path(args.folder_path)
-    clips = tl.load_clips(folder, cfg)
-    prior, prior_ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
-    prior_mean = prior_ckpt["mean"].to(device)
-    prior_std = prior_ckpt["std"].to(device)
+    with profiler.section("setup/load_npz_and_prior"):
+        clips = tl.load_clips(folder, cfg)
+        prior, prior_ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
+        prior_mean = prior_ckpt["mean"].to(device)
+        prior_std = prior_ckpt["std"].to(device)
 
-    input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
-    model = tl.MLPController(input_dim, output_dim, cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    with profiler.section("setup/model_optimizer_compile"):
+        input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
+        model = tl.MLPController(input_dim, output_dim, cfg).to(device)
+        model, compile_enabled = tl.maybe_compile_model(model, input_dim, cfg, device)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     if args.resume_checkpoint:
         resume_path = tl.resolve_path(args.resume_checkpoint)
         resume = torch.load(resume_path, map_location=device, weights_only=False)
-        model.load_state_dict(resume["model"])
+        tl.unwrap_compiled_model(model).load_state_dict(resume["model"])
         print(f"resumed model weights from {resume_path}", flush=True)
     run_dir = tl.resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
@@ -305,6 +310,7 @@ def train(args: argparse.Namespace) -> None:
         "loss_type": "pure_transition_ae_prior",
         "ae_score_loss": args.ae_score_loss,
         "ae_huber_delta": args.ae_huber_delta,
+        "compile_enabled": compile_enabled,
     }
 
     schedule = tuple(
@@ -350,7 +356,7 @@ def train(args: argparse.Namespace) -> None:
         clip_ids = []
         starts = []
         fixed_clip = None
-        if args.agent_batch_clips == 1 and cfg.agent_sampling == "random":
+        if args.agent_batch_clips == 1 and cfg.agent_sampling == "random" and len(clips) > 1:
             fixed_clip = agent_rng.randrange(len(clips))
         for _ in range(cfg.batch_size):
             if cfg.agent_sampling == "coverage":
@@ -371,26 +377,59 @@ def train(args: argparse.Namespace) -> None:
     stalls = 0
     stage_start_epoch = 1
     start_time = time.perf_counter()
+    last_diagnostics = {
+        "joint_rmse": 0.0,
+        "ee_rmse": 0.0,
+        "output_mse": 0.0,
+    }
     for epoch in range(1, cfg.max_epochs + 1):
         parts = []
         model.train()
+        compute_diagnostics = (
+            args.best_metric != "ae_score"
+            or args.diagnostic_metrics_every_epochs == 1
+            or (
+                args.diagnostic_metrics_every_epochs > 1
+                and (epoch == 1 or epoch % args.diagnostic_metrics_every_epochs == 0)
+            )
+        )
         if cfg.training_loop == "agents":
             train_iter = [agent_batch(dataset, rollout_k) for _ in range(max(1, args.agent_batches_per_epoch))]
         else:
             train_iter = loader
         for batch in train_iter:
-            loss, scalars = run_batch_ae(model, prior, prior_mean, prior_std, clips, batch, cfg, rollout_k, device)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            with profiler.section("train/forward_loss"):
+                loss, scalars = run_batch_ae(
+                    model,
+                    prior,
+                    prior_mean,
+                    prior_std,
+                    clips,
+                    batch,
+                    cfg,
+                    rollout_k,
+                    device,
+                    compute_diagnostics=compute_diagnostics,
+                )
+            with profiler.section("train/zero_grad"):
+                opt.zero_grad(set_to_none=True)
+            with profiler.section("train/backward"):
+                loss.backward()
+            with profiler.section("train/clip_grad"):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            with profiler.section("train/optimizer_step"):
+                opt.step()
             parts.append(scalars)
         train_total = float(np.mean([p["total"] for p in parts]))
         train_score = float(np.mean([p["ae_score"] for p in parts]))
         motion_rms = float(np.mean([p["canon_step_rms"] for p in parts]))
-        joint_rmse = float(np.mean([p["joint_rmse"] for p in parts]))
-        ee_rmse = float(np.mean([p["ee_rmse"] for p in parts]))
-        output_mse = float(np.mean([p["output_mse"] for p in parts]))
+        if compute_diagnostics:
+            last_diagnostics["joint_rmse"] = float(np.mean([p["joint_rmse"] for p in parts]))
+            last_diagnostics["ee_rmse"] = float(np.mean([p["ee_rmse"] for p in parts]))
+            last_diagnostics["output_mse"] = float(np.mean([p["output_mse"] for p in parts]))
+        joint_rmse = last_diagnostics["joint_rmse"]
+        ee_rmse = last_diagnostics["ee_rmse"]
+        output_mse = last_diagnostics["output_mse"]
         selection_metric = {
             "ae_score": train_total,
             "joint_rmse": joint_rmse,
@@ -400,9 +439,10 @@ def train(args: argparse.Namespace) -> None:
         writer.add_scalar("loss/train_total", train_total, epoch)
         writer.add_scalar("loss/ae_score", train_score, epoch)
         writer.add_scalar("motion/canon_step_rms", motion_rms, epoch)
-        writer.add_scalar("accuracy/joint_rmse_m", joint_rmse, epoch)
-        writer.add_scalar("accuracy/end_effector_rmse_m", ee_rmse, epoch)
-        writer.add_scalar("accuracy/output_mse", output_mse, epoch)
+        if compute_diagnostics:
+            writer.add_scalar("accuracy/joint_rmse_m", joint_rmse, epoch)
+            writer.add_scalar("accuracy/end_effector_rmse_m", ee_rmse, epoch)
+            writer.add_scalar("accuracy/output_mse", output_mse, epoch)
         writer.add_scalar(f"selection/{args.best_metric}", selection_metric, epoch)
         writer.add_scalar("curriculum/rollout_k", rollout_k, epoch)
         improved = selection_metric < best - cfg.curriculum_min_delta
@@ -449,6 +489,7 @@ def train(args: argparse.Namespace) -> None:
     tl.save_checkpoint(last_path, model, opt, epoch, best, rollout_k, cfg, metadata)
     refresh_live_viewer(args, last_path)
     writer.close()
+    profiler.write_csv(run_dir / "timing_profile.csv", time.perf_counter() - process_start_time)
     if visual_report_bridge is not None:
         visual_report_bridge.close()
 
@@ -481,7 +522,16 @@ def main() -> None:
     parser.add_argument("--curriculum-min-delta", type=float, default=1e-6)
     parser.add_argument("--max-train-seconds", type=float, default=0.0)
     parser.add_argument("--resume-checkpoint", default=None)
+    parser.add_argument("--compile", action="store_true", help="Try torch.compile after a forward/backward probe.")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile.")
+    parser.add_argument("--compile-mode", default="default")
     parser.add_argument("--best-metric", choices=("ae_score", "joint_rmse", "ee_rmse", "output_mse"), default="ae_score")
+    parser.add_argument(
+        "--diagnostic-metrics-every-epochs",
+        type=int,
+        default=10,
+        help="Compute visual/GT diagnostic RMSE every N epochs for AE-prior runs. Set 1 for every epoch, 0 to disable unless best-metric needs it.",
+    )
     parser.add_argument("--ae-score-loss", choices=("mse", "huber"), default="mse")
     parser.add_argument("--ae-huber-delta", type=float, default=1.0)
     parser.add_argument("--save-live-every-epochs", type=int, default=20)
@@ -493,6 +543,12 @@ def main() -> None:
     parser.add_argument("--visual-report-interval-seconds", type=float, default=60.0)
     parser.add_argument("--visual-report-device", default="cpu")
     parser.add_argument("--visual-report-max-frames", type=int, default=180)
+    parser.add_argument("--profile-timing", action="store_true", help="Write timing_profile.csv in the run directory.")
+    parser.add_argument(
+        "--profile-sync-cuda",
+        action="store_true",
+        help="Synchronize CUDA around timed sections for stricter timing. Slower, but more precise.",
+    )
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-contact-physics-losses", action="store_true")

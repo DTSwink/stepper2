@@ -37,6 +37,12 @@ Use `--agent-sampling coverage` for small clips. It resets rollout agents across
 the valid start frames uniformly, which avoids the noisy duplicate/missed starts
 you get from pure random reset on tiny datasets.
 
+For multi-clip random-agent experiments, keep `--agent-batch-clips 1` unless you
+are intentionally stress-testing mixed-clip batches. This keeps each training
+batch on a single clip, so the rollout stays vectorized instead of splitting
+into many tiny per-clip groups. `1` is the default for the supervised trainer
+and for the AE-prior trainer.
+
 At the end of every training run, `training/runs/model_comparisons/model_comparison.html`
 is refreshed from that run's `checkpoint_best.pt` and source NPZ. Use
 `--no-update-comparison-on-exit` for batch sweeps where you do not want the
@@ -73,14 +79,16 @@ the heavier pose snapshot path. Drag the horizontal splitter above the graph to
 give it more vertical room while inspecting a run. Use `--no-live-viewer` for
 fully unattended/scripted runs.
 
-`torch.compile` is enabled by default and self-tests before training. If the
-local PyTorch build cannot compile, for example because Triton is unavailable on
-Windows, the trainer prints the reason and falls back to normal eager GPU
-training. You can skip the compile probe explicitly:
+`torch.compile` is opt-in. On this Windows RTX 4060 Laptop setup, eager mode is
+currently faster for the rollout trainers once compile cold-start is included.
+If you want to test a future PyTorch/Triton build, use:
 
 ```powershell
-.\.tools\python310\python.exe .\training\train_locomotion.py --device cuda --no-compile
+.\.tools\python310\python.exe .\training\train_locomotion.py --device cuda --compile --compile-mode reduce-overhead
 ```
+
+The trainer runs a forward/backward probe before accepting a compiled model and
+falls back to eager mode if compilation fails.
 
 To time a run until validation loss drops by a target ratio:
 
