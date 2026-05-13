@@ -412,3 +412,36 @@ Interpretation: adding pose context to the AE prior preserved one-step accuracy
 and greatly reduced long-rollout drift on the old single walking clip. This is
 the strongest pure-AE result so far on that clip, and it remains free of direct
 DeepMimic-style supervised pose loss.
+
+## 2026-05-13 - Pose-Aware AE Prior On UE5 Test Clip
+
+The same pose-aware AE prior workflow was rerun on
+`ue5/test/npz_final/M_Neutral_Walk_Loop_F.npz`.
+
+- Run prefix: `ae_poseaware_ue5test_fullroll_20260513_142434`
+- Source clip length: `121` frames at `30 FPS`
+- Objective: pure pose-aware transition AE score, no direct supervised pose loss
+  and no contact physics losses.
+- Rollout schedule: `K=1 -> 8 -> 16 -> 32 -> 64 -> 119`, where `K=119` covers
+  the full valid autoregressive window for this clip.
+- Final checkpoint:
+  `training/runs/ae_poseaware_ue5test_fullroll_20260513_142434_k119/checkpoints/checkpoint_best.pt`
+
+Final visualization metrics:
+
+- One-step average joint error: `0.005601 m`
+- One-step max joint error: `0.007443 m`
+- Full autoregressive average joint error: `0.079561 m`
+- Full autoregressive final joint error: `0.157714 m`
+- Full autoregressive max joint error: `0.177733 m`
+
+Interpretation: the UE5 test clip contains repeated gait cycles, so exact
+long-horizon pose alignment is less important than style continuity. The
+one-step prediction is clean, and the full autoregressive rollout keeps the
+walking style coherent even though the pose drifts away from the exact source
+phase over time. That drift is acceptable for this experiment because the goal
+is not frame-locked imitation; it is a reusable AE-style motion prior that can
+keep producing a plausible walk.
+
+An optional low-learning-rate polish pass was started afterward, but the
+completed `K=119` result above is the accepted conclusion for this experiment.
