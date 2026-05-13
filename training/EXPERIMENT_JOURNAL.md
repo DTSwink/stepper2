@@ -537,3 +537,91 @@ Interpretation: the cyclic sampling implementation itself passed seam/index
 checks, but the short cyclic AE-only polish should not be considered better.
 Future acceptance checks must include foot-clearance/contact metrics in addition
 to joint drift and visual style.
+
+## 2026-05-13 - Omni Directional Pose-Aware AE Run
+
+Dataset:
+
+- Source folder: `ue5/animations_omni_only`
+- Generated folder: `ue5/animations_omni_only/npz_final`
+- Clips: 11 total: 8 omni walk directions, 2 extra lateral-foot variants, and
+  1 idle loop.
+- Skeleton: 26 stored bones including `root`, 25 model body bones.
+- FPS: `30` for all clips.
+- Cyclic sampling enabled. Shortest trainable cyclic period is `111`, so the
+  final rollout schedule used `K=111`.
+
+Important setup note: pure AE controller training must pass
+`--no-contact-physics-losses`. The first omni controller attempt accidentally
+left contact physics losses enabled, which produced misleadingly bad results and
+large AE totals. The accepted run below is pure pose-aware transition AE prior:
+no supervised pose loss and no contact/physics losses.
+
+Performance fix:
+
+- The slow first clean attempt used `--agent-batch-clips 0`, which mixed clips
+  inside each mini-batch and forced many small per-clip rollout groups.
+- The accepted run resumed from the clean K=1 checkpoint and used
+  `--agent-batch-clips 1`, so each mini-batch stays on one clip and remains
+  vectorized.
+- K=8 speed improved from roughly `20s/epoch` to roughly `1-2s/epoch`.
+
+Prior:
+
+- Run: `ae_poseaware_omni_cyclic_20260513_172626`
+- Checkpoint:
+  `training/runs/ae_poseaware_omni_cyclic_20260513_172626/checkpoints/checkpoint_best.pt`
+- AE prior reached target at epoch `214`, reconstruction loss `0.002041`.
+- Tier sanity at epoch 200: clean `0.00513`, slight `0.00755`, bad `0.315`,
+  noise `1.304`.
+
+Controller:
+
+- Run: `ae_poseaware_omni_pure_cyclic_fast_20260513_181213`
+- Checkpoint:
+  `training/runs/ae_poseaware_omni_pure_cyclic_fast_20260513_181213/checkpoints/checkpoint_best_k111.pt`
+- Resumed from clean K=1:
+  `training/runs/ae_poseaware_omni_pure_cyclic_20260513_180204/checkpoints/checkpoint_best_k01.pt`
+- Schedule: `K=8 -> 16 -> 32 -> 64 -> 111`.
+- Best stage scores:
+  - K8: `0.040064`
+  - K16: `0.041574`
+  - K32: `0.043662`
+  - K64: `0.026823`
+  - K111: `0.017297`
+- The script does not currently auto-stop after the final stage cap, so the run
+  was manually stopped after K111 reached the intended stage budget.
+
+Best K111 sampled visualization metrics:
+
+- Forward walk `M_Neutral_Walk_Loop_F`:
+  - one-step avg `0.008850 m`
+  - autoreg avg `0.036826 m`
+  - autoreg end `0.048970 m`
+  - autoreg max `0.052801 m`
+- Backward walk `M_Neutral_Walk_Loop_B`:
+  - one-step avg `0.007204 m`
+  - autoreg avg `0.068557 m`
+  - autoreg end `0.081624 m`
+  - autoreg max `0.117977 m`
+- Lateral-left `M_Neutral_Walk_Loop_LL`:
+  - one-step avg `0.010364 m`
+  - autoreg avg `0.075683 m`
+  - autoreg end `0.103676 m`
+  - autoreg max `0.118718 m`
+- Lateral-right `M_Neutral_Walk_Loop_RR`:
+  - one-step avg `0.010717 m`
+  - autoreg avg `0.091326 m`
+  - autoreg end `0.155555 m`
+  - autoreg max `0.160544 m`
+- Idle `M_Neutral_Stand_Idle_Loop`:
+  - one-step avg `0.003750 m`
+  - autoreg avg `0.010861 m`
+  - autoreg end `0.013471 m`
+  - autoreg max `0.015641 m`
+
+Interpretation: the full omni pure-AE result is a good accepted candidate.
+Forward and idle are tight. Lateral and backward motions drift more in exact
+pose phase, especially `RR`, but visual overlays remain coherent and gait-like.
+This is expected for the AE objective: it is style/transition-prior training,
+not direct frame-locked supervised imitation.
