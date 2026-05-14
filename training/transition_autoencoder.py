@@ -42,6 +42,13 @@ class AEConfig:
     stall_patience_epochs: int = 120
     min_delta: float = 1e-6
     tier_eval_every_epochs: int = 25
+    compatibility_weight: float = 0.0
+    compatibility_direction_weight: float = 1.0
+    compatibility_temporal_weight: float = 1.0
+    compatibility_temporal_min_skip: int = 2
+    compatibility_temporal_max_skip: int = 8
+    compatibility_hidden_dim: int = 256
+    compatibility_num_hidden_layers: int = 2
 
 
 class TransitionAutoencoder(nn.Module):
@@ -60,9 +67,30 @@ class TransitionAutoencoder(nn.Module):
             in_dim = cfg.hidden_dim
         decoder += [nn.Linear(in_dim, dim)]
         self.net = nn.Sequential(*(encoder + decoder))
+        self.compatibility_head = None
+        if cfg.compatibility_weight > 0.0:
+            layers: list[nn.Module] = []
+            in_dim = dim
+            for _ in range(cfg.compatibility_num_hidden_layers):
+                layers += [
+                    nn.Linear(in_dim, cfg.compatibility_hidden_dim),
+                    nn.LayerNorm(cfg.compatibility_hidden_dim),
+                    nn.GELU(),
+                ]
+                in_dim = cfg.compatibility_hidden_dim
+            layers += [nn.Linear(in_dim, 1)]
+            self.compatibility_head = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+    def has_compatibility_head(self) -> bool:
+        return self.compatibility_head is not None
+
+    def compatibility_logits(self, x: torch.Tensor) -> torch.Tensor:
+        if self.compatibility_head is None:
+            raise RuntimeError("This transition autoencoder was created without a compatibility head.")
+        return self.compatibility_head(x).squeeze(-1)
 
 
 def set_seed(seed: int) -> None:
@@ -136,12 +164,57 @@ def clean_transition_features(
     return transition_feature_from_next_pose(clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device)
 
 
-def collect_clean_features(clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device) -> torch.Tensor:
+def transition_features_with_offset(
+    clip: tl.MotionClip,
+    cur_idx: torch.Tensor,
+    next_offset: int,
+    cfg: tl.TrainConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    prev_idx = cur_idx - 1
+    next_idx = cur_idx + next_offset
+    prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
+    cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
+    next_pose = tl.get_pose_from_clip(clip, next_idx, device)
+    return transition_feature_from_next_pose(clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device)
+
+
+def collect_clean_feature_rows(
+    clips: list[tl.MotionClip],
+    cfg: tl.TrainConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     chunks = []
-    for clip in clips:
+    clip_chunks = []
+    idx_chunks = []
+    for ci, clip in enumerate(clips):
         stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - 1
         idx = torch.arange(1, stop, dtype=torch.long, device=device)
         chunks.append(clean_transition_features(clip, idx, cfg, device).detach().cpu())
+        clip_chunks.append(torch.full((idx.numel(),), ci, dtype=torch.long))
+        idx_chunks.append(idx.detach().cpu())
+    return torch.cat(chunks, dim=0), torch.cat(clip_chunks, dim=0), torch.cat(idx_chunks, dim=0)
+
+
+def collect_clean_features(clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device) -> torch.Tensor:
+    return collect_clean_feature_rows(clips, cfg, device)[0]
+
+
+def collect_temporal_skip_features(
+    clips: list[tl.MotionClip],
+    cfg: tl.TrainConfig,
+    device: torch.device,
+    min_skip: int,
+    max_skip: int,
+) -> torch.Tensor:
+    chunks = []
+    min_skip = max(2, int(min_skip))
+    max_skip = max(min_skip, int(max_skip))
+    for clip in clips:
+        stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - max_skip
+        idx = torch.arange(1, stop, dtype=torch.long, device=device)
+        for skip in range(min_skip, max_skip + 1):
+            chunks.append(transition_features_with_offset(clip, idx, skip, cfg, device).detach().cpu())
     return torch.cat(chunks, dim=0)
 
 
@@ -234,6 +307,72 @@ def save_tier_report(path: Path, rows: list[dict[str, float]]) -> None:
         writer.writerows(rows)
 
 
+def sample_direction_negatives(
+    x_norm: torch.Tensor,
+    clip_ids: torch.Tensor,
+    batch_indices: torch.Tensor,
+    schema: dict[str, int],
+) -> torch.Tensor:
+    batch = x_norm.index_select(0, batch_indices)
+    batch_clip_ids = clip_ids.index_select(0, batch_indices)
+    body_indices = torch.randint(0, x_norm.shape[0], batch_indices.shape, device=x_norm.device)
+    for _ in range(16):
+        same_clip = clip_ids.index_select(0, body_indices) == batch_clip_ids
+        if not bool(same_clip.any()):
+            break
+        body_indices[same_clip] = torch.randint(0, x_norm.shape[0], (int(same_clip.sum().item()),), device=x_norm.device)
+    negative = x_norm.index_select(0, body_indices).clone()
+    root_start = schema["input_root_start"]
+    root_end = schema["input_root_end"]
+    negative[:, root_start:root_end] = batch[:, root_start:root_end]
+    return negative
+
+
+def compatibility_bce_loss(
+    model: TransitionAutoencoder,
+    positive: torch.Tensor,
+    direction_negative: torch.Tensor | None,
+    temporal_negative: torch.Tensor | None,
+    cfg: AEConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    zero = positive.new_zeros(())
+    if not model.has_compatibility_head() or cfg.compatibility_weight <= 0.0:
+        return zero, {
+            "compat_pos_loss": zero,
+            "compat_direction_loss": zero,
+            "compat_temporal_loss": zero,
+            "compat_pos_acc": zero,
+            "compat_direction_acc": zero,
+            "compat_temporal_acc": zero,
+        }
+
+    pos_logits = model.compatibility_logits(positive)
+    pos_loss = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits))
+    total = pos_loss
+    direction_loss = zero
+    temporal_loss = zero
+    direction_acc = zero
+    temporal_acc = zero
+    if direction_negative is not None and cfg.compatibility_direction_weight > 0.0:
+        direction_logits = model.compatibility_logits(direction_negative)
+        direction_loss = F.binary_cross_entropy_with_logits(direction_logits, torch.zeros_like(direction_logits))
+        total = total + cfg.compatibility_direction_weight * direction_loss
+        direction_acc = (direction_logits < 0.0).float().mean()
+    if temporal_negative is not None and cfg.compatibility_temporal_weight > 0.0:
+        temporal_logits = model.compatibility_logits(temporal_negative)
+        temporal_loss = F.binary_cross_entropy_with_logits(temporal_logits, torch.zeros_like(temporal_logits))
+        total = total + cfg.compatibility_temporal_weight * temporal_loss
+        temporal_acc = (temporal_logits < 0.0).float().mean()
+    return total, {
+        "compat_pos_loss": pos_loss.detach(),
+        "compat_direction_loss": direction_loss.detach(),
+        "compat_temporal_loss": temporal_loss.detach(),
+        "compat_pos_acc": (pos_logits > 0.0).float().mean().detach(),
+        "compat_direction_acc": direction_acc.detach(),
+        "compat_temporal_acc": temporal_acc.detach(),
+    }
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = AEConfig()
     for field in cfg.__dataclass_fields__:
@@ -247,10 +386,21 @@ def train(args: argparse.Namespace) -> None:
     locomotion_cfg.cyclic_animation = cfg.cyclic_animation
     folder = tl.resolve_path(cfg.folder_path)
     clips = tl.load_clips(folder, locomotion_cfg)
-    clean = collect_clean_features(clips, locomotion_cfg, device)
+    clean, feature_clip_ids, _feature_cur_idx = collect_clean_feature_rows(clips, locomotion_cfg, device)
+    skip_features = None
+    if cfg.compatibility_weight > 0.0 and cfg.compatibility_temporal_weight > 0.0:
+        skip_features = collect_temporal_skip_features(
+            clips,
+            locomotion_cfg,
+            device,
+            cfg.compatibility_temporal_min_skip,
+            cfg.compatibility_temporal_max_skip,
+        )
     mean = clean.mean(dim=0)
     std = clean.std(dim=0).clamp_min(cfg.std_floor)
     x_norm = normalise(clean, mean, std).to(device)
+    clip_ids = feature_clip_ids.to(device)
+    skip_norm = normalise(skip_features, mean, std).to(device) if skip_features is not None else None
     mean = mean.to(device)
     std = std.to(device)
     schema = transition_schema(clips[0], locomotion_cfg)
@@ -263,7 +413,7 @@ def train(args: argparse.Namespace) -> None:
 
     print(
         f"transition_ae samples={x_norm.shape[0]} dim={x_norm.shape[1]} latent={cfg.latent_dim} "
-        f"device={device} folder={folder}",
+        f"compat={cfg.compatibility_weight:g} device={device} folder={folder}",
         flush=True,
     )
     best = math.inf
@@ -276,20 +426,46 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         perm = indices[torch.randperm(indices.numel(), device=device)]
         loss_sum = torch.zeros((), device=device)
+        recon_sum = torch.zeros((), device=device)
+        compat_sum = torch.zeros((), device=device)
+        compat_parts_sum: dict[str, torch.Tensor] = {}
         loss_count = 0
         for start in range(0, perm.numel(), cfg.batch_size):
-            batch = x_norm.index_select(0, perm[start : start + cfg.batch_size])
+            batch_indices = perm[start : start + cfg.batch_size]
+            batch = x_norm.index_select(0, batch_indices)
             noisy = batch
             if cfg.input_noise_std > 0.0:
                 noisy = batch + cfg.input_noise_std * torch.randn_like(batch)
             recon = model(noisy)
-            loss = F.huber_loss(recon, batch)
+            recon_loss = F.huber_loss(recon, batch)
+            compat_loss = torch.zeros((), device=device)
+            compat_parts: dict[str, torch.Tensor] = {}
+            if cfg.compatibility_weight > 0.0:
+                direction_negative = sample_direction_negatives(x_norm, clip_ids, batch_indices, schema)
+                temporal_negative = None
+                if skip_norm is not None:
+                    skip_indices = torch.randint(0, skip_norm.shape[0], batch_indices.shape, device=device)
+                    temporal_negative = skip_norm.index_select(0, skip_indices)
+                compat_loss, compat_parts = compatibility_bce_loss(
+                    model,
+                    batch,
+                    direction_negative,
+                    temporal_negative,
+                    cfg,
+                )
+            loss = recon_loss + cfg.compatibility_weight * compat_loss
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             loss_sum = loss_sum + loss.detach()
+            recon_sum = recon_sum + recon_loss.detach()
+            compat_sum = compat_sum + compat_loss.detach()
+            for key, value in compat_parts.items():
+                compat_parts_sum[key] = compat_parts_sum.get(key, torch.zeros((), device=device)) + value
             loss_count += 1
         train_loss = float((loss_sum / max(1, loss_count)).cpu())
+        train_recon = float((recon_sum / max(1, loss_count)).cpu())
+        train_compat = float((compat_sum / max(1, loss_count)).cpu())
         if baseline is None:
             baseline = train_loss
             target = baseline * (1.0 - cfg.target_loss_reduction)
@@ -317,7 +493,11 @@ def train(args: argparse.Namespace) -> None:
                 ckpt_dir / "checkpoint_best.pt",
             )
         writer.add_scalar("loss/train", train_loss, epoch)
+        writer.add_scalar("loss/reconstruction", train_recon, epoch)
+        writer.add_scalar("loss/compatibility", train_compat, epoch)
         writer.add_scalar("loss/best", best, epoch)
+        for key, value in compat_parts_sum.items():
+            writer.add_scalar(f"compatibility/{key}", float((value / max(1, loss_count)).cpu()), epoch)
         if epoch == 1 or epoch % cfg.tier_eval_every_epochs == 0:
             report = tier_report(model, x_norm, schema)
             row = {"epoch": epoch, "train_loss": train_loss, "best": best, **report}
@@ -338,7 +518,11 @@ def train(args: argparse.Namespace) -> None:
                 flush=True,
             )
         elif epoch % 10 == 0:
-            print(f"epoch={epoch:04d} loss={train_loss:.6g} best={best:.6g} stalls={stalls}", flush=True)
+            print(
+                f"epoch={epoch:04d} loss={train_loss:.6g} recon={train_recon:.6g} "
+                f"compat={train_compat:.6g} best={best:.6g} stalls={stalls}",
+                flush=True,
+            )
         if target is not None and train_loss <= target:
             print(f"target reached epoch={epoch} loss={train_loss:.6g} target={target:.6g}", flush=True)
             break

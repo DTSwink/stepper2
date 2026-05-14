@@ -683,3 +683,253 @@ Current default speed posture:
 - Visual reporter remains asynchronous and can be disabled with
   `--no-visual-reporter` for timing sweeps.
 - Use `--compile` only for explicit compiler experiments.
+
+## 2026-05-13 - Rollout Compatibility Monitor And Direction Finetune Probe
+
+Problem:
+
+- On the omni dataset, the pure pose-aware AE controller could visually choose
+  a nearby body style for a commanded root direction. The observed case was
+  lateral motion looking more like a diagonal/nearby walk, which can create
+  foot skating even if the generic AE transition score remains plausible.
+
+Benign monitor added:
+
+- `training/inspect_rollout_compatibility.py`
+- This is read-only. It does not affect training, checkpoint selection, or
+  gradients.
+- For a trained controller checkpoint, it rolls out each command clip, keeps the
+  generated body transitions fixed, swaps only the AE root-condition slice
+  across candidate source clips, and reports which candidate root direction
+  scores best.
+- This gives a cheap sensor for "the command is pure left, but the generated
+  body transition scores like forward-left/back-left/etc." without relying only
+  on screenshots.
+
+Prior-side diagnostic added:
+
+- `training/inspect_ae_compatibility.py`
+- It prints a root/body score matrix for an AE prior checkpoint.
+
+Baseline accepted checkpoint monitor:
+
+- Controller:
+  `training/runs/ae_poseaware_omni_pure_cyclic_fast_20260513_181213/checkpoints/checkpoint_best_k111.pt`
+- Compatibility prior probe:
+  `training/runs/ae_compat_omni_probe_20260513_02/checkpoints/checkpoint_best.pt`
+- Result: all main directions ranked correctly except:
+  - `LL -> BL`, rank `3`, gap about `0.434`
+  - `RR -> BR`, rank `3`, gap about `0.240`
+- This confirmed the monitor catches the exact failure family that was visible
+  by eye.
+
+Compatibility prior probe:
+
+- Run: `ae_compat_omni_probe_20260513_02`
+- Added an optional compatibility head to the transition AE.
+- Positive samples are clean root/body transitions from the same clip.
+- Direction negatives keep the root-condition slice from clip A but take body
+  transition features from a different clip B.
+- Temporal skip negatives are supported but were not emphasized because the old
+  AE already punishes frame skips strongly.
+- The resulting AE matrix strongly separates wrong direction pairs. Same-root
+  lateral variants such as `LL/LR` and `RL/RR` remain intentionally near each
+  other because they share the same root motion but differ in lead-foot phase.
+
+Controller finetune probes:
+
+- Aggressive K111 compatibility finetune with score weight `0.1` was unstable
+  and tended toward low-motion/static solutions. It is not accepted.
+- Softer K8 finetune:
+  `ae_compat_finetune_omni_k8_multibatch_20260513_01`
+  - Resumed from the accepted K111 controller.
+  - Used the compatibility prior with score weight `0.02`, small LR, and more
+    batches per epoch.
+  - Monitor result for `checkpoint_last.pt`: all commands ranked correctly
+    except same-direction lateral alternates:
+    - `LL -> LR`, rank `2`, gap about `0.000003`
+    - `RR -> RL`, rank `2`, gap about `0.000006`
+- Short K111 polish:
+  `ae_compat_finetune_omni_k111_polish_20260513_01`
+  - Kept the same monitor behavior.
+  - LL visualization was regenerated to
+    `training/runs/model_comparisons/model_comparison.html`.
+  - Exact LL autoreg drift remained worse than the old accepted K111 checkpoint,
+    so this should be considered a diagnostic/partial finetune result, not a
+    replacement accepted model.
+
+Current interpretation:
+
+- The new compatibility monitor is useful and caught the problem automatically.
+- The compatibility prior is direction-aware, but direct controller finetuning
+  needs careful balancing because a low compatibility score alone can reward
+  low-motion solutions on some sampled batches.
+- For future experiments, use this monitor as a read-only alarm alongside visual
+  reports. Do not treat the compatibility score as a production loss without
+  additional safeguards.
+
+### Model-aware transition AE idea
+
+The next proposed experiment is to keep the accepted K111 omni controller as the
+baseline and train a second transition AE with the same feature vector as the
+pose-aware AE, but with generated controller transitions used as explicit
+negative examples.
+
+Rationale:
+
+- The original pose-aware AE answers: "does this transition look like something
+  from the motion dataset?"
+- A model-aware AE should answer: "does this transition look like ground truth,
+  or like the current controller's own artifacts?"
+- This makes the prior specialize to the failure modes the current controller
+  actually produces: wrong direction/body pairing, low-motion shortcuts,
+  hovering, skating, or other generated-only habits.
+
+Implementation plan:
+
+- Positive transitions: clean ground-truth transitions from the dataset.
+- Negative transitions: autoregressive rollouts from the accepted controller.
+- Input vector: unchanged from the current pose-aware AE, so the controller
+  training path can swap the prior without any input-dimension change.
+- Objective: low reconstruction energy on real transitions, and a margin that
+  pushes generated transitions to higher reconstruction energy.
+- Then freeze this model-aware AE and finetune the controller against its score.
+- This can form an iterative loop later:
+  `controller -> generated fakes -> model-aware AE -> controller finetune`.
+
+Important guardrail:
+
+- Do not trust this AE score as proof that foot sliding is solved. Foot skating
+  must still be judged with the geometric foot-slide monitor and visual reports.
+  The AE is a training signal, not the final physicality judge.
+
+Model-aware AE experiment results:
+
+- Run: `modelaware_ae_omni_k111_fakes_20260513_01`
+  - Initialized from the accepted pose-aware AE.
+  - Positives: clean omni dataset transitions.
+  - Negatives: rollouts from accepted K111 controller
+    `ae_poseaware_omni_pure_cyclic_fast_20260513_181213/checkpoint_best_k111.pt`.
+  - Same feature dimension as the pose-aware AE: no controller input/output
+    dimension change.
+  - Training separated the static fake set clearly:
+    - final real energy about `0.0030`
+    - final fake energy about `0.0353`
+    - about `99.2%` of fake transitions above the `0.02` margin.
+
+- Finetune: `modelaware_ae_finetune_omni_k111_20260513_01`
+  - Resumed from the accepted K111 controller.
+  - Used the model-aware AE as the frozen prior.
+  - Geometric foot-slide monitor:
+    - baseline K111 mean contact p95: `1.2105 m/s`
+    - loop-1 best mean contact p95: `1.0313 m/s`
+    - loop-1 last mean contact p95: `1.4195 m/s`
+    - ground truth mean contact p95: `0.1543 m/s`
+  - Interpretation: the model-aware AE gave a real but modest improvement on
+    the selected checkpoint. The final checkpoint regressed, so this is not yet
+    a robust self-driving loop.
+
+- Second loop:
+  - AE: `modelaware_ae_omni_loop2_fakes_20260513_01`
+  - Finetune: `modelaware_ae_finetune_omni_k111_loop2_20260513_01`
+  - Geometric foot-slide monitor:
+    - loop-2 best mean contact p95: `1.0331 m/s`
+    - loop-2 last mean contact p95: `1.2092 m/s`
+  - Interpretation: loop 2 did not compound the improvement. The approach has
+    signal, but the current AE energy is still not a reliable foot-skating
+    objective.
+
+Important lesson:
+
+- The model-aware AE can detect that generated transitions differ from real
+  transitions, but the current feature/objective still does not directly encode
+  "the planted sole point should not slide."
+- AE-score checkpoint selection is noisy with one-clip agent batches. Some
+  low-score epochs line up with near-zero `motion_rms`, often from easy/idle-like
+  sampled batches, so AE score alone must not be treated as acceptance.
+- If this path continues, the next useful change is likely to add explicit
+  contact geometry features to the AE input/energy, or keep the AE prior but add
+  a separate geometric foot-slide loss/monitor for checkpoint acceptance.
+
+Combined original + dynamic AE probe:
+
+- Change: controller finetuning can now average multiple frozen AE priors with
+  equal weight. The first use is:
+  `0.5 * original_poseaware_AE + 0.5 * current_model_aware_AE`.
+- Rationale: keep the original dataset/style manifold as an anchor while the
+  dynamic AE keeps learning the controller's current loopholes.
+- Resume point requested by inspection: end of cycle 1, not cycle 2, because
+  cycle 2 looked worse visually.
+- Run: `modelaware_loop_combined_from_cycle1_20260514_01`
+  - Initial model:
+    `modelaware_loop_continue_20260514_04_model_cycle01/checkpoint_best.pt`
+  - Initial dynamic AE:
+    `modelaware_loop_continue_20260514_04_ae_cycle01/checkpoint_best.pt`
+  - Anchor AE:
+    `ae_poseaware_omni_cyclic_20260513_172626/checkpoint_best.pt`
+- External foot-slide monitor:
+  - start mean contact p95: `1.0061 m/s`
+  - combined cycle 1 mean contact p95: `0.9472 m/s`
+  - combined cycle 2 mean contact p95: `1.0771 m/s`
+  - ground truth mean contact p95: `0.1543 m/s`
+- Interpretation: the equal-weight anchor improved the first combined cycle,
+  but the next cycle regressed. The best checkpoint from this branch is cycle 1,
+  and the loop should not blindly follow dynamic AE loss without foot-slide or
+  visual acceptance checks.
+
+Forward-walk diagnostic correction:
+
+- A bad first inspection mistake was to sort isolated worst foot-slide spikes.
+  That missed the actual visual story: on the forward walk, the generated motion
+  starts mostly forward-walk-like, then progressively drifts into a more lateral
+  gait while the root still asks for forward motion.
+- For AE/model-aware rollouts, source `.npz` contact labels are not a valid
+  generated-contact mask once the model phase drifts. Use generated geometry
+  instead for quick inspection.
+- Quick forward-only temporal proxy on
+  `modelaware_loop_combined_from_cycle1_20260514_01_model_cycle02/checkpoint_last.pt`:
+  - support slide mean, first 15 frames: `0.141 m/s`
+  - support slide mean, last 15 frames: `0.858 m/s`
+  - support slide p95, first 15 frames: `0.255 m/s`
+  - support slide p95, last 15 frames: `1.144 m/s`
+  - lateral gait excess, first 15 frames: `+0.031`
+  - lateral gait excess, last 15 frames: `+0.282`
+- Lesson: for non-supervised/phase-free experiments, acceptance monitoring
+  needs chronological drift metrics, not only frame-aligned ground-truth deltas
+  or top-N worst slide frames.
+
+Baseline correction for foot-slide finetuning:
+
+- For omni finetuning, the correct accepted baseline is the omni K111
+  controller, not the forward-only `ue5/test` K119 branch:
+  `training/runs/ae_poseaware_omni_pure_cyclic_fast_20260513_181213/checkpoints/checkpoint_best_k111.pt`
+- Its matching omni pose-aware AE prior is:
+  `training/runs/ae_poseaware_omni_cyclic_20260513_172626/checkpoints/checkpoint_best.pt`
+- Its dataset is:
+  `ue5/animations_omni_only/npz_final`
+- The forward-only K119 branch remains useful for the single forward clip, but
+  should not be used as the baseline or AE prior for all-direction omni
+  foot-slide finetuning.
+
+Accepted foot-slide-aware omni baseline:
+
+- New best accepted baseline:
+  `training/runs/footslide_ae_from_omni_k111_allanims_w20_lr1e6_resume_20260514/checkpoints/checkpoint_best_k111.pt`
+- Started from:
+  `training/runs/ae_poseaware_omni_pure_cyclic_fast_20260513_181213/checkpoints/checkpoint_best_k111.pt`
+- Prior:
+  `training/runs/ae_poseaware_omni_cyclic_20260513_172626/checkpoints/checkpoint_best.pt`
+- Dataset: `ue5/animations_omni_only/npz_final`
+- Objective: `AE prior loss + 20.0 * simple generated-geometry support-foot slide loss`
+- Ground-truth zero-loss slide threshold: `0.213529931 m/s`
+  (`1.05 * max ground-truth support slide`)
+- Cyclic K: `111`
+- Best checkpoint metadata:
+  - epoch: `1966`
+  - best combined objective: `0.0021822865`
+  - learning rate: `1e-6`
+  - batch size: `256`
+  - training loop: `agents`
+- This replaces the previous pure-AE omni K111 checkpoint as the preferred
+  baseline for future omni experiments unless a later visual inspection proves
+  otherwise.

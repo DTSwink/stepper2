@@ -128,6 +128,9 @@ class TrainConfig:
     freefall_initial_contacts_off: bool = True
     enable_freefall_termination: bool = False
     ae_loss_weight: float = 1.0
+    simple_footslide_loss_weight: float = 0.0
+    simple_footslide_threshold_mps: float = 0.0
+    simple_footslide_gt_margin: float = 1.05
 
     end_effector_bones: tuple[str, ...] = ("foot_l", "ball_l", "foot_r", "ball_r")
     exclude_bone_prefixes: tuple[str, ...] = ("ik_", "weapon_")

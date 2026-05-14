@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+import contact_physics as cp
 import train_locomotion as tl
 import transition_autoencoder as tae
 from visual_report_bridge import VisualReportBridge
@@ -54,6 +55,21 @@ def load_prior(path: Path, device: torch.device):
     return model, ckpt
 
 
+def load_prior_bundle(paths: list[Path], device: torch.device):
+    bundle = []
+    for path in paths:
+        prior, ckpt = load_prior(path, device)
+        bundle.append(
+            {
+                "path": path,
+                "model": prior,
+                "mean": ckpt["mean"].to(device),
+                "std": ckpt["std"].to(device),
+            }
+        )
+    return bundle
+
+
 def ae_score(
     prior,
     mean,
@@ -61,6 +77,7 @@ def ae_score(
     features: torch.Tensor,
     loss_type: str = "mse",
     huber_delta: float = 1.0,
+    compatibility_weight: float = 0.0,
 ) -> torch.Tensor:
     x = (features - mean) / std
     recon = prior(x)
@@ -68,20 +85,78 @@ def ae_score(
         error = F.huber_loss(recon, x, reduction="none", delta=huber_delta)
     else:
         error = F.mse_loss(recon, x, reduction="none")
-    return error.mean(dim=-1).mean()
+    score = error.mean(dim=-1)
+    if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
+        compatibility = F.softplus(-prior.compatibility_logits(x))
+        score = score + compatibility_weight * compatibility
+    return score.mean()
+
+
+def clip_is_idle(clip: tl.MotionClip) -> bool:
+    return "idle" in Path(clip.path).stem.lower()
+
+
+@torch.no_grad()
+def compute_groundtruth_support_slide_threshold(
+    clips: list[tl.MotionClip],
+    cfg: tl.TrainConfig,
+    device: torch.device,
+    margin: float,
+) -> float:
+    max_support = 0.0
+    for clip in clips:
+        limit = clip.cyclic_period if cfg.cyclic_animation else clip.T - 1
+        idx = torch.arange(0, limit + 1, dtype=torch.long, device=device)
+        pos, rot = tl.global_from_clip(clip, idx, cfg, device)
+        foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
+        toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
+        speeds = cp.foot_slide_speeds(
+            pos[:-1],
+            rot[:-1],
+            pos[1:],
+            rot[1:],
+            foot_indices,
+            toe_indices,
+            clip.fps,
+        )
+        support = speeds.reshape(-1) if clip_is_idle(clip) else speeds.amin(dim=-1)
+        max_support = max(max_support, float(support.max().detach().cpu()))
+    return max_support * float(margin)
+
+
+def simple_generated_footslide_loss(
+    clip: tl.MotionClip,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    threshold_mps: float,
+) -> torch.Tensor:
+    foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
+    toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
+    speeds = cp.foot_slide_speeds(
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        foot_indices,
+        toe_indices,
+        clip.fps,
+    )
+    support_speed = speeds.mean(dim=-1) if clip_is_idle(clip) else speeds.amin(dim=-1)
+    return F.relu(support_speed - float(threshold_mps)).mean()
 
 
 def run_batch_ae(
     model: torch.nn.Module,
-    prior: torch.nn.Module,
-    prior_mean: torch.Tensor,
-    prior_std: torch.Tensor,
+    priors: list[dict[str, object]],
     clips: list[tl.MotionClip],
     batch: list[torch.Tensor],
     cfg: tl.TrainConfig,
     rollout_k: int,
     device: torch.device,
     compute_diagnostics: bool = True,
+    compatibility_score_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     clip_indices, starts = batch
     total_loss = torch.zeros((), device=device)
@@ -93,6 +168,7 @@ def run_batch_ae(
     joint_rmses: list[torch.Tensor] = []
     ee_rmses: list[torch.Tensor] = []
     output_mses: list[torch.Tensor] = []
+    footslide_losses: list[torch.Tensor] = []
 
     for ci, rows in groups.items():
         clip = clips[ci]
@@ -106,6 +182,10 @@ def run_batch_ae(
             clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device
         )
         group_loss = torch.zeros((), device=device)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+        cur_global_pos, cur_global_rot, _cur_canon = tl.fk_from_pose(
+            clip, cur_root_pos, cur_root_rot, cur_pose, device
+        )
         for step in range(rollout_k):
             inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
             raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
@@ -113,7 +193,7 @@ def run_batch_ae(
             target_idx = cur_idx + 1
             tensors = clip.tensors(device)
             root_pos, root_rot, _yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
-            pred_global_pos, _, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
+            pred_global_pos, pred_global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
             next_pose = {
                 "pelvis_pos": pred_pose["pelvis_pos"],
                 "pelvis_rot6": pred_pose["pelvis_rot6"],
@@ -124,8 +204,31 @@ def run_batch_ae(
             features = tae.transition_feature_from_next_pose(
                 clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
             )
-            score = ae_score(prior, prior_mean, prior_std, features, cfg.ae_score_loss, cfg.ae_huber_delta)
+            prior_scores = [
+                ae_score(
+                    prior_info["model"],
+                    prior_info["mean"],
+                    prior_info["std"],
+                    features,
+                    cfg.ae_score_loss,
+                    cfg.ae_huber_delta,
+                    compatibility_score_weight,
+                )
+                for prior_info in priors
+            ]
+            score = torch.stack(prior_scores).mean()
             step_loss = cfg.ae_loss_weight * score
+            simple_slide_loss = torch.zeros((), device=device)
+            if cfg.simple_footslide_loss_weight > 0.0:
+                simple_slide_loss = simple_generated_footslide_loss(
+                    clip,
+                    cur_global_pos,
+                    cur_global_rot,
+                    pred_global_pos,
+                    pred_global_rot,
+                    cfg.simple_footslide_threshold_mps,
+                )
+                step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
             term_mask = torch.zeros(cur_idx.shape[0], dtype=torch.bool, device=device)
             if cfg.enable_contact_physics_losses:
                 target_pose = tl.get_pose_from_clip(clip, target_idx, device)
@@ -153,6 +256,8 @@ def run_batch_ae(
                 step_loss = step_loss + physics_loss
             group_loss = group_loss + step_loss / rollout_k
             scores.append(score.detach())
+            if cfg.simple_footslide_loss_weight > 0.0:
+                footslide_losses.append(simple_slide_loss.detach())
             motion_sizes.append((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach())
             if compute_diagnostics:
                 target_pose = tl.get_pose_from_clip(clip, target_idx, device)
@@ -198,11 +303,17 @@ def run_batch_ae(
                 cur_pose = tl.blend_pose_by_mask(next_pose, restart_cur_pose, term_mask)
                 prev_idx = torch.where(term_mask, restart_prev_idx, cur_idx)
                 cur_idx = torch.where(term_mask, restart_cur_idx, target_idx)
+                cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+                cur_global_pos, cur_global_rot, _cur_canon = tl.fk_from_pose(
+                    clip, cur_root_pos, cur_root_rot, cur_pose, device
+                )
                 continue
             prev_pose = cur_pose
             cur_pose = next_pose
             prev_idx = cur_idx
             cur_idx = target_idx
+            cur_global_pos = pred_global_pos
+            cur_global_rot = pred_global_rot
         total_loss = total_loss + group_loss
     total_loss = total_loss / max(1, len(groups))
     def mean_metric(values: list[torch.Tensor]) -> float:
@@ -217,6 +328,7 @@ def run_batch_ae(
         "joint_rmse": mean_metric(joint_rmses),
         "ee_rmse": mean_metric(ee_rmses),
         "output_mse": mean_metric(output_mses),
+        "simple_footslide": mean_metric(footslide_losses),
     }
 
 
@@ -259,6 +371,9 @@ def train(args: argparse.Namespace) -> None:
     cfg.ae_loss_weight = args.ae_loss_weight
     cfg.ae_score_loss = args.ae_score_loss
     cfg.ae_huber_delta = args.ae_huber_delta
+    cfg.simple_footslide_loss_weight = args.simple_footslide_loss_weight
+    cfg.simple_footslide_threshold_mps = args.simple_footslide_threshold_mps
+    cfg.simple_footslide_gt_margin = args.simple_footslide_gt_margin
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
     tl.apply_cuda_performance_settings(cfg, device)
@@ -267,9 +382,21 @@ def train(args: argparse.Namespace) -> None:
     folder = tl.resolve_path(args.folder_path)
     with profiler.section("setup/load_npz_and_prior"):
         clips = tl.load_clips(folder, cfg)
-        prior, prior_ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
-        prior_mean = prior_ckpt["mean"].to(device)
-        prior_std = prior_ckpt["std"].to(device)
+        prior_paths = [tl.resolve_path(args.prior_checkpoint)]
+        prior_paths.extend(tl.resolve_path(path) for path in args.extra_prior_checkpoint)
+        priors = load_prior_bundle(prior_paths, device)
+        if cfg.simple_footslide_loss_weight > 0.0 and cfg.simple_footslide_threshold_mps <= 0.0:
+            cfg.simple_footslide_threshold_mps = compute_groundtruth_support_slide_threshold(
+                clips,
+                cfg,
+                device,
+                cfg.simple_footslide_gt_margin,
+            )
+            print(
+                f"auto simple_footslide_threshold_mps={cfg.simple_footslide_threshold_mps:.6g} "
+                f"(margin={cfg.simple_footslide_gt_margin:.3f})",
+                flush=True,
+            )
 
     with profiler.section("setup/model_optimizer_compile"):
         input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
@@ -306,10 +433,15 @@ def train(args: argparse.Namespace) -> None:
         "end_effector_indices": clips[0].end_effectors,
         "input_dim": input_dim,
         "output_dim": output_dim,
-        "ae_prior_checkpoint": str(tl.resolve_path(args.prior_checkpoint)),
+        "ae_prior_checkpoint": str(prior_paths[0]),
+        "ae_prior_checkpoints": [str(path) for path in prior_paths],
+        "ae_prior_weights": [1.0 / len(prior_paths) for _path in prior_paths],
         "loss_type": "pure_transition_ae_prior",
         "ae_score_loss": args.ae_score_loss,
         "ae_huber_delta": args.ae_huber_delta,
+        "simple_footslide_loss_weight": cfg.simple_footslide_loss_weight,
+        "simple_footslide_threshold_mps": cfg.simple_footslide_threshold_mps,
+        "simple_footslide_gt_margin": cfg.simple_footslide_gt_margin,
         "compile_enabled": compile_enabled,
     }
 
@@ -369,7 +501,7 @@ def train(args: argparse.Namespace) -> None:
 
     dataset, loader = make_loader(rollout_k)
     print(
-        f"pure_ae run={cfg.run_name} prior={args.prior_checkpoint} K={rollout_k} "
+        f"pure_ae run={cfg.run_name} priors={len(priors)} primary_prior={args.prior_checkpoint} K={rollout_k} "
         f"samples={len(dataset)} loop={cfg.training_loop}",
         flush=True,
     )
@@ -401,15 +533,14 @@ def train(args: argparse.Namespace) -> None:
             with profiler.section("train/forward_loss"):
                 loss, scalars = run_batch_ae(
                     model,
-                    prior,
-                    prior_mean,
-                    prior_std,
+                    priors,
                     clips,
                     batch,
                     cfg,
                     rollout_k,
                     device,
                     compute_diagnostics=compute_diagnostics,
+                    compatibility_score_weight=args.compatibility_score_weight,
                 )
             with profiler.section("train/zero_grad"):
                 opt.zero_grad(set_to_none=True)
@@ -423,6 +554,7 @@ def train(args: argparse.Namespace) -> None:
         train_total = float(np.mean([p["total"] for p in parts]))
         train_score = float(np.mean([p["ae_score"] for p in parts]))
         motion_rms = float(np.mean([p["canon_step_rms"] for p in parts]))
+        footslide_loss = float(np.mean([p["simple_footslide"] for p in parts]))
         if compute_diagnostics:
             last_diagnostics["joint_rmse"] = float(np.mean([p["joint_rmse"] for p in parts]))
             last_diagnostics["ee_rmse"] = float(np.mean([p["ee_rmse"] for p in parts]))
@@ -438,6 +570,8 @@ def train(args: argparse.Namespace) -> None:
         }[args.best_metric]
         writer.add_scalar("loss/train_total", train_total, epoch)
         writer.add_scalar("loss/ae_score", train_score, epoch)
+        writer.add_scalar("loss/simple_footslide", footslide_loss, epoch)
+        writer.add_scalar("monitor/simple_footslide_threshold_mps", cfg.simple_footslide_threshold_mps, epoch)
         writer.add_scalar("motion/canon_step_rms", motion_rms, epoch)
         if compute_diagnostics:
             writer.add_scalar("accuracy/joint_rmse_m", joint_rmse, epoch)
@@ -469,6 +603,7 @@ def train(args: argparse.Namespace) -> None:
         )
         print(
             f"epoch={epoch:04d} K={rollout_k:02d} ae={train_total:.6g} best_{args.best_metric}={best:.6g} "
+            f"ae_score={train_score:.6g} footslide={footslide_loss:.6g} "
             f"joint_rmse={joint_rmse:.6g} ee_rmse={ee_rmse:.6g} motion_rms={motion_rms:.6g} "
             f"stalls={stalls} elapsed_s={time.perf_counter() - start_time:.1f}",
             flush=True,
@@ -482,6 +617,13 @@ def train(args: argparse.Namespace) -> None:
             stalls = 0
             stage_start_epoch = epoch + 1
             print(f"advanced rollout_k={rollout_k} samples={len(dataset)}", flush=True)
+        elif can_advance and args.stop_on_final_stall:
+            print(
+                f"stopped on final stall epoch={epoch} K={rollout_k} "
+                f"best_{args.best_metric}={best:.6g}",
+                flush=True,
+            )
+            break
         if args.max_train_seconds > 0 and time.perf_counter() - start_time >= args.max_train_seconds:
             print(f"max_train_seconds reached {args.max_train_seconds}", flush=True)
             break
@@ -498,6 +640,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder-path", default="data/npz_final")
     parser.add_argument("--prior-checkpoint", required=True)
+    parser.add_argument(
+        "--extra-prior-checkpoint",
+        action="append",
+        default=[],
+        help="Additional frozen AE prior checkpoint. All priors are averaged with equal weight.",
+    )
     parser.add_argument("--run-name", default="locomotion_pure_ae")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--cyclic-animation", action=argparse.BooleanOptionalAction, default=False)
@@ -520,6 +668,7 @@ def main() -> None:
     parser.add_argument("--curriculum-stall-patience-epochs", type=int, default=60)
     parser.add_argument("--curriculum-min-epochs", type=int, default=30)
     parser.add_argument("--curriculum-min-delta", type=float, default=1e-6)
+    parser.add_argument("--stop-on-final-stall", action="store_true")
     parser.add_argument("--max-train-seconds", type=float, default=0.0)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--compile", action="store_true", help="Try torch.compile after a forward/backward probe.")
@@ -564,6 +713,30 @@ def main() -> None:
     parser.add_argument("--alpha11-contact-height", type=float, default=245.0)
     parser.add_argument("--alpha12-termination", type=float, default=0.07)
     parser.add_argument("--ae-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--simple-footslide-loss-weight",
+        type=float,
+        default=0.0,
+        help="Extra simple generated-geometry support-foot slide loss. Default off.",
+    )
+    parser.add_argument(
+        "--simple-footslide-threshold-mps",
+        type=float,
+        default=0.0,
+        help="Zero-loss support slide threshold. If <=0, use max ground-truth support slide times margin.",
+    )
+    parser.add_argument(
+        "--simple-footslide-gt-margin",
+        type=float,
+        default=1.05,
+        help="Multiplier for the auto threshold from ground-truth support slide.",
+    )
+    parser.add_argument(
+        "--compatibility-score-weight",
+        type=float,
+        default=0.0,
+        help="Extra model-training penalty from a compatible transition prior head, if the AE checkpoint has one.",
+    )
     train(parser.parse_args())
 
 

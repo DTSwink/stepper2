@@ -45,6 +45,7 @@ from visualize_model import apply_config_dict, load_model
 
 
 DEFAULT_NPZ_DIR = PROJECT_ROOT / "data" / "npz_final"
+DEFAULT_ANIMATION_LIBRARY_DIR = PROJECT_ROOT / "ue5" / "animations_omni_only" / "npz_final"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 APP_ICON = PROJECT_ROOT / "training" / "assets" / "stepper_model_viewer.ico"
 SETTINGS_PATH = PROJECT_ROOT / "training" / "model_viewer_settings.json"
@@ -837,6 +838,7 @@ class ModelViewerApp(tk.Tk):
         self.gl_lists: dict[str, int] = {}
         self.shadow_lists: dict[int, tuple[int, int, int]] = {}
         self.shadow_generation = 0
+        self.animation_browser_paths: list[Path] = []
         self.fps_last_time = time.perf_counter()
         self.fps_frame_count = 0
         self.display_fps = 0.0
@@ -907,6 +909,15 @@ class ModelViewerApp(tk.Tk):
             latest_npz = newest_npz()
             startup_npz = str(latest_npz) if latest_npz is not None else ""
         self.startup_npz_path_var = tk.StringVar(value=startup_npz)
+        animation_settings = (
+            self.app_settings.get("animation_browser", {})
+            if isinstance(self.app_settings.get("animation_browser", {}), dict)
+            else {}
+        )
+        animation_folder = str(animation_settings.get("folder_path", "")).strip()
+        if not animation_folder:
+            animation_folder = str(DEFAULT_ANIMATION_LIBRARY_DIR)
+        self.animation_folder_var = tk.StringVar(value=animation_folder)
         self.settings_status_var = tk.StringVar(value="")
 
         self._configure_style()
@@ -914,6 +925,7 @@ class ModelViewerApp(tk.Tk):
         self.apply_startup_geometry()
         self.deiconify()
         self.after(250, self.keep_inside_work_area)
+        self.after(80, self.refresh_animation_browser)
         self.after(120, self.auto_load_latest)
         self.schedule_next_tick()
 
@@ -1075,6 +1087,42 @@ class ModelViewerApp(tk.Tk):
         ttk.Button(actor_buttons, text="Remove", command=self.remove_selected).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(actor_buttons, text="Duplicate", command=self.duplicate_selected).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
+        animation_browser = ttk.Frame(actors_tab)
+        animation_browser.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(animation_browser, text="Animations").pack(anchor=tk.W)
+        animation_list_frame = ttk.Frame(animation_browser)
+        animation_list_frame.pack(fill=tk.X, pady=(3, 3))
+        self.animation_listbox = tk.Listbox(
+            animation_list_frame,
+            height=7,
+            bg="#14171c",
+            fg=TEXT,
+            selectbackground="#4f718e",
+            selectforeground=TEXT,
+            highlightthickness=1,
+            highlightbackground=LINE,
+            relief=tk.FLAT,
+            exportselection=False,
+        )
+        animation_scroll = ttk.Scrollbar(animation_list_frame, orient=tk.VERTICAL, command=self.animation_listbox.yview)
+        self.animation_listbox.configure(yscrollcommand=animation_scroll.set)
+        self.animation_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        animation_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.animation_listbox.bind("<Double-1>", self.load_selected_animation)
+        self.animation_listbox.bind("<Return>", self.load_selected_animation)
+        animation_tools = ttk.Frame(animation_browser)
+        animation_tools.pack(fill=tk.X)
+        ttk.Button(animation_tools, text="Load", command=self.load_selected_animation).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(animation_tools, text="Folder...", command=self.browse_animation_folder).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+        )
+        ttk.Button(animation_tools, text="Refresh", command=self.refresh_animation_browser).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+        )
+        ttk.Label(animation_browser, textvariable=self.animation_folder_var, style="Muted.TLabel", wraplength=316).pack(
+            anchor=tk.W, pady=(3, 0)
+        )
+
         ttk.Separator(actors_tab).pack(fill=tk.X, pady=5)
         ttk.Label(actors_tab, text="Selected Actor").pack(anchor=tk.W)
         inspector = ttk.Frame(actors_tab)
@@ -1123,6 +1171,7 @@ class ModelViewerApp(tk.Tk):
         self.install_space_play_bindtag(self)
         self.bind("<Left>", lambda _event: self.step_frame(-1))
         self.bind("<Right>", lambda _event: self.step_frame(1))
+        self.bind("<Delete>", self.on_delete_selected)
         for var in (self.name_var, self.visible_var, *self.offset_vars, *self.pelvis_offset_vars):
             var.trace_add("write", lambda *_args: self.apply_inspector())
         self.scale_var.trace_add("write", lambda *_args: self.draw())
@@ -1321,6 +1370,10 @@ class ModelViewerApp(tk.Tk):
             if startup_path:
                 startup_path = str(resolve_path(startup_path))
             startup = {"source_npz_path": startup_path}
+            animation_folder = self.animation_folder_var.get().strip()
+            if animation_folder:
+                animation_folder = str(resolve_path(animation_folder))
+            animation_browser = {"folder_path": animation_folder}
             controller = {
                 "max_speed_mps": max(0.05, float(self.controller_max_speed_var.get())),
                 "acceleration_response": max(0.1, float(self.controller_accel_response_var.get())),
@@ -1337,6 +1390,7 @@ class ModelViewerApp(tk.Tk):
         self.app_settings["camera"] = camera
         self.app_settings["colliders"] = colliders
         self.app_settings["startup"] = startup
+        self.app_settings["animation_browser"] = animation_browser
         self.app_settings["controller"] = controller
         try:
             write_app_settings(self.app_settings)
@@ -1375,6 +1429,75 @@ class ModelViewerApp(tk.Tk):
                 messagebox.showerror("Unsupported file", "Open an .npz motion file or a .pt/.pth checkpoint.")
         except Exception as exc:
             messagebox.showerror("Open failed", str(exc))
+
+    def animation_folder(self) -> Path:
+        path_text = self.animation_folder_var.get().strip()
+        if not path_text:
+            return DEFAULT_ANIMATION_LIBRARY_DIR
+        return resolve_path(path_text)
+
+    def refresh_animation_browser(self) -> None:
+        if not hasattr(self, "animation_listbox"):
+            return
+        folder = self.animation_folder()
+        self.animation_browser_paths = []
+        self.animation_listbox.delete(0, tk.END)
+        if not folder.exists():
+            self.animation_listbox.insert(tk.END, "(folder not found)")
+            return
+        try:
+            paths = sorted(folder.glob("*.npz"), key=lambda item: item.name.lower())
+        except OSError as exc:
+            self.animation_listbox.insert(tk.END, f"(cannot read folder: {exc})")
+            return
+        self.animation_browser_paths = paths
+        if not paths:
+            self.animation_listbox.insert(tk.END, "(no npz files)")
+            return
+        for path in paths:
+            self.animation_listbox.insert(tk.END, path.stem)
+
+    def browse_animation_folder(self) -> None:
+        initial = self.animation_folder()
+        path_text = filedialog.askdirectory(
+            title="Animation folder",
+            initialdir=str(initial if initial.exists() else PROJECT_ROOT),
+        )
+        if not path_text:
+            return
+        self.animation_folder_var.set(str(Path(path_text).resolve()))
+        self.refresh_animation_browser()
+
+    def selected_animation_path(self) -> Path | None:
+        if not hasattr(self, "animation_listbox"):
+            return None
+        selection = self.animation_listbox.curselection()
+        if not selection:
+            return None
+        index = int(selection[0])
+        if index < 0 or index >= len(self.animation_browser_paths):
+            return None
+        return self.animation_browser_paths[index]
+
+    def load_selected_animation(self, _event: tk.Event | None = None) -> str | None:
+        path = self.selected_animation_path()
+        if path is None:
+            return "break" if _event is not None else None
+        try:
+            actor = self.selected_actor()
+            if actor is not None and actor.kind == "model":
+                self.load_model_source(actor, path)
+                self.refresh_tree(select_id=actor.actor_id)
+                self.update_timeline()
+                self.update_bounds()
+                self.invalidate_shadow_cache()
+                self.status_var.set(f"{actor.checkpoint_path.name if actor.checkpoint_path else 'checkpoint'}\n{path.name}\n{actor.status}")
+                self.draw()
+            else:
+                self.add_npz_actor(path)
+        except Exception as exc:
+            messagebox.showerror("Animation load failed", str(exc))
+        return "break" if _event is not None else None
 
     def auto_load_latest(self) -> None:
         if self.actors:
@@ -1467,16 +1590,42 @@ class ModelViewerApp(tk.Tk):
         actor = self.selected_actor()
         if actor is None:
             return
+        camera_target = self.camera_target().copy()
+        camera_distance = self.camera_distance()
+        yaw = self.yaw
+        pitch = self.pitch
+        view_axis = self.view_axis
+        pan_y = self.pan_y
+        target_locked = self.camera_target_locked
+        penetration_mode = self.penetration_mode
         self.actors = [item for item in self.actors if item.actor_id != actor.actor_id]
         if self.follow_cam_actor_id == actor.actor_id:
             self.set_follow_cam_actor(None)
         self.selected_actor_id = None
         self.refresh_tree()
         self.update_timeline()
-        if not self.actors:
-            self.update_bounds()
+        self.update_bounds()
+        self.yaw = yaw
+        self.pitch = pitch
+        self.view_axis = view_axis
+        self.pan_y = pan_y
+        self.camera_target_locked = target_locked
+        self.penetration_mode = penetration_mode
+        self.set_camera_target(camera_target)
+        self.set_camera_distance(camera_distance)
         self.invalidate_shadow_cache()
         self.draw()
+
+    def on_delete_selected(self, _event: tk.Event) -> str | None:
+        focus = self.focus_get()
+        if focus is not None:
+            widget_class = str(focus.winfo_class())
+            if widget_class in {"Entry", "TEntry", "Spinbox", "TSpinbox"}:
+                return None
+        if self.selected_actor() is None:
+            return None
+        self.remove_selected()
+        return "break"
 
     def set_selected_source_npz(self) -> None:
         actor = self.selected_actor()
@@ -1550,7 +1699,23 @@ class ModelViewerApp(tk.Tk):
         if self.tree_select_source == expected:
             self.tree_select_source = None
 
-    def on_tree_button_press(self, _event: tk.Event) -> None:
+    def clear_actor_selection(self, redraw: bool = True) -> None:
+        self.selected_actor_id = None
+        self.tree.selection_remove(self.tree.selection())
+        self.tree.focus("")
+        self.gizmo_visible = False
+        self.gizmo_drag = None
+        self.gizmo_hits.clear()
+        self.load_inspector()
+        if redraw:
+            self.draw()
+
+    def on_tree_button_press(self, event: tk.Event) -> None:
+        if not self.tree.identify_row(event.y):
+            self.tree_select_source = None
+            self.programmatic_tree_selection = False
+            self.clear_actor_selection()
+            return
         self.tree_select_source = "user"
         self.programmatic_tree_selection = False
 
@@ -1806,8 +1971,14 @@ class ModelViewerApp(tk.Tk):
 
     def penetration_camera(self) -> None:
         self.cancel_camera_transition()
-        self.set_follow_cam_actor(None)
         target = self.camera_target().copy()
+        if self.follow_cam_actor_id is not None:
+            actor = next((item for item in self.actors if item.actor_id == self.follow_cam_actor_id), None)
+            if actor is not None and actor.visible:
+                root = self.actor_follow_root_world(actor)
+                if root is not None:
+                    target[0] = root[0]
+                    target[2] = root[2]
         target[1] = 0.0
         self.set_camera_target(target)
         self.pitch = FLAT_PITCH
@@ -1860,7 +2031,10 @@ class ModelViewerApp(tk.Tk):
             return False
         old_target = self.camera_target().copy()
         target = root.copy()
-        target[1] = max(target[1], 0.85)
+        if self.penetration_mode:
+            target[1] = 0.0
+        else:
+            target[1] = max(target[1], 0.85)
         self.set_camera_target(target)
         self.camera_target_locked = True
         return bool(np.linalg.norm(target - old_target) > 1e-5)
@@ -2398,10 +2572,7 @@ class ModelViewerApp(tk.Tk):
             return
         self.mark_pointer_dragged(x, y)
         if self.pending_gizmo_clear_on_release:
-            self.gizmo_visible = False
-            self.gizmo_drag = None
-            self.gizmo_hits.clear()
-            self.draw()
+            self.clear_actor_selection()
         self.pending_gizmo_clear_on_release = False
 
     def on_mouse_down(self, event: tk.Event) -> None:
@@ -2418,7 +2589,7 @@ class ModelViewerApp(tk.Tk):
             self.select_actor_from_viewport(picked.actor_id)
             return
         self.gizmo_drag = None
-        self.pending_gizmo_clear_on_release = self.gizmo_visible
+        self.pending_gizmo_clear_on_release = self.selected_actor_id is not None
         self.drag_start = (event.x, event.y)
         self.drag_pan = bool(event.state & 0x0001)
 

@@ -22,7 +22,7 @@
     "hand_height": 0.032
   },
   "startup": {
-    "source_npz_path": "data/fbx/npz_final/testcasc.npz"
+    "source_npz_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\test\\npz_final\\M_Neutral_Walk_Loop_F.npz"
   },
   "controller": {
     "max_speed_mps": 1.8,
