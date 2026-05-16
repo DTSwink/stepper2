@@ -46,6 +46,7 @@ from visualize_model import apply_config_dict, load_model
 
 DEFAULT_NPZ_DIR = PROJECT_ROOT / "data" / "npz_final"
 DEFAULT_ANIMATION_LIBRARY_DIR = PROJECT_ROOT / "ue5" / "animations_omni_only" / "npz_final"
+DEFAULT_ANIMATION_LIBRARY_DIR_2 = PROJECT_ROOT / "ue5" / "animations_transitions_only_full_trimmed" / "npz_final"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 APP_ICON = PROJECT_ROOT / "training" / "assets" / "stepper_model_viewer.ico"
 SETTINGS_PATH = PROJECT_ROOT / "training" / "model_viewer_settings.json"
@@ -225,10 +226,17 @@ def actor_basename(path: Path) -> str:
     return path.stem
 
 
-def newest_best_checkpoint() -> Path | None:
+def newest_checkpoint() -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
-    candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_best*.pt"))
+    last_checkpoints = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_last.pt"))
+    if last_checkpoints:
+        return max(last_checkpoints, key=lambda p: p.stat().st_mtime)
+    candidates = [
+        path
+        for path in DEFAULT_RUNS_DIR.glob("*/checkpoints/*.pt")
+        if not path.name.startswith("checkpoint_best")
+    ]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -326,6 +334,9 @@ class Actor:
     clip_tensors: dict[str, torch.Tensor] | None = None
     source_contacts: np.ndarray | None = None
     initial_pelvis_offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
+    initial_root_yaw: float = 0.0
+    random_init_source_npz_path: Path | None = None
+    random_init_frame: int | None = None
     generated_pos: list[np.ndarray] = field(default_factory=list)
     generated_rot: list[np.ndarray] = field(default_factory=list)
     generated_contacts: list[np.ndarray] = field(default_factory=list)
@@ -344,6 +355,7 @@ class Actor:
     controller_move_input: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     controller_turn_input: float = 0.0
     controller_settings_snapshot: RootMotionSettings | None = None
+    authored_extension_active: bool = False
     prev_idx: torch.Tensor | None = None
     cur_idx: torch.Tensor | None = None
     prev_pose: dict[str, torch.Tensor] | None = None
@@ -355,7 +367,7 @@ class Actor:
 
     @property
     def frame_count(self) -> int:
-        if self.kind == "model" and self.controller_active:
+        if self.kind == "model" and (self.controller_active or self.authored_extension_active):
             generated_count = min(len(self.generated_pos), len(self.generated_rot))
             return max(int(self.clip.T) if self.clip is not None else 1, generated_count, int(self.generation_target) + 1)
         return int(self.clip.T) if self.clip is not None else 1
@@ -390,14 +402,17 @@ class Actor:
             out["contacts"] = torch.zeros_like(out["contacts"])
         return out
 
-    def refresh_seed_global_pose(self, index: int, pose: dict[str, torch.Tensor], device: torch.device) -> None:
+    def refresh_seed_global_pose(
+        self, index: int, pose: dict[str, torch.Tensor], device: torch.device, clip_index: int | None = None
+    ) -> None:
         if self.clip is None:
             return
         tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(device)
-        idx = torch.tensor([index], dtype=torch.long, device=device)
+        idx = torch.tensor([index if clip_index is None else int(clip_index)], dtype=torch.long, device=device)
         root_pos = tensors["root_pos"].index_select(0, idx)
         root_rot = tensors["root_rot"].index_select(0, idx)
-        global_pos, global_rot, _canon = tl.fk_from_pose(self.clip, root_pos, root_rot, pose, device)
+        global_pos, global_rot, canon = tl.fk_from_pose(self.clip, root_pos, root_rot, pose, device)
+        pose["canon_pos"] = canon
         while len(self.generated_pos) <= index:
             self.generated_pos.append(global_pos[0].detach().cpu().numpy().astype(np.float32))
             self.generated_rot.append(global_rot[0].detach().cpu().numpy().astype(np.float32))
@@ -469,32 +484,51 @@ class Actor:
             self.generated_pos.clear()
             self.generated_rot.clear()
             self.generated_contacts.clear()
+            self.controller_root_offset = np.zeros(3, dtype=np.float32)
+            self.controller_velocity = np.zeros(2, dtype=np.float32)
+            self.controller_root_anchor = None
+            self.controller_yaw = 0.0
+            self.controller_move_yaw = 0.0
             self.controller_active = False
             self.controller_move_input = np.zeros(2, dtype=np.float32)
             self.controller_turn_input = 0.0
+            self.controller_settings_snapshot = None
+            self.authored_extension_active = False
             self.clear_controller_root_plan()
             if self.clip is None:
                 return
             first_count = min(2, self.clip.T)
-            for i in range(first_count):
-                self.generated_pos.append(self.clip.global_pos[i].detach().cpu().numpy().astype(np.float32))
-                self.generated_rot.append(self.clip.global_rot[i].detach().cpu().numpy().astype(np.float32))
-                if hasattr(self.clip, "contacts"):
-                    self.generated_contacts.append(self.clip.contacts[i].detach().cpu().numpy().reshape(-1)[:2].astype(np.float32))
-                else:
-                    self.generated_contacts.append(np.zeros(2, dtype=np.float32))
             self.generation_target = max(0, first_count - 1)
             if self.kind == "model" and self.model is not None and self.clip.T >= 2:
                 device = self.device or torch.device("cpu")
                 self.prev_idx = torch.tensor([0], dtype=torch.long)
                 self.cur_idx = torch.tensor([1], dtype=torch.long)
-                self.prev_pose = tl.get_pose_from_clip(self.clip, self.prev_idx, device)
-                self.cur_pose = tl.get_pose_from_clip(self.clip, self.cur_idx, device)
+                pose_clip = self.clip
+                pose_prev_idx = self.prev_idx
+                pose_cur_idx = self.cur_idx
+                if self.random_init_source_npz_path is not None and self.random_init_frame is not None and self.cfg is not None:
+                    try:
+                        candidate_clip = tl.MotionClip(self.random_init_source_npz_path, self.cfg)
+                        if candidate_clip.body_names != self.clip.body_names:
+                            raise ValueError("random init skeleton does not match source skeleton")
+                        max_seed_cur = max(1, candidate_clip.T - 1)
+                        seed_cur = max(1, min(max_seed_cur, int(self.random_init_frame)))
+                        pose_clip = candidate_clip
+                        pose_prev_idx = torch.tensor([seed_cur - 1], dtype=torch.long)
+                        pose_cur_idx = torch.tensor([seed_cur], dtype=torch.long)
+                    except Exception:
+                        self.random_init_source_npz_path = None
+                        self.random_init_frame = None
+                        pose_clip = self.clip
+                        pose_prev_idx = self.prev_idx
+                        pose_cur_idx = self.cur_idx
+                self.prev_pose = tl.get_pose_from_clip(pose_clip, pose_prev_idx, device)
+                self.cur_pose = tl.get_pose_from_clip(pose_clip, pose_cur_idx, device)
                 if self.cfg is not None:
                     self.prev_pose, self.cur_pose = tl.maybe_apply_initial_offsets(
-                        self.clip,
-                        self.prev_idx,
-                        self.cur_idx,
+                        pose_clip,
+                        pose_prev_idx,
+                        pose_cur_idx,
                         self.prev_pose,
                         self.cur_pose,
                         self.cfg,
@@ -503,8 +537,6 @@ class Actor:
                     if self.has_initial_pelvis_offset():
                         self.prev_pose = self.apply_initial_pelvis_offset_to_pose(self.prev_pose, self.prev_idx, device)
                         self.cur_pose = self.apply_initial_pelvis_offset_to_pose(self.cur_pose, self.cur_idx, device)
-                        self.refresh_seed_global_pose(0, self.prev_pose, device)
-                        self.refresh_seed_global_pose(1, self.cur_pose, device)
                     elif self.cfg.freefall_body_height_offset_m != 0.0:
                         tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(device)
                         prev_root_pos = tensors["root_pos"].index_select(0, self.prev_idx.to(device))
@@ -519,12 +551,148 @@ class Actor:
                         if len(self.generated_pos) > 1:
                             self.generated_pos[1] = cur_pos[0].detach().cpu().numpy().astype(np.float32)
                             self.generated_rot[1] = cur_rot[0].detach().cpu().numpy().astype(np.float32)
+                    self.refresh_seed_global_pose(0, self.prev_pose, device, 0)
+                    self.refresh_seed_global_pose(1, self.cur_pose, device, 1)
+            else:
+                for clip_index in range(first_count):
+                    self.generated_pos.append(self.clip.global_pos[clip_index].detach().cpu().numpy().astype(np.float32))
+                    self.generated_rot.append(self.clip.global_rot[clip_index].detach().cpu().numpy().astype(np.float32))
+                    if hasattr(self.clip, "contacts"):
+                        self.generated_contacts.append(
+                            self.clip.contacts[clip_index].detach().cpu().numpy().reshape(-1)[:2].astype(np.float32)
+                        )
+                    else:
+                        self.generated_contacts.append(np.zeros(2, dtype=np.float32))
 
-    def pose_for_frame(self, frame: int, generate: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    def reset_generation_to_source_frame(self, frame: int) -> int:
+        with self.generation_lock:
+            self.generated_pos.clear()
+            self.generated_rot.clear()
+            self.generated_contacts.clear()
+            self.controller_root_offset = np.zeros(3, dtype=np.float32)
+            self.controller_velocity = np.zeros(2, dtype=np.float32)
+            self.controller_root_anchor = None
+            self.controller_yaw = 0.0
+            self.controller_move_yaw = 0.0
+            self.controller_active = False
+            self.controller_move_input = np.zeros(2, dtype=np.float32)
+            self.controller_turn_input = 0.0
+            self.controller_settings_snapshot = None
+            self.authored_extension_active = False
+            self.clear_controller_root_plan()
+            if self.clip is None:
+                return 0
+            seed_cur = max(0, min(int(frame), self.clip.T - 1))
+            seed_prev = max(0, seed_cur - 1)
+            for clip_index in range(seed_cur + 1):
+                self.generated_pos.append(self.clip.global_pos[clip_index].detach().cpu().numpy().astype(np.float32))
+                self.generated_rot.append(self.clip.global_rot[clip_index].detach().cpu().numpy().astype(np.float32))
+                if hasattr(self.clip, "contacts"):
+                    self.generated_contacts.append(
+                        self.clip.contacts[clip_index].detach().cpu().numpy().reshape(-1)[:2].astype(np.float32)
+                    )
+                else:
+                    self.generated_contacts.append(np.zeros(2, dtype=np.float32))
+            self.generation_target = seed_cur
+            if self.kind == "model" and self.model is not None and self.cfg is not None:
+                device = self.device or torch.device("cpu")
+                self.prev_idx = torch.tensor([seed_prev], dtype=torch.long)
+                self.cur_idx = torch.tensor([seed_cur], dtype=torch.long)
+                self.prev_pose = tl.get_pose_from_clip(self.clip, self.prev_idx, device)
+                self.cur_pose = tl.get_pose_from_clip(self.clip, self.cur_idx, device)
+            return seed_cur
+
+    def seed_local_pose_at_current_root(
+        self,
+        frame: int,
+        pose_clip: tl.MotionClip,
+        pose_cur_index: int,
+        extend_authored: bool = False,
+    ) -> int:
+        with self.generation_lock:
+            if (
+                self.kind != "model"
+                or self.model is None
+                or self.clip is None
+                or self.cfg is None
+                or self.device is None
+            ):
+                return 0
+            frame_i = max(0, int(frame))
+            pose_cur_index = max(0, min(int(pose_cur_index), pose_clip.T - 1))
+            pose_prev_index = max(0, pose_cur_index - 1)
+            root_prev_frame = max(0, frame_i - 1)
+            device = self.device
+            pose_prev_idx = torch.tensor([pose_prev_index], dtype=torch.long)
+            pose_cur_idx = torch.tensor([pose_cur_index], dtype=torch.long)
+            prev_pose = tl.get_pose_from_clip(pose_clip, pose_prev_idx, device)
+            cur_pose = tl.get_pose_from_clip(pose_clip, pose_cur_idx, device)
+            prev_pose, cur_pose = tl.maybe_apply_initial_offsets(
+                pose_clip,
+                pose_prev_idx,
+                pose_cur_idx,
+                prev_pose,
+                cur_pose,
+                self.cfg,
+                device,
+            )
+            if self.has_initial_pelvis_offset():
+                prev_pose = self.apply_initial_pelvis_offset_to_pose(
+                    prev_pose, torch.tensor([min(root_prev_frame, self.clip.T - 1)]), device
+                )
+                cur_pose = self.apply_initial_pelvis_offset_to_pose(
+                    cur_pose, torch.tensor([min(frame_i, self.clip.T - 1)]), device
+                )
+            prev_root_pos, prev_root_rot, _prev_yaw, _prev_heading = self.authored_root_state(
+                root_prev_frame, device, extend_authored
+            )
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = self.authored_root_state(
+                frame_i, device, extend_authored
+            )
+            prev_global_pos, prev_global_rot, prev_canon = tl.fk_from_pose(
+                self.clip, prev_root_pos, prev_root_rot, prev_pose, device
+            )
+            cur_global_pos, cur_global_rot, cur_canon = tl.fk_from_pose(
+                self.clip, cur_root_pos, cur_root_rot, cur_pose, device
+            )
+            prev_pose["canon_pos"] = prev_canon
+            cur_pose["canon_pos"] = cur_canon
+            while len(self.generated_pos) <= frame_i:
+                fallback_idx = min(len(self.generated_pos), self.clip.T - 1)
+                self.generated_pos.append(self.clip.global_pos[fallback_idx].detach().cpu().numpy().astype(np.float32))
+                self.generated_rot.append(self.clip.global_rot[fallback_idx].detach().cpu().numpy().astype(np.float32))
+                if hasattr(self.clip, "contacts"):
+                    self.generated_contacts.append(
+                        self.clip.contacts[fallback_idx].detach().cpu().numpy().reshape(-1)[:2].astype(np.float32)
+                    )
+                else:
+                    self.generated_contacts.append(np.zeros(2, dtype=np.float32))
+            if root_prev_frame != frame_i:
+                self.generated_pos[root_prev_frame] = prev_global_pos[0].detach().cpu().numpy().astype(np.float32)
+                self.generated_rot[root_prev_frame] = prev_global_rot[0].detach().cpu().numpy().astype(np.float32)
+                self.generated_contacts[root_prev_frame] = self.pose_contacts_numpy(prev_pose)
+            self.generated_pos[frame_i] = cur_global_pos[0].detach().cpu().numpy().astype(np.float32)
+            self.generated_rot[frame_i] = cur_global_rot[0].detach().cpu().numpy().astype(np.float32)
+            self.generated_contacts[frame_i] = self.pose_contacts_numpy(cur_pose)
+            del self.generated_pos[frame_i + 1 :]
+            del self.generated_rot[frame_i + 1 :]
+            del self.generated_contacts[frame_i + 1 :]
+            self.prev_idx = torch.tensor([root_prev_frame], dtype=torch.long)
+            self.cur_idx = torch.tensor([frame_i], dtype=torch.long)
+            self.prev_pose = prev_pose
+            self.cur_pose = cur_pose
+            self.generation_target = frame_i
+            self.authored_extension_active = bool(extend_authored and not self.controller_active)
+            return pose_cur_index
+
+    def pose_for_frame(
+        self, frame: int, generate: bool = True, extend_authored: bool = False
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         if self.clip is None:
             return None
         requested_frame = max(0, int(frame))
-        frame = requested_frame if self.kind == "model" and self.controller_active else min(requested_frame, self.clip.T - 1)
+        can_extend = bool(self.kind == "model" and (self.controller_active or extend_authored or self.authored_extension_active))
+        frame = requested_frame if can_extend else min(requested_frame, self.clip.T - 1)
         if self.kind == "npz":
             return (
                 self.clip.global_pos[frame].detach().cpu().numpy().astype(np.float32),
@@ -533,7 +701,7 @@ class Actor:
         if self.model is None:
             return None
         if generate:
-            self.generate_to(frame)
+            self.generate_to(frame, extend_authored=extend_authored)
         elif frame >= len(self.generated_pos):
             if not self.generated_pos:
                 return None
@@ -544,10 +712,11 @@ class Actor:
         frame = min(frame, generated_count - 1)
         return self.generated_pos[frame], self.generated_rot[frame]
 
-    def start_async_generation(self, frame: int) -> None:
+    def start_async_generation(self, frame: int, extend_authored: bool = False) -> None:
         if self.kind != "model" or self.model is None or self.clip is None:
             return
-        if self.controller_active:
+        self.authored_extension_active = bool(extend_authored and not self.controller_active)
+        if self.controller_active or self.authored_extension_active:
             frame = max(0, int(frame))
         else:
             frame = max(0, min(int(frame), self.clip.T - 1))
@@ -561,14 +730,65 @@ class Actor:
     def _generation_worker(self) -> None:
         while True:
             target = int(self.generation_target)
-            self.generate_to(target)
+            self.generate_to(target, extend_authored=bool(self.authored_extension_active and not self.controller_active))
             if int(self.generation_target) <= target:
                 return
 
     @torch.no_grad()
-    def generate_to(self, frame: int) -> None:
+    def generate_to(self, frame: int, extend_authored: bool = False) -> None:
+        if self.kind == "model" and self.clip is not None and not self.controller_active:
+            self.authored_extension_active = bool(extend_authored)
         with self.generation_lock:
             self._generate_to_locked(frame)
+
+    def authored_root_state(
+        self, frame: int, device: torch.device, extend_authored: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self.clip is not None and self.cfg is not None
+        idx_value = max(0, int(frame))
+        if not extend_authored or idx_value < int(self.clip.T):
+            idx = torch.tensor([min(idx_value, self.clip.T - 1)], dtype=torch.long, device=device)
+            return tl.root_state(self.clip, idx, self.cfg, device)
+        tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(device)
+        root_pos = tensors["root_pos"]
+        root_rot = tensors["root_rot"]
+        root_yaw = tensors["root_yaw"]
+        extra = float(idx_value - (int(self.clip.T) - 1))
+        if int(self.clip.T) >= 3:
+            pos_delta = ((root_pos[-1] - root_pos[-2]) + (root_pos[-2] - root_pos[-3])) * 0.5
+            yaw_delta = (tl.wrap_angle(root_yaw[-1] - root_yaw[-2]) + tl.wrap_angle(root_yaw[-2] - root_yaw[-3])) * 0.5
+        elif int(self.clip.T) >= 2:
+            pos_delta = root_pos[-1] - root_pos[-2]
+            yaw_delta = tl.wrap_angle(root_yaw[-1] - root_yaw[-2])
+        else:
+            pos_delta = torch.zeros(3, dtype=root_pos.dtype, device=device)
+            yaw_delta = torch.zeros((), dtype=root_yaw.dtype, device=device)
+        pos = (root_pos[-1] + pos_delta * extra).view(1, 3)
+        delta_yaw = (-yaw_delta * extra).view(1)
+        rot = root_rot[-1:].matmul(tl.yaw_to_row_matrix(delta_yaw))
+        yaw = tl.heading_yaw_from_root(rot)
+        heading = tl.yaw_to_row_matrix(yaw)
+        return pos, rot, yaw, heading
+
+    def set_authored_extension_root_plan(self, prev_frame: int, cur_frame: int) -> None:
+        if self.clip is None or self.cfg is None or self.device is None:
+            return
+        prev_pos, _prev_rot, prev_yaw, _prev_heading = self.authored_root_state(prev_frame, self.device, True)
+        cur_pos, _cur_rot, cur_yaw, _cur_heading = self.authored_root_state(cur_frame, self.device, True)
+        future_pos: list[np.ndarray] = []
+        future_yaw: list[float] = []
+        for k in range(1, int(self.cfg.future_window) + 1):
+            fut_pos, _fut_rot, fut_yaw, _fut_heading = self.authored_root_state(cur_frame + k, self.device, True)
+            future_pos.append(fut_pos[0].detach().cpu().numpy().astype(np.float32))
+            future_yaw.append(float(fut_yaw[0].detach().cpu()))
+        self.set_controller_root_plan(
+            prev_pos[0].detach().cpu().numpy().astype(np.float32),
+            cur_pos[0].detach().cpu().numpy().astype(np.float32),
+            float(prev_yaw[0].detach().cpu()),
+            float(cur_yaw[0].detach().cpu()),
+            np.asarray(future_pos, dtype=np.float32),
+            np.asarray(future_yaw, dtype=np.float32),
+        )
 
     def _generate_to_locked(self, frame: int) -> None:
         if (
@@ -584,15 +804,28 @@ class Actor:
         ):
             return
         tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(self.device)
-        while len(self.generated_pos) <= frame and (self.controller_active or len(self.generated_pos) < self.clip.T):
+        extend_authored = bool(self.authored_extension_active and not self.controller_active)
+        while len(self.generated_pos) <= frame and (self.controller_active or extend_authored or len(self.generated_pos) < self.clip.T):
             target = len(self.generated_pos)
-            target_idx = torch.tensor([target], dtype=torch.long)
-            source_target_idx = torch.tensor([min(target, self.clip.T - 1)], dtype=torch.long, device=self.device)
-            root_pos = tensors["root_pos"].index_select(0, source_target_idx)
-            root_rot = tensors["root_rot"].index_select(0, source_target_idx)
             if self.controller_active:
+                target_idx = torch.tensor([target], dtype=torch.long)
+                source_target_idx = torch.tensor([min(target, self.clip.T - 1)], dtype=torch.long, device=self.device)
+                root_pos = tensors["root_pos"].index_select(0, source_target_idx)
+                root_rot = tensors["root_rot"].index_select(0, source_target_idx)
+                inp = self.build_controller_input()
+            elif extend_authored:
+                prev_frame = int(self.prev_idx.reshape(-1)[0].item())
+                cur_frame = int(self.cur_idx.reshape(-1)[0].item())
+                target_idx = torch.tensor([cur_frame + 1], dtype=torch.long)
+                self.set_authored_extension_root_plan(prev_frame, cur_frame)
+                root_pos, root_rot, _root_yaw, _heading = self.authored_root_state(cur_frame + 1, self.device, True)
                 inp = self.build_controller_input()
             else:
+                next_idx = self.cur_idx.to(self.device) + 1
+                if not self.cfg.cyclic_animation:
+                    next_idx = torch.clamp(next_idx, max=self.clip.T - 1)
+                target_idx = next_idx.detach().cpu()
+                root_pos, root_rot, _root_yaw, _heading = tl.root_state(self.clip, next_idx, self.cfg, self.device)
                 inp = tl.build_input(
                     self.clip,
                     self.prev_idx,
@@ -664,7 +897,7 @@ class Actor:
             and self.controller_prev_root_yaw is not None
             and self.controller_cur_root_yaw is not None
         ):
-            delta = (self.controller_cur_root_pos - self.controller_prev_root_pos) @ yaw_rotation_matrix_np(self.controller_prev_root_yaw)
+            delta = (self.controller_cur_root_pos - self.controller_prev_root_pos) @ yaw_rotation_matrix_np(self.controller_prev_root_yaw).T
             yaw_delta = angle_wrap_np(float(self.controller_cur_root_yaw) - float(self.controller_prev_root_yaw))
             values = np.asarray(
                 [
@@ -703,7 +936,7 @@ class Actor:
             feats: list[float] = []
             cur_pos = self.controller_cur_root_pos
             cur_yaw = float(self.controller_cur_root_yaw)
-            heading = yaw_rotation_matrix_np(cur_yaw)
+            heading = yaw_rotation_matrix_np(cur_yaw).T
             future_count = int(self.cfg.future_window)
             for k in range(1, future_count + 1):
                 idx = min(k - 1, len(self.controller_future_root_pos) - 1)
@@ -839,6 +1072,9 @@ class ModelViewerApp(tk.Tk):
         self.shadow_lists: dict[int, tuple[int, int, int]] = {}
         self.shadow_generation = 0
         self.animation_browser_paths: list[Path] = []
+        self.animation_browser_paths_by_tab: dict[str, list[Path]] = {"anim1": [], "anim2": []}
+        self.animation_listboxes: dict[str, tk.Listbox] = {}
+        self.animation_folder_vars: dict[str, tk.StringVar] = {}
         self.fps_last_time = time.perf_counter()
         self.fps_frame_count = 0
         self.display_fps = 0.0
@@ -846,6 +1082,10 @@ class ModelViewerApp(tk.Tk):
         self.overlay_texture_text = ""
         self.overlay_texture_size = (0, 0)
         self.overlay_texture_uv = (1.0, 1.0)
+        self.root_motion_overlay_texture_id = 0
+        self.root_motion_overlay_texture_text = ""
+        self.root_motion_overlay_texture_size = (0, 0)
+        self.root_motion_overlay_texture_uv = (1.0, 1.0)
         self.contact_overlay_texture_id = 0
         self.contact_overlay_texture_text = ""
         self.contact_overlay_texture_size = (0, 0)
@@ -864,12 +1104,14 @@ class ModelViewerApp(tk.Tk):
         self.foot_contact_from_source_var = tk.BooleanVar(value=False)
         self.controller_detected_on_startup = self.poll_controller().connected
         self.controller_enabled_var = tk.BooleanVar(value=self.controller_detected_on_startup)
-        self.show_trajectory_var = tk.BooleanVar(value=self.controller_detected_on_startup)
+        self.show_trajectory_var = tk.BooleanVar(value=True)
+        self.extend_trajectory_var = tk.BooleanVar(value=False)
         self.device_var = tk.StringVar(value="cpu")
         self.name_var = tk.StringVar(value="")
         self.visible_var = tk.BooleanVar(value=True)
         self.offset_vars = [tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0)]
         self.pelvis_offset_vars = [tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0)]
+        self.root_yaw_var = tk.DoubleVar(value=0.0)
         self.status_var = tk.StringVar(value="Open an NPZ or checkpoint to begin.")
         current_target = self.camera_target()
         self.settings_yaw_var = tk.DoubleVar(value=self.yaw)
@@ -903,6 +1145,7 @@ class ModelViewerApp(tk.Tk):
         self.controller_right_deadzone_var = tk.DoubleVar(value=float(controller_settings.get("right_deadzone", 0.26)))
         self.trajectory_seconds_var = tk.DoubleVar(value=float(controller_settings.get("trajectory_seconds", 1.0)))
         self.trajectory_step_var = tk.DoubleVar(value=float(controller_settings.get("trajectory_step_seconds", 0.16)))
+        self.extend_trajectory_var.set(bool(controller_settings.get("extend_trajectory", False)))
         startup_settings = self.app_settings.get("startup", {}) if isinstance(self.app_settings.get("startup", {}), dict) else {}
         startup_npz = str(startup_settings.get("source_npz_path", "")).strip()
         if not startup_npz:
@@ -918,6 +1161,20 @@ class ModelViewerApp(tk.Tk):
         if not animation_folder:
             animation_folder = str(DEFAULT_ANIMATION_LIBRARY_DIR)
         self.animation_folder_var = tk.StringVar(value=animation_folder)
+        animation_folder_2 = str(animation_settings.get("folder_path_2", "")).strip()
+        if not animation_folder_2:
+            animation_folder_2 = str(DEFAULT_ANIMATION_LIBRARY_DIR_2)
+        self.animation_folder_var_2 = tk.StringVar(value=animation_folder_2)
+        self.animation_folder_vars = {
+            "anim1": self.animation_folder_var,
+            "anim2": self.animation_folder_var_2,
+        }
+        random_settings = (
+            self.app_settings.get("random_initialization", {})
+            if isinstance(self.app_settings.get("random_initialization", {}), dict)
+            else {}
+        )
+        self.random_initialization_var = tk.BooleanVar(value=bool(random_settings.get("enabled", False)))
         self.settings_status_var = tk.StringVar(value="")
 
         self._configure_style()
@@ -1019,6 +1276,12 @@ class ModelViewerApp(tk.Tk):
         ttk.Checkbutton(controller_controls, text="Show Trajectory", variable=self.show_trajectory_var, command=self.draw).pack(
             anchor=tk.W
         )
+        ttk.Checkbutton(
+            controller_controls,
+            text="Extend Trajectory",
+            variable=self.extend_trajectory_var,
+            command=self.on_extend_trajectory_toggle,
+        ).pack(anchor=tk.W)
         ttk.Checkbutton(toolbar, text="Labels", variable=self.labels_var, command=self.draw).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Reset View", command=self.reset_camera).pack(side=tk.LEFT, padx=(12, 4))
         self.follow_cam_button = ttk.Button(toolbar, text="Follow Cam", command=self.follow_camera)
@@ -1071,61 +1334,116 @@ class ModelViewerApp(tk.Tk):
         tabs.add(actors_tab, text="Actors")
         tabs.add(settings_tab, text="Settings")
 
-        self.tree = ttk.Treeview(actors_tab, columns=("kind", "status"), show="tree headings", height=9)
+        actors_scroll_canvas = tk.Canvas(actors_tab, bg=PANEL, highlightthickness=0, borderwidth=0)
+        actors_scrollbar = ttk.Scrollbar(actors_tab, orient=tk.VERTICAL, command=actors_scroll_canvas.yview)
+        actors_scroll_canvas.configure(yscrollcommand=actors_scrollbar.set)
+        actors_scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        actors_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        actors_content = ttk.Frame(actors_scroll_canvas)
+        actors_content_window = actors_scroll_canvas.create_window((0, 0), window=actors_content, anchor=tk.NW)
+
+        def sync_actors_scroll_region(_event: tk.Event | None = None) -> None:
+            actors_scroll_canvas.configure(scrollregion=actors_scroll_canvas.bbox("all"))
+
+        def sync_actors_content_width(event: tk.Event) -> None:
+            actors_scroll_canvas.itemconfigure(actors_content_window, width=event.width)
+
+        def on_actors_wheel(event: tk.Event) -> str:
+            if event.widget in getattr(self, "animation_listboxes", {}).values():
+                return ""
+            actors_scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        actors_content.bind("<Configure>", sync_actors_scroll_region)
+        actors_scroll_canvas.bind("<Configure>", sync_actors_content_width)
+        actors_scroll_canvas.bind("<MouseWheel>", on_actors_wheel)
+        actors_content.bind("<MouseWheel>", on_actors_wheel)
+
+        tree_frame = ttk.Frame(actors_content)
+        tree_frame.pack(fill=tk.X, pady=(4, 6))
+        tree_frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(tree_frame, columns=("kind", "status"), show="tree headings", height=8)
         self.tree.heading("#0", text="Name")
         self.tree.heading("kind", text="Type")
         self.tree.heading("status", text="State")
         self.tree.column("#0", width=150)
         self.tree.column("kind", width=64, anchor=tk.CENTER)
         self.tree.column("status", width=98, anchor=tk.W)
-        self.tree.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
+        self.tree.grid(row=0, column=0, sticky=tk.EW)
+        self.tree.bind("<MouseWheel>", on_actors_wheel)
         self.tree.bind("<ButtonPress-1>", self.on_tree_button_press)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
-        actor_buttons = ttk.Frame(actors_tab)
+        actor_buttons = ttk.Frame(actors_content)
         actor_buttons.pack(fill=tk.X, pady=(0, 7))
         ttk.Button(actor_buttons, text="Remove", command=self.remove_selected).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(actor_buttons, text="Duplicate", command=self.duplicate_selected).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
-        animation_browser = ttk.Frame(actors_tab)
+        animation_browser = ttk.Frame(actors_content)
         animation_browser.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(animation_browser, text="Animations").pack(anchor=tk.W)
-        animation_list_frame = ttk.Frame(animation_browser)
-        animation_list_frame.pack(fill=tk.X, pady=(3, 3))
-        self.animation_listbox = tk.Listbox(
-            animation_list_frame,
-            height=7,
-            bg="#14171c",
-            fg=TEXT,
-            selectbackground="#4f718e",
-            selectforeground=TEXT,
-            highlightthickness=1,
-            highlightbackground=LINE,
-            relief=tk.FLAT,
-            exportselection=False,
+        self.animation_tabs = ttk.Notebook(animation_browser)
+        self.animation_tabs.pack(fill=tk.X)
+        for tab_key, tab_label, folder_var in (
+            ("anim1", "Animation 1", self.animation_folder_var),
+            ("anim2", "Animation 2", self.animation_folder_var_2),
+        ):
+            tab = ttk.Frame(self.animation_tabs)
+            self.animation_tabs.add(tab, text=tab_label)
+            animation_list_frame = ttk.Frame(tab)
+            animation_list_frame.pack(fill=tk.X, pady=(3, 3))
+            listbox = tk.Listbox(
+                animation_list_frame,
+                height=7,
+                bg="#14171c",
+                fg=TEXT,
+                selectbackground="#4f718e",
+                selectforeground=TEXT,
+                highlightthickness=1,
+                highlightbackground=LINE,
+                relief=tk.FLAT,
+                exportselection=False,
+            )
+            animation_scroll = ttk.Scrollbar(animation_list_frame, orient=tk.VERTICAL, command=listbox.yview)
+            listbox.configure(yscrollcommand=animation_scroll.set)
+            listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            animation_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            listbox.bind("<Double-1>", lambda event, key=tab_key: self.load_selected_animation(event, key))
+            listbox.bind("<Return>", lambda event, key=tab_key: self.load_selected_animation(event, key))
+            self.animation_listboxes[tab_key] = listbox
+            animation_tools = ttk.Frame(tab)
+            animation_tools.pack(fill=tk.X)
+            ttk.Button(animation_tools, text="Load", command=lambda key=tab_key: self.load_selected_animation(tab_key=key)).pack(
+                side=tk.LEFT, fill=tk.X, expand=True
+            )
+            ttk.Button(animation_tools, text="Folder...", command=lambda key=tab_key: self.browse_animation_folder(key)).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+            )
+            ttk.Button(animation_tools, text="Refresh", command=self.refresh_animation_browser).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+            )
+            ttk.Label(tab, textvariable=folder_var, style="Muted.TLabel", wraplength=316).pack(
+                anchor=tk.W, pady=(3, 0)
+            )
+        self.animation_listbox = self.animation_listboxes["anim1"]
+
+        random_row = ttk.Frame(actors_content)
+        random_row.pack(fill=tk.X, pady=(6, 2))
+        ttk.Checkbutton(
+            random_row,
+            text="Random initialisation",
+            variable=self.random_initialization_var,
+            command=self.on_random_initialization_toggle,
+        ).pack(side=tk.LEFT)
+        ttk.Button(random_row, text="Shuffle", command=self.shuffle_random_initialization).pack(
+            side=tk.RIGHT, padx=(6, 0)
         )
-        animation_scroll = ttk.Scrollbar(animation_list_frame, orient=tk.VERTICAL, command=self.animation_listbox.yview)
-        self.animation_listbox.configure(yscrollcommand=animation_scroll.set)
-        self.animation_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        animation_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.animation_listbox.bind("<Double-1>", self.load_selected_animation)
-        self.animation_listbox.bind("<Return>", self.load_selected_animation)
-        animation_tools = ttk.Frame(animation_browser)
-        animation_tools.pack(fill=tk.X)
-        ttk.Button(animation_tools, text="Load", command=self.load_selected_animation).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(animation_tools, text="Folder...", command=self.browse_animation_folder).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
-        )
-        ttk.Button(animation_tools, text="Refresh", command=self.refresh_animation_browser).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
-        )
-        ttk.Label(animation_browser, textvariable=self.animation_folder_var, style="Muted.TLabel", wraplength=316).pack(
-            anchor=tk.W, pady=(3, 0)
+        ttk.Button(random_row, text="Reset", command=self.reset_model_to_ground_truth_initialization).pack(
+            side=tk.RIGHT, padx=(6, 0)
         )
 
-        ttk.Separator(actors_tab).pack(fill=tk.X, pady=5)
-        ttk.Label(actors_tab, text="Selected Actor").pack(anchor=tk.W)
-        inspector = ttk.Frame(actors_tab)
+        ttk.Separator(actors_content).pack(fill=tk.X, pady=5)
+        ttk.Label(actors_content, text="Selected Actor").pack(anchor=tk.W)
+        inspector = ttk.Frame(actors_content)
         inspector.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(inspector, text="Name", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Entry(inspector, textvariable=self.name_var).grid(row=0, column=1, sticky=tk.EW, pady=2)
@@ -1160,10 +1478,29 @@ class ModelViewerApp(tk.Tk):
                 width=6,
                 command=self.apply_inspector,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(inspector, text="Root Yaw F0", style="Muted.TLabel").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Spinbox(
+            inspector,
+            from_=-1000.0,
+            to=1000.0,
+            increment=0.05,
+            textvariable=self.root_yaw_var,
+            width=10,
+            command=self.apply_inspector,
+        ).grid(row=4, column=1, sticky=tk.EW, pady=2)
         inspector.columnconfigure(1, weight=1)
-        self.source_button = ttk.Button(actors_tab, text="Set Model Source NPZ...", command=self.set_selected_source_npz)
+        self.source_button = ttk.Button(actors_content, text="Set Model Source NPZ...", command=self.set_selected_source_npz)
         self.source_button.pack(fill=tk.X, pady=(4, 3))
-        ttk.Label(actors_tab, textvariable=self.status_var, style="Muted.TLabel", wraplength=316).pack(anchor=tk.W, pady=(6, 0))
+        ttk.Label(actors_content, textvariable=self.status_var, style="Muted.TLabel", wraplength=316).pack(anchor=tk.W, pady=(6, 0))
+
+        def bind_actors_wheel_recursive(widget: tk.Widget) -> None:
+            if widget is getattr(self, "animation_listbox", None):
+                return
+            widget.bind("<MouseWheel>", on_actors_wheel, add="+")
+            for child in widget.winfo_children():
+                bind_actors_wheel_recursive(child)
+
+        bind_actors_wheel_recursive(actors_content)
 
         self.build_settings_tab(settings_tab)
 
@@ -1172,7 +1509,7 @@ class ModelViewerApp(tk.Tk):
         self.bind("<Left>", lambda _event: self.step_frame(-1))
         self.bind("<Right>", lambda _event: self.step_frame(1))
         self.bind("<Delete>", self.on_delete_selected)
-        for var in (self.name_var, self.visible_var, *self.offset_vars, *self.pelvis_offset_vars):
+        for var in (self.name_var, self.visible_var, *self.offset_vars, *self.pelvis_offset_vars, self.root_yaw_var):
             var.trace_add("write", lambda *_args: self.apply_inspector())
         self.scale_var.trace_add("write", lambda *_args: self.draw())
         for var in (
@@ -1373,7 +1710,11 @@ class ModelViewerApp(tk.Tk):
             animation_folder = self.animation_folder_var.get().strip()
             if animation_folder:
                 animation_folder = str(resolve_path(animation_folder))
-            animation_browser = {"folder_path": animation_folder}
+            animation_folder_2 = self.animation_folder_var_2.get().strip()
+            if animation_folder_2:
+                animation_folder_2 = str(resolve_path(animation_folder_2))
+            animation_browser = {"folder_path": animation_folder, "folder_path_2": animation_folder_2}
+            random_initialization = {"enabled": bool(self.random_initialization_var.get())}
             controller = {
                 "max_speed_mps": max(0.05, float(self.controller_max_speed_var.get())),
                 "acceleration_response": max(0.1, float(self.controller_accel_response_var.get())),
@@ -1383,6 +1724,7 @@ class ModelViewerApp(tk.Tk):
                 "right_deadzone": max(0.0, min(0.8, float(self.controller_right_deadzone_var.get()))),
                 "trajectory_seconds": max(0.1, float(self.trajectory_seconds_var.get())),
                 "trajectory_step_seconds": max(0.04, float(self.trajectory_step_var.get())),
+                "extend_trajectory": bool(self.extend_trajectory_var.get()),
             }
         except tk.TclError:
             self.settings_status_var.set("Invalid setting.")
@@ -1391,6 +1733,7 @@ class ModelViewerApp(tk.Tk):
         self.app_settings["colliders"] = colliders
         self.app_settings["startup"] = startup
         self.app_settings["animation_browser"] = animation_browser
+        self.app_settings["random_initialization"] = random_initialization
         self.app_settings["controller"] = controller
         try:
             write_app_settings(self.app_settings)
@@ -1430,68 +1773,103 @@ class ModelViewerApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Open failed", str(exc))
 
-    def animation_folder(self) -> Path:
-        path_text = self.animation_folder_var.get().strip()
+    def animation_folder(self, tab_key: str = "anim1") -> Path:
+        folder_var = self.animation_folder_vars.get(tab_key, self.animation_folder_var)
+        path_text = folder_var.get().strip()
         if not path_text:
-            return DEFAULT_ANIMATION_LIBRARY_DIR
+            return DEFAULT_ANIMATION_LIBRARY_DIR_2 if tab_key == "anim2" else DEFAULT_ANIMATION_LIBRARY_DIR
         return resolve_path(path_text)
 
-    def refresh_animation_browser(self) -> None:
-        if not hasattr(self, "animation_listbox"):
-            return
-        folder = self.animation_folder()
-        self.animation_browser_paths = []
-        self.animation_listbox.delete(0, tk.END)
-        if not folder.exists():
-            self.animation_listbox.insert(tk.END, "(folder not found)")
-            return
+    def active_animation_tab_key(self) -> str:
+        if not hasattr(self, "animation_tabs"):
+            return "anim1"
         try:
-            paths = sorted(folder.glob("*.npz"), key=lambda item: item.name.lower())
-        except OSError as exc:
-            self.animation_listbox.insert(tk.END, f"(cannot read folder: {exc})")
-            return
-        self.animation_browser_paths = paths
-        if not paths:
-            self.animation_listbox.insert(tk.END, "(no npz files)")
-            return
-        for path in paths:
-            self.animation_listbox.insert(tk.END, path.stem)
+            selected = self.animation_tabs.index(self.animation_tabs.select())
+        except tk.TclError:
+            return "anim1"
+        return "anim2" if selected == 1 else "anim1"
 
-    def browse_animation_folder(self) -> None:
-        initial = self.animation_folder()
+    def refresh_animation_browser(self) -> None:
+        if not hasattr(self, "animation_listboxes"):
+            return
+        for tab_key, listbox in self.animation_listboxes.items():
+            folder = self.animation_folder(tab_key)
+            paths: list[Path] = []
+            listbox.delete(0, tk.END)
+            if not folder.exists():
+                listbox.insert(tk.END, "(folder not found)")
+                self.animation_browser_paths_by_tab[tab_key] = []
+                continue
+            try:
+                paths = sorted(folder.glob("*.npz"), key=lambda item: item.name.lower())
+            except OSError as exc:
+                listbox.insert(tk.END, f"(cannot read folder: {exc})")
+                self.animation_browser_paths_by_tab[tab_key] = []
+                continue
+            self.animation_browser_paths_by_tab[tab_key] = paths
+            if not paths:
+                listbox.insert(tk.END, "(no npz files)")
+                continue
+            for path in paths:
+                listbox.insert(tk.END, path.stem)
+        self.animation_browser_paths = self.animation_browser_paths_by_tab.get(self.active_animation_tab_key(), [])
+
+    def browse_animation_folder(self, tab_key: str | None = None) -> None:
+        tab_key = tab_key or self.active_animation_tab_key()
+        initial = self.animation_folder(tab_key)
         path_text = filedialog.askdirectory(
             title="Animation folder",
             initialdir=str(initial if initial.exists() else PROJECT_ROOT),
         )
         if not path_text:
             return
-        self.animation_folder_var.set(str(Path(path_text).resolve()))
+        folder_var = self.animation_folder_vars.get(tab_key, self.animation_folder_var)
+        folder_var.set(str(Path(path_text).resolve()))
         self.refresh_animation_browser()
 
-    def selected_animation_path(self) -> Path | None:
-        if not hasattr(self, "animation_listbox"):
+    def selected_animation_path(self, tab_key: str | None = None) -> Path | None:
+        if not hasattr(self, "animation_listboxes"):
             return None
-        selection = self.animation_listbox.curselection()
+        tab_key = tab_key or self.active_animation_tab_key()
+        listbox = self.animation_listboxes.get(tab_key)
+        if listbox is None:
+            return None
+        selection = listbox.curselection()
         if not selection:
             return None
         index = int(selection[0])
-        if index < 0 or index >= len(self.animation_browser_paths):
+        paths = self.animation_browser_paths_by_tab.get(tab_key, [])
+        if index < 0 or index >= len(paths):
             return None
-        return self.animation_browser_paths[index]
+        return paths[index]
 
-    def load_selected_animation(self, _event: tk.Event | None = None) -> str | None:
-        path = self.selected_animation_path()
+    def load_selected_animation(self, _event: tk.Event | None = None, tab_key: str | None = None) -> str | None:
+        path = self.selected_animation_path(tab_key)
         if path is None:
             return "break" if _event is not None else None
         try:
             actor = self.selected_actor()
             if actor is not None and actor.kind == "model":
-                self.load_model_source(actor, path)
+                keep_random_seed = bool(self.random_initialization_var.get())
+                self.load_model_source(actor, path, clear_random=not keep_random_seed)
+                if keep_random_seed and actor.random_init_frame is None:
+                    self.sample_random_initialization(actor, redraw=False)
                 self.refresh_tree(select_id=actor.actor_id)
                 self.update_timeline()
                 self.update_bounds()
                 self.invalidate_shadow_cache()
-                self.status_var.set(f"{actor.checkpoint_path.name if actor.checkpoint_path else 'checkpoint'}\n{path.name}\n{actor.status}")
+                random_line = ""
+                if actor.random_init_frame is not None:
+                    init_name = (
+                        actor.random_init_source_npz_path.name
+                        if actor.random_init_source_npz_path is not None
+                        else "random init"
+                    )
+                    random_line = f"\ninit {init_name} frame {actor.random_init_frame}"
+                self.status_var.set(
+                    f"{actor.checkpoint_path.name if actor.checkpoint_path else 'checkpoint'}\n"
+                    f"root {path.name}\n{actor.status}{random_line}"
+                )
                 self.draw()
             else:
                 self.add_npz_actor(path)
@@ -1499,10 +1877,162 @@ class ModelViewerApp(tk.Tk):
             messagebox.showerror("Animation load failed", str(exc))
         return "break" if _event is not None else None
 
+    def random_initialization_candidates(self) -> list[Path]:
+        folder = self.animation_folder("anim1")
+        if not folder.exists():
+            folder = DEFAULT_ANIMATION_LIBRARY_DIR
+        if not folder.exists():
+            return []
+        return sorted(folder.glob("*.npz"), key=lambda item: item.name.lower())
+
+    def on_random_initialization_toggle(self) -> None:
+        actor = self.selected_actor()
+        if actor is None or actor.kind != "model":
+            self.status_var.set("Select a model actor to randomise its start state.")
+            return
+        if self.random_initialization_var.get():
+            self.sample_random_initialization(actor)
+        else:
+            actor.random_init_source_npz_path = None
+            actor.random_init_frame = None
+            actor.reset_generation()
+            self.frame = 0.0
+            self.update_timeline()
+            self.invalidate_shadow_cache()
+            self.load_inspector()
+            self.draw()
+
+    def shuffle_random_initialization(self) -> None:
+        actor = self.selected_actor()
+        if actor is None or actor.kind != "model":
+            self.status_var.set("Select a model actor before shuffling.")
+            return
+        if self.playing:
+            self.sample_random_pose_at_current_root(actor)
+            return
+        if not self.random_initialization_var.get():
+            self.random_initialization_var.set(True)
+        self.sample_random_initialization(actor)
+
+    def reset_model_to_ground_truth_initialization(self) -> None:
+        actor = self.selected_actor()
+        if actor is None or actor.kind != "model":
+            self.status_var.set("Select a model actor before resetting its start state.")
+            return
+        if actor.clip is None:
+            self.status_var.set("Selected model has no source NPZ.")
+            return
+        current_frame = max(0, int(round(float(self.frame))))
+        actor.random_init_source_npz_path = None
+        actor.random_init_frame = None
+        self.random_initialization_var.set(False)
+        extend_live = self.extend_playback_active(actor)
+        actor.generate_to(current_frame, extend_authored=extend_live)
+        source_frame = min(current_frame, actor.clip.T - 1) if actor.clip is not None else 0
+        seed_frame = actor.seed_local_pose_at_current_root(current_frame, actor.clip, source_frame, extend_live)
+        source_name = actor.source_npz_path.name if actor.source_npz_path is not None else "source NPZ"
+        checkpoint_name = actor.checkpoint_path.name if actor.checkpoint_path is not None else "checkpoint"
+        self.status_var.set(f"{checkpoint_name}\n{source_name}\nreset local pose from source frame {seed_frame}")
+        self.refresh_tree(select_id=actor.actor_id)
+        self.update_timeline()
+        self.update_bounds()
+        self.invalidate_shadow_cache()
+        self.load_inspector()
+        self.draw()
+
+    def sample_random_pose_at_current_root(self, actor: Actor) -> bool:
+        if actor.kind != "model" or actor.checkpoint_path is None or actor.cfg is None:
+            return False
+        candidates = self.random_initialization_candidates()
+        if not candidates:
+            self.status_var.set("No NPZ animations found for random pose shuffle.")
+            return False
+        current_frame = max(0, int(round(float(self.frame))))
+        extend_live = self.extend_playback_active(actor)
+        actor.generate_to(current_frame, extend_authored=extend_live)
+        rng = np.random.default_rng()
+        last_error = ""
+        for _attempt in range(min(12, len(candidates) * 2)):
+            path = candidates[int(rng.integers(0, len(candidates)))]
+            try:
+                candidate_clip = tl.MotionClip(path, actor.cfg)
+                if actor.clip is not None and candidate_clip.body_names != actor.clip.body_names:
+                    last_error = f"{path.name} skeleton does not match the selected model source."
+                    continue
+                if candidate_clip.T < 2:
+                    last_error = f"{path.name} has too few frames."
+                    continue
+                seed_cur = int(rng.integers(1, candidate_clip.T))
+                actor.random_init_source_npz_path = None
+                actor.random_init_frame = None
+                actor.seed_local_pose_at_current_root(current_frame, candidate_clip, seed_cur, extend_live)
+                root_source_name = actor.source_npz_path.name if actor.source_npz_path is not None else "selected source"
+                self.status_var.set(
+                    f"{actor.checkpoint_path.name if actor.checkpoint_path else 'checkpoint'}\n"
+                    f"root {root_source_name}\n"
+                    f"shuffled local pose from {path.name} frame {seed_cur}"
+                )
+                self.refresh_tree(select_id=actor.actor_id)
+                self.update_timeline()
+                self.update_bounds()
+                self.invalidate_shadow_cache()
+                self.load_inspector()
+                self.draw()
+                return True
+            except Exception as exc:
+                last_error = f"{path.name}: {exc}"
+        self.status_var.set(f"Random pose shuffle failed: {last_error}")
+        return False
+
+    def sample_random_initialization(self, actor: Actor, redraw: bool = True) -> bool:
+        if actor.kind != "model" or actor.checkpoint_path is None:
+            return False
+        candidates = self.random_initialization_candidates()
+        if not candidates:
+            self.status_var.set("No NPZ animations found for random initialisation.")
+            return False
+        rng = np.random.default_rng()
+        last_error = ""
+        for _attempt in range(min(12, len(candidates) * 2)):
+            path = candidates[int(rng.integers(0, len(candidates)))]
+            try:
+                if actor.cfg is None:
+                    last_error = f"{actor.name} has no model config."
+                    continue
+                candidate_clip = tl.MotionClip(path, actor.cfg)
+                if actor.clip is not None and candidate_clip.body_names != actor.clip.body_names:
+                    last_error = f"{path.name} skeleton does not match the selected model source."
+                    continue
+                if candidate_clip.T < 2:
+                    last_error = f"{path.name} has too few frames."
+                    continue
+                seed_cur = int(rng.integers(1, candidate_clip.T))
+                actor.random_init_source_npz_path = path
+                actor.random_init_frame = seed_cur
+                actor.reset_generation()
+                self.frame = 0.0
+                root_source_name = actor.source_npz_path.name if actor.source_npz_path is not None else "selected source"
+                self.status_var.set(
+                    f"{actor.checkpoint_path.name if actor.checkpoint_path else 'checkpoint'}\n"
+                    f"root {root_source_name}\n"
+                    f"init {path.name} frame {seed_cur} (prev {seed_cur - 1})"
+                )
+                if redraw:
+                    self.refresh_tree(select_id=actor.actor_id)
+                    self.update_timeline()
+                    self.update_bounds()
+                    self.invalidate_shadow_cache()
+                    self.draw()
+                return True
+            except Exception as exc:
+                last_error = f"{path.name}: {exc}"
+        self.status_var.set(f"Random initialisation failed: {last_error}")
+        return False
+
     def auto_load_latest(self) -> None:
         if self.actors:
             return
-        checkpoint = newest_best_checkpoint()
+        checkpoint = newest_checkpoint()
         source = self.startup_source_npz()
         if checkpoint is None or source is None:
             return
@@ -1547,6 +2077,8 @@ class ModelViewerApp(tk.Tk):
                 source_path = source.npz_path
         if source_path is not None:
             self.load_model_source(actor, source_path)
+        if self.random_initialization_var.get() and actor.clip is not None:
+            self.sample_random_initialization(actor, redraw=False)
         self.refresh_tree(select_id=actor.actor_id)
         self.update_timeline()
         self.update_bounds()
@@ -1566,6 +2098,9 @@ class ModelViewerApp(tk.Tk):
             visible=actor.visible,
             offset=actor.offset + np.asarray([0.75, 0.0, 0.0], dtype=np.float32),
             initial_pelvis_offset=actor.initial_pelvis_offset.copy(),
+            initial_root_yaw=float(actor.initial_root_yaw),
+            random_init_source_npz_path=actor.random_init_source_npz_path,
+            random_init_frame=actor.random_init_frame,
             npz_path=actor.npz_path,
             checkpoint_path=actor.checkpoint_path,
             status=actor.status,
@@ -1575,7 +2110,9 @@ class ModelViewerApp(tk.Tk):
             if clone.kind == "npz" and clone.npz_path is not None:
                 clone.load_npz(clone.npz_path)
             elif clone.kind == "model" and clone.checkpoint_path is not None and actor.source_npz_path is not None:
-                self.load_model_source(clone, actor.source_npz_path)
+                self.load_model_source(clone, actor.source_npz_path, clear_random=False)
+                if clone.random_init_frame is not None:
+                    clone.reset_generation()
         except Exception as exc:
             messagebox.showerror("Duplicate failed", str(exc))
             return
@@ -1639,7 +2176,10 @@ class ModelViewerApp(tk.Tk):
         if not path_text:
             return
         try:
-            self.load_model_source(actor, Path(path_text))
+            keep_random_seed = bool(self.random_initialization_var.get())
+            self.load_model_source(actor, Path(path_text), clear_random=not keep_random_seed)
+            if keep_random_seed and actor.random_init_frame is None:
+                self.sample_random_initialization(actor, redraw=False)
         except Exception as exc:
             messagebox.showerror("Source failed", str(exc))
             return
@@ -1649,14 +2189,18 @@ class ModelViewerApp(tk.Tk):
         self.invalidate_shadow_cache()
         self.draw()
 
-    def load_model_source(self, actor: Actor, source_npz_path: Path) -> None:
+    def load_model_source(self, actor: Actor, source_npz_path: Path, clear_random: bool = True) -> None:
         if actor.checkpoint_path is None:
             raise ValueError("Model actor has no checkpoint path.")
+        if clear_random:
+            actor.random_init_source_npz_path = None
+            actor.random_init_frame = None
         device_name = self.device_var.get()
         if device_name == "cuda" and not torch.cuda.is_available():
             device_name = "cpu"
             self.device_var.set("cpu")
         actor.load_checkpoint(actor.checkpoint_path, source_npz_path, torch.device(device_name))
+        self.frame = 0.0
 
     def selected_actor(self) -> Actor | None:
         if self.selected_actor_id is None:
@@ -1757,6 +2301,7 @@ class ModelViewerApp(tk.Tk):
                 var.set(0.0)
             for var in self.pelvis_offset_vars:
                 var.set(0.0)
+            self.root_yaw_var.set(0.0)
             self.source_button.state(["disabled"])
             self.status_var.set("No actor selected.")
             self.loading_inspector = False
@@ -1767,11 +2312,20 @@ class ModelViewerApp(tk.Tk):
             var.set(float(actor.offset[i]))
         for i, var in enumerate(self.pelvis_offset_vars):
             var.set(float(actor.initial_pelvis_offset[i] if actor.kind == "model" else 0.0))
+        self.root_yaw_var.set(float(actor.initial_root_yaw))
         if actor.kind == "model":
             self.source_button.state(["!disabled"])
             checkpoint = actor.checkpoint_path.name if actor.checkpoint_path else "checkpoint"
             source = actor.source_npz_path.name if actor.source_npz_path else "no source NPZ"
-            self.status_var.set(f"{checkpoint}\n{source}\n{actor.status}")
+            random_line = ""
+            if actor.random_init_frame is not None:
+                init_name = (
+                    actor.random_init_source_npz_path.name
+                    if actor.random_init_source_npz_path is not None
+                    else "random init"
+                )
+                random_line = f"\ninit {init_name} frame {actor.random_init_frame}"
+            self.status_var.set(f"{checkpoint}\n{source}\n{actor.status}{random_line}")
         else:
             self.source_button.state(["disabled"])
             self.status_var.set(f"{actor.npz_path}\n{actor.status}")
@@ -1788,6 +2342,7 @@ class ModelViewerApp(tk.Tk):
         try:
             actor.offset = np.asarray([var.get() for var in self.offset_vars], dtype=np.float32)
             pelvis_offset = np.asarray([var.get() for var in self.pelvis_offset_vars], dtype=np.float32)
+            root_yaw = float(self.root_yaw_var.get())
         except tk.TclError:
             return
         if actor.kind == "model" and np.linalg.norm(actor.initial_pelvis_offset - pelvis_offset) > 1e-7:
@@ -1795,6 +2350,8 @@ class ModelViewerApp(tk.Tk):
             actor.reset_generation()
             self.frame = 0.0
             self.update_timeline()
+        if abs(float(actor.initial_root_yaw) - root_yaw) > 1e-7:
+            actor.initial_root_yaw = root_yaw
         if self.tree.exists(str(actor.actor_id)):
             icon = "[x]" if actor.visible else "[ ]"
             self.tree.item(str(actor.actor_id), text=f"{icon} {actor.name}", values=(actor.kind, actor.status))
@@ -1808,7 +2365,7 @@ class ModelViewerApp(tk.Tk):
 
     def update_timeline(self) -> None:
         max_frame = max(0, self.max_frames() - 1)
-        if not self.playing:
+        if not self.playing and not self.extend_playback_active():
             self.frame = min(self.frame, float(max_frame))
         frame_i = min(max_frame, int(self.frame))
         if self.timeline_last_frame == frame_i and self.timeline_last_max_frame == max_frame:
@@ -1828,7 +2385,10 @@ class ModelViewerApp(tk.Tk):
             if not actor.visible or actor.clip is None:
                 continue
             clip_pos = actor.clip.global_pos.detach().cpu().numpy().reshape(-1, 3)
-            points.append(clip_pos)
+            if abs(float(actor.initial_root_yaw)) > 1e-8:
+                pivot = self.actor_root_yaw_pivot(actor)
+                clip_pos = (clip_pos - pivot[None, :]) @ self.actor_root_yaw_matrix(actor) + pivot[None, :]
+            points.append((clip_pos + actor.offset[None, :]).astype(np.float32))
         if not points:
             self.center = np.zeros(3, dtype=np.float32)
             self.extent = 1.0
@@ -1864,7 +2424,10 @@ class ModelViewerApp(tk.Tk):
             else:
                 for actor in self.actors:
                     if actor.kind == "model":
-                        actor.start_async_generation(int(self.frame) + 8)
+                        actor.start_async_generation(
+                            int(self.frame) + 8,
+                            extend_authored=self.extend_playback_active(actor),
+                        )
         self.last_tick = time.perf_counter()
 
     def advance_playback(self, step_seconds: float) -> None:
@@ -1872,7 +2435,7 @@ class ModelViewerApp(tk.Tk):
         speed = max(0.01, float(self.speed_var.get()))
         self.frame += step_seconds * fps * speed
         frame_count = max(1, self.max_frames())
-        if self.controller_enabled_var.get():
+        if self.controller_enabled_var.get() or self.extend_playback_active():
             return
         elif self.frame >= frame_count:
             self.frame = self.frame % float(frame_count)
@@ -2198,7 +2761,39 @@ class ModelViewerApp(tk.Tk):
         forward = forward / norm
         return math.atan2(float(forward[0]), float(forward[2]))
 
-    def actor_anchor_root_world(self, actor: Actor) -> np.ndarray | None:
+    def actor_root_yaw_pivot(self, actor: Actor) -> np.ndarray:
+        if actor.clip is None:
+            return np.zeros(3, dtype=np.float32)
+        return actor.clip.root_pos[0].detach().cpu().numpy().astype(np.float32)
+
+    def actor_root_yaw_matrix(self, actor: Actor) -> np.ndarray:
+        return yaw_rotation_matrix_np(float(actor.initial_root_yaw))
+
+    def apply_actor_root_yaw_local_point(self, actor: Actor, point: np.ndarray) -> np.ndarray:
+        point = np.asarray(point, dtype=np.float32)
+        if abs(float(actor.initial_root_yaw)) <= 1e-8:
+            return point.astype(np.float32, copy=True)
+        pivot = self.actor_root_yaw_pivot(actor)
+        return ((point - pivot) @ self.actor_root_yaw_matrix(actor) + pivot).astype(np.float32)
+
+    def apply_actor_root_yaw_world_point(self, actor: Actor, point: np.ndarray) -> np.ndarray:
+        return (self.apply_actor_root_yaw_local_point(actor, point) + actor.offset).astype(np.float32)
+
+    def apply_actor_root_yaw_local_pose(
+        self, actor: Actor, positions: np.ndarray, rotations: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        transformed_pos = np.asarray(positions, dtype=np.float32).copy()
+        transformed_rot = np.asarray(rotations, dtype=np.float32).copy()
+        if abs(float(actor.initial_root_yaw)) <= 1e-8:
+            return transformed_pos, transformed_rot
+        pivot = self.actor_root_yaw_pivot(actor)
+        yaw_matrix = self.actor_root_yaw_matrix(actor)
+        flat = transformed_pos.reshape(-1, 3)
+        transformed_pos = ((flat - pivot[None, :]) @ yaw_matrix + pivot[None, :]).reshape(transformed_pos.shape)
+        transformed_rot = np.matmul(transformed_rot, yaw_matrix).astype(np.float32)
+        return transformed_pos.astype(np.float32), transformed_rot
+
+    def actor_anchor_root_local(self, actor: Actor) -> np.ndarray | None:
         if actor.clip is None:
             return None
         generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
@@ -2209,15 +2804,25 @@ class ModelViewerApp(tk.Tk):
             frame = max(0, min(actor.clip.T - 1, int(self.frame)))
             positions = actor.clip.global_pos[frame].detach().cpu().numpy().astype(np.float32)
         root = max(0, min(actor.root_index, len(positions) - 1))
-        return (positions[root] + actor.offset).astype(np.float32)
+        return self.apply_actor_root_yaw_local_point(actor, positions[root])
+
+    def actor_anchor_root_world(self, actor: Actor) -> np.ndarray | None:
+        root = self.actor_anchor_root_local(actor)
+        if root is None:
+            return None
+        return (root + actor.offset).astype(np.float32)
 
     def actor_authored_root_world(self, actor: Actor, frame: int | None = None) -> np.ndarray | None:
         if actor.clip is None:
             return None
-        frame_i = int(self.frame) if frame is None else int(frame)
+        frame_value = float(self.frame) if frame is None else float(frame)
+        if self.extend_playback_active(actor) and frame_value > float(actor.clip.T - 1):
+            sample = self.authored_root_sample(actor, frame_value)
+            return sample[0] if sample is not None else None
+        frame_i = int(frame_value)
         frame_i = max(0, min(actor.clip.T - 1, frame_i))
         root = actor.clip.root_pos[frame_i].detach().cpu().numpy().astype(np.float32)
-        return (root + actor.offset).astype(np.float32)
+        return self.apply_actor_root_yaw_world_point(actor, root)
 
     def actor_follow_root_world(self, actor: Actor) -> np.ndarray | None:
         if actor.kind == "model" and actor.controller_active and actor.controller_root_anchor is not None:
@@ -2225,6 +2830,9 @@ class ModelViewerApp(tk.Tk):
         if actor.clip is None:
             return self.actor_root_world(actor)
         max_frame = max(0, actor.clip.T - 1)
+        if self.extend_playback_active(actor) and float(self.frame) > float(max_frame):
+            sample = self.authored_root_sample(actor, float(self.frame))
+            return sample[0] if sample is not None else None
         frame = max(0.0, min(float(self.frame), float(max_frame)))
         base = int(math.floor(frame))
         nxt = min(max_frame, base + 1)
@@ -2235,7 +2843,7 @@ class ModelViewerApp(tk.Tk):
         else:
             root_b = actor.clip.root_pos[nxt].detach().cpu().numpy().astype(np.float32)
             root = (root_a * (1.0 - t) + root_b * t).astype(np.float32)
-        return (root + actor.offset).astype(np.float32)
+        return self.apply_actor_root_yaw_world_point(actor, root)
 
     def camera_pan_scale(self) -> float:
         distance = self.camera_distance()
@@ -2243,7 +2851,7 @@ class ModelViewerApp(tk.Tk):
         return distance / viewport * 1.65
 
     def actor_pose_world(self, actor: Actor) -> tuple[np.ndarray, np.ndarray] | None:
-        pose = actor.pose_for_frame(int(self.frame))
+        pose = actor.pose_for_frame(int(self.frame), extend_authored=self.extend_playback_active(actor))
         if pose is None:
             return None
         positions, rotations = pose
@@ -2252,8 +2860,7 @@ class ModelViewerApp(tk.Tk):
     def apply_actor_world_transform(
         self, actor: Actor, positions: np.ndarray, rotations: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        transformed_pos = positions.astype(np.float32, copy=True)
-        transformed_rot = rotations.astype(np.float32, copy=True)
+        transformed_pos, transformed_rot = self.apply_actor_root_yaw_local_pose(actor, positions, rotations)
         if actor.kind == "model" and (actor.controller_active or np.linalg.norm(actor.controller_root_offset) > 1e-6):
             pivot_index = max(0, min(actor.root_index, len(transformed_pos) - 1))
             authored_root = transformed_pos[pivot_index].copy()
@@ -2288,36 +2895,33 @@ class ModelViewerApp(tk.Tk):
         if actor.clip is None:
             return None
         controller_live = bool(actor.kind == "model" and actor.controller_active)
+        extend_live = self.extend_playback_active(actor)
         max_frame = max(0, actor.frame_count - 1)
-        if controller_live:
+        if controller_live or extend_live:
             generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
             if generated_count <= 0:
                 return None
-            if self.playing:
-                frame = float(generated_count - 1)
-            else:
-                frame = max(0.0, min(float(self.frame), float(generated_count - 1)))
+            frame = max(0.0, float(self.frame))
         else:
             frame = max(0.0, min(float(self.frame), float(max_frame)))
         base = int(math.floor(frame))
-        nxt = base + 1 if controller_live else min(max_frame, base + 1)
+        nxt = base + 1 if (controller_live or extend_live) else min(max_frame, base + 1)
         t = frame - base
         generate_sync = not (self.playing and actor.kind == "model")
         if not generate_sync:
-            if controller_live:
-                generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
-                actor.start_async_generation(max(nxt + 1, generated_count + 2))
+            if controller_live or extend_live:
+                actor.start_async_generation(nxt + 2, extend_authored=extend_live)
             else:
                 actor.start_async_generation(min(max_frame, nxt + 8))
                 if nxt >= min(len(actor.generated_pos), len(actor.generated_rot)):
                     actor.generate_to(nxt)
-        pose_a = actor.pose_for_frame(base, generate=generate_sync)
+        pose_a = actor.pose_for_frame(base, generate=generate_sync, extend_authored=extend_live)
         if pose_a is None:
             return None
         if nxt == base or t <= 1e-4:
             positions, rotations = pose_a
             return self.apply_actor_world_transform(actor, positions, rotations)
-        pose_b = actor.pose_for_frame(nxt, generate=generate_sync)
+        pose_b = actor.pose_for_frame(nxt, generate=generate_sync, extend_authored=extend_live)
         if pose_b is None:
             positions, rotations = pose_a
             return self.apply_actor_world_transform(actor, positions, rotations)
@@ -2385,7 +2989,7 @@ class ModelViewerApp(tk.Tk):
             self.playback_accumulator = min(0.08, self.playback_accumulator + dt)
             target_step = 1.0 / TARGET_PLAYBACK_FPS
             steps = 0
-            max_substeps = 1 if self.controller_enabled_var.get() else MAX_PLAYBACK_SUBSTEPS
+            max_substeps = MAX_PLAYBACK_SUBSTEPS
             while self.playback_accumulator >= target_step and steps < max_substeps:
                 self.advance_playback(target_step)
                 self.playback_accumulator -= target_step
@@ -2465,7 +3069,7 @@ class ModelViewerApp(tk.Tk):
         sample = self.poll_controller()
         self.controller_sample = sample
         if actor.controller_root_anchor is None:
-            root = self.actor_anchor_root_world(actor)
+            root = self.actor_anchor_root_local(actor)
             if root is not None:
                 actor.controller_root_anchor = (root - actor.controller_root_offset).astype(np.float32)
         actor.controller_active = True
@@ -2476,8 +3080,6 @@ class ModelViewerApp(tk.Tk):
         state = RootMotionState(actor.controller_root_offset.copy(), actor.controller_velocity.copy(), float(actor.controller_yaw))
         root_turn = np.asarray([sample.triggers, 0.0], dtype=np.float32)
         anchor = actor.controller_root_anchor if actor.controller_root_anchor is not None else np.zeros(3, dtype=np.float32)
-        prev_root_pos = (anchor + state.offset).astype(np.float32)
-        prev_root_yaw = float(state.yaw)
         updated = integrate_controller_root_motion(
             state,
             sample.move,
@@ -2489,35 +3091,9 @@ class ModelViewerApp(tk.Tk):
         actor.controller_root_offset = updated.offset
         actor.controller_velocity = updated.velocity
         actor.controller_yaw = updated.yaw
-        cur_root_pos = (anchor + updated.offset).astype(np.float32)
-        cur_root_yaw = float(updated.yaw)
-        future_positions: list[np.ndarray] = []
-        future_yaws: list[float] = []
-        if actor.clip is not None and actor.cfg is not None:
-            future_state = RootMotionState(updated.offset.copy(), updated.velocity.copy(), float(updated.yaw))
-            sim_dt = 1.0 / max(1.0, float(actor.clip.fps))
-            for _ in range(int(actor.cfg.future_window)):
-                future_state = integrate_controller_root_motion(
-                    future_state,
-                    sample.move,
-                    root_turn,
-                    sim_dt,
-                    actor.controller_settings_snapshot,
-                    movement_yaw=actor.controller_move_yaw,
-                )
-                future_positions.append((anchor + future_state.offset).astype(np.float32))
-                future_yaws.append(float(future_state.yaw))
-            actor.set_controller_root_plan(
-                prev_root_pos,
-                cur_root_pos,
-                prev_root_yaw,
-                cur_root_yaw,
-                np.asarray(future_positions, dtype=np.float32),
-                np.asarray(future_yaws, dtype=np.float32),
-            )
+        self.update_controller_model_root_plan(actor, updated, sample.move, root_turn, anchor)
         if self.playing:
-            generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
-            actor.start_async_generation(generated_count + 2)
+            actor.start_async_generation(int(math.floor(max(0.0, self.frame))) + 3)
         if np.linalg.norm(sample.look) > 1e-5:
             self.view_axis = None
             self.yaw -= float(sample.look[0]) * 0.045
@@ -2528,6 +3104,51 @@ class ModelViewerApp(tk.Tk):
             or abs(sample.triggers) > 1e-5
             or np.linalg.norm(sample.look) > 1e-5
             or np.linalg.norm(actor.controller_velocity) > 1e-5
+        )
+
+    def update_controller_model_root_plan(
+        self,
+        actor: Actor,
+        state: RootMotionState,
+        move_input: np.ndarray,
+        root_turn: np.ndarray,
+        anchor: np.ndarray,
+    ) -> None:
+        if actor.clip is None or actor.cfg is None or actor.controller_settings_snapshot is None:
+            return
+        model_dt = 1.0 / max(1.0, float(actor.clip.fps))
+        settings = actor.controller_settings_snapshot
+        velocity_delta = (
+            np.asarray([state.velocity[0], 0.0, state.velocity[1]], dtype=np.float32)
+            @ yaw_rotation_matrix_np(actor.controller_move_yaw)
+            * model_dt
+        )
+        yaw_delta = float(actor.controller_turn_input) * math.radians(float(settings.turn_rate_dps)) * model_dt
+        cur_root_pos = (anchor + state.offset).astype(np.float32)
+        prev_root_pos = (cur_root_pos - velocity_delta).astype(np.float32)
+        cur_root_yaw = float(state.yaw)
+        prev_root_yaw = angle_wrap_np(cur_root_yaw - yaw_delta)
+        future_positions: list[np.ndarray] = []
+        future_yaws: list[float] = []
+        future_state = RootMotionState(state.offset.copy(), state.velocity.copy(), float(state.yaw))
+        for _ in range(int(actor.cfg.future_window)):
+            future_state = integrate_controller_root_motion(
+                future_state,
+                move_input,
+                root_turn,
+                model_dt,
+                settings,
+                movement_yaw=actor.controller_move_yaw,
+            )
+            future_positions.append((anchor + future_state.offset).astype(np.float32))
+            future_yaws.append(float(future_state.yaw))
+        actor.set_controller_root_plan(
+            prev_root_pos,
+            cur_root_pos,
+            prev_root_yaw,
+            cur_root_yaw,
+            np.asarray(future_positions, dtype=np.float32),
+            np.asarray(future_yaws, dtype=np.float32),
         )
 
     def synthetic_controller_preview(self, t: float) -> tuple[np.ndarray, np.ndarray]:
@@ -2558,6 +3179,20 @@ class ModelViewerApp(tk.Tk):
     def on_controller_toggle(self) -> None:
         if not self.controller_enabled_var.get():
             self.clear_controller_root_motion()
+        self.draw()
+
+    def extend_playback_active(self, actor: Actor | None = None) -> bool:
+        if self.controller_enabled_var.get() or not self.extend_trajectory_var.get():
+            return False
+        return actor is None or (actor.kind == "model" and actor.clip is not None)
+
+    def on_extend_trajectory_toggle(self) -> None:
+        if not self.extend_trajectory_var.get():
+            for actor in self.actors:
+                actor.authored_extension_active = False
+            max_frame = max(0, self.max_frames() - 1)
+            self.frame = min(self.frame, float(max_frame))
+            self.update_timeline()
         self.draw()
 
     def mark_pointer_dragged(self, x: int, y: int) -> None:
@@ -2691,6 +3326,76 @@ class ModelViewerApp(tk.Tk):
             f"target {target[0]:+.3f} {target[1]:+.3f} {target[2]:+.3f}\n"
             f"fps {self.display_fps:5.1f}"
         )
+
+    def root_motion_overlay_actor(self) -> Actor | None:
+        selected = self.selected_actor()
+        if selected is not None and selected.visible and selected.clip is not None:
+            return selected
+        for actor in self.actors:
+            if actor.visible and actor.clip is not None:
+                return actor
+        return None
+
+    def root_motion_sample_world(self, actor: Actor, frame_value: float) -> tuple[np.ndarray, float] | None:
+        if actor.kind == "model" and actor.controller_active:
+            if (
+                actor.controller_prev_root_pos is not None
+                and actor.controller_cur_root_pos is not None
+                and actor.controller_prev_root_yaw is not None
+                and actor.controller_cur_root_yaw is not None
+            ):
+                return (
+                    (actor.controller_cur_root_pos + actor.offset).astype(np.float32),
+                    angle_wrap_np(float(actor.controller_cur_root_yaw) + float(actor.initial_root_yaw)),
+                )
+            if actor.controller_root_anchor is not None:
+                return (
+                    (actor.controller_root_anchor + actor.controller_root_offset + actor.offset).astype(np.float32),
+                    angle_wrap_np(float(actor.controller_yaw) + float(actor.initial_root_yaw)),
+                )
+        return self.authored_root_sample(actor, frame_value)
+
+    def previous_root_motion_sample_world(self, actor: Actor, frame_value: float) -> tuple[np.ndarray, float, float] | None:
+        if actor.kind == "model" and actor.controller_active:
+            if (
+                actor.controller_prev_root_pos is not None
+                and actor.controller_cur_root_pos is not None
+                and actor.controller_prev_root_yaw is not None
+            ):
+                return (
+                    (actor.controller_prev_root_pos + actor.offset).astype(np.float32),
+                    angle_wrap_np(float(actor.controller_prev_root_yaw) + float(actor.initial_root_yaw)),
+                    1.0,
+                )
+        if actor.clip is None:
+            return None
+        if frame_value <= 0.0 and actor.clip.T > 1:
+            previous_frame = 0.0
+            current_frame = 1.0
+        else:
+            previous_frame = max(0.0, frame_value - 1.0)
+            current_frame = frame_value
+        sample = self.authored_root_sample(actor, previous_frame)
+        if sample is None:
+            return None
+        return sample[0], sample[1], max(1e-6, current_frame - previous_frame)
+
+    def root_motion_overlay_text(self) -> str:
+        actor = self.root_motion_overlay_actor()
+        if actor is None or actor.clip is None:
+            return ""
+        frame_value = max(0.0, float(self.frame))
+        current = self.root_motion_sample_world(actor, frame_value)
+        previous = self.previous_root_motion_sample_world(actor, frame_value)
+        if current is None or previous is None:
+            return ""
+        current_pos, current_yaw = current
+        previous_pos, previous_yaw, frame_delta = previous
+        fps = max(1.0, float(actor.clip.fps))
+        delta = np.asarray(current_pos - previous_pos, dtype=np.float32)
+        horizontal_speed = float(np.linalg.norm(delta[[0, 2]])) * fps / max(1e-6, frame_delta)
+        yaw_rate = math.degrees(angle_wrap_np(float(current_yaw) - float(previous_yaw))) * fps / max(1e-6, frame_delta)
+        return f"root v {horizontal_speed:6.3f} m/s\nroot yaw {yaw_rate:+7.1f} deg/s"
 
     def on_axis_gizmo_click(self, event: tk.Event) -> None:
         nearest = None
@@ -3358,6 +4063,16 @@ class ModelViewerApp(tk.Tk):
         )
         self.overlay_texture_text = text
 
+    def upload_root_motion_overlay_texture(self, text: str) -> None:
+        if text == self.root_motion_overlay_texture_text and self.root_motion_overlay_texture_id:
+            return
+        (
+            self.root_motion_overlay_texture_id,
+            self.root_motion_overlay_texture_size,
+            self.root_motion_overlay_texture_uv,
+        ) = self.make_overlay_texture(text, self.root_motion_overlay_texture_id, 14)
+        self.root_motion_overlay_texture_text = text
+
     def upload_contact_overlay_texture(self, text: str) -> None:
         if text == self.contact_overlay_texture_text and self.contact_overlay_texture_id:
             return
@@ -3427,6 +4142,22 @@ class ModelViewerApp(tk.Tk):
             self.overlay_texture_uv,
             12.0,
             12.0,
+            width,
+            height,
+        )
+
+    def gl_draw_root_motion_overlay(self, width: int, height: int) -> None:
+        text = self.root_motion_overlay_text()
+        if not text:
+            return
+        self.upload_root_motion_overlay_texture(text)
+        _text_w, text_h = self.root_motion_overlay_texture_size
+        self.gl_draw_text_overlay(
+            self.root_motion_overlay_texture_id,
+            self.root_motion_overlay_texture_size,
+            self.root_motion_overlay_texture_uv,
+            12.0,
+            max(12.0, float(height - text_h - 12)),
             width,
             height,
         )
@@ -3687,6 +4418,7 @@ class ModelViewerApp(tk.Tk):
         self.gl_draw_gizmo_overlay(width, height)
         self.gl_draw_contact_metrics_overlay(width, height, actor_poses)
         self.gl_draw_camera_overlay(width, height)
+        self.gl_draw_root_motion_overlay(width, height)
         GL.glFlush()
 
     def hex_to_rgb(self, color: str) -> tuple[float, float, float]:
@@ -4154,45 +4886,82 @@ class ModelViewerApp(tk.Tk):
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glEnable(GL.GL_LINE_SMOOTH)
         try:
-            GL.glColor4f(0.42, 1.0, 0.78, 0.82)
-            GL.glLineWidth(2.0)
+            points: list[np.ndarray] = []
+            yaws: list[float] = []
             last = np.asarray([root[0], FOOT_CONTACT_CONFIG.ground_y + 0.018, root[2]], dtype=np.float32)
+            points.append(last)
+            yaws.append(angle_wrap_np(float(actor.controller_yaw) + float(actor.initial_root_yaw)))
             for step in range(1, steps + 1):
                 root_turn = np.asarray([sample.triggers, 0.0], dtype=np.float32)
                 state = integrate_controller_root_motion(state, sample.move, root_turn, dt, settings, movement_yaw=movement_yaw)
                 point = root_base + state.offset
                 point = np.asarray([point[0], FOOT_CONTACT_CONFIG.ground_y + 0.018, point[2]], dtype=np.float32)
-                if step % 2 == 1:
-                    GL.glBegin(GL.GL_LINES)
-                    GL.glVertex3f(float(last[0]), float(last[1]), float(last[2]))
-                    GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-                    GL.glEnd()
-                GL.glPointSize(5.0 if step < steps else 7.0)
-                GL.glBegin(GL.GL_POINTS)
-                GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-                GL.glEnd()
+                points.append(point)
+                yaws.append(angle_wrap_np(float(state.yaw) + float(actor.initial_root_yaw)))
                 last = point
+            self.gl_draw_root_trajectory_samples(points, yaws)
         finally:
             GL.glDepthMask(GL.GL_TRUE)
             GL.glPopAttrib()
 
-    def authored_root_trajectory_points(self, actor: Actor) -> list[np.ndarray]:
+    def authored_root_sample(self, actor: Actor, frame_value: float) -> tuple[np.ndarray, float] | None:
         if actor.clip is None:
-            return []
+            return None
+        clip = actor.clip
+        max_frame = max(0, clip.T - 1)
+        frame_value = float(frame_value)
+        root_pos = clip.root_pos.detach().cpu().numpy().astype(np.float32)
+        root_yaw = clip.root_yaw.detach().cpu().numpy().astype(np.float32)
+        if frame_value <= max_frame or not self.extend_trajectory_var.get():
+            frame_value = max(0.0, min(float(max_frame), frame_value))
+            base = int(math.floor(frame_value))
+            nxt = min(max_frame, base + 1)
+            t = frame_value - float(base)
+            pos = root_pos[base] if nxt == base or t <= 1e-6 else root_pos[base] * (1.0 - t) + root_pos[nxt] * t
+            yaw = float(root_yaw[base])
+            if nxt != base and t > 1e-6:
+                yaw = angle_wrap_np(yaw + angle_wrap_np(float(root_yaw[nxt] - root_yaw[base])) * t)
+            return self.apply_actor_root_yaw_world_point(actor, pos), angle_wrap_np(yaw + float(actor.initial_root_yaw))
+        extra = frame_value - float(max_frame)
+        if clip.T >= 3:
+            pos_delta = ((root_pos[-1] - root_pos[-2]) + (root_pos[-2] - root_pos[-3])) * 0.5
+            yaw_delta = (
+                angle_wrap_np(float(root_yaw[-1] - root_yaw[-2]))
+                + angle_wrap_np(float(root_yaw[-2] - root_yaw[-3]))
+            ) * 0.5
+        elif clip.T >= 2:
+            pos_delta = root_pos[-1] - root_pos[-2]
+            yaw_delta = angle_wrap_np(float(root_yaw[-1] - root_yaw[-2]))
+        else:
+            pos_delta = np.zeros(3, dtype=np.float32)
+            yaw_delta = 0.0
+        pos = root_pos[-1] + pos_delta * extra
+        yaw = angle_wrap_np(float(root_yaw[-1]) + yaw_delta * extra)
+        return self.apply_actor_root_yaw_world_point(actor, pos), angle_wrap_np(yaw + float(actor.initial_root_yaw))
+
+    def authored_root_trajectory_samples(self, actor: Actor) -> tuple[list[np.ndarray], list[float]]:
+        if actor.clip is None:
+            return [], []
         settings = self.controller_settings()
-        frame = max(0, min(actor.clip.T - 1, int(round(float(self.frame)))))
+        frame = max(0.0, float(self.frame))
+        if not self.extend_playback_active(actor):
+            frame = min(float(actor.clip.T - 1), frame)
         fps = max(1.0, float(actor.clip.fps))
         steps = max(1, min(48, int(math.ceil(settings.trajectory_seconds / settings.trajectory_step_seconds))))
         dt = settings.trajectory_seconds / steps
-        points = []
+        points: list[np.ndarray] = []
+        yaws: list[float] = []
         for step in range(0, steps + 1):
-            sample_frame = max(0, min(actor.clip.T - 1, int(round(frame + step * dt * fps))))
-            root = actor.clip.root_pos[sample_frame].detach().cpu().numpy().astype(np.float32) + actor.offset
+            sample = self.authored_root_sample(actor, frame + step * dt * fps)
+            if sample is None:
+                continue
+            root, yaw = sample
             points.append(np.asarray([root[0], FOOT_CONTACT_CONFIG.ground_y + 0.018, root[2]], dtype=np.float32))
-        return points
+            yaws.append(yaw)
+        return points, yaws
 
     def gl_draw_authored_root_trajectory(self, actor: Actor) -> None:
-        points = self.authored_root_trajectory_points(actor)
+        points, yaws = self.authored_root_trajectory_samples(actor)
         if len(points) < 2:
             return
         GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT | GL.GL_LINE_BIT | GL.GL_POINT_BIT)
@@ -4203,24 +4972,51 @@ class ModelViewerApp(tk.Tk):
         GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
         GL.glEnable(GL.GL_LINE_SMOOTH)
         try:
-            GL.glColor4f(0.42, 1.0, 0.78, 0.82)
-            GL.glLineWidth(2.0)
-            for idx in range(1, len(points)):
-                if idx % 2 == 1:
-                    last = points[idx - 1]
-                    point = points[idx]
-                    GL.glBegin(GL.GL_LINES)
-                    GL.glVertex3f(float(last[0]), float(last[1]), float(last[2]))
-                    GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-                    GL.glEnd()
-                GL.glPointSize(5.0 if idx < len(points) - 1 else 7.0)
-                point = points[idx]
-                GL.glBegin(GL.GL_POINTS)
-                GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
-                GL.glEnd()
+            self.gl_draw_root_trajectory_samples(points, yaws)
         finally:
             GL.glDepthMask(GL.GL_TRUE)
             GL.glPopAttrib()
+
+    def gl_draw_root_trajectory_samples(self, points: list[np.ndarray], yaws: list[float]) -> None:
+        if len(points) < 2:
+            return
+        GL.glColor4f(0.42, 1.0, 0.78, 0.82)
+        GL.glLineWidth(2.0)
+        for idx in range(1, len(points)):
+            if idx % 2 == 1:
+                last = points[idx - 1]
+                point = points[idx]
+                GL.glBegin(GL.GL_LINES)
+                GL.glVertex3f(float(last[0]), float(last[1]), float(last[2]))
+                GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+                GL.glEnd()
+            GL.glPointSize(5.0 if idx < len(points) - 1 else 7.0)
+            point = points[idx]
+            GL.glBegin(GL.GL_POINTS)
+            GL.glVertex3f(float(point[0]), float(point[1]), float(point[2]))
+            GL.glEnd()
+        if yaws:
+            self.gl_draw_root_yaw_arrow(points[0], yaws[0])
+
+    def gl_draw_root_yaw_arrow(self, origin: np.ndarray, yaw: float) -> None:
+        forward = np.asarray([math.sin(float(yaw)), 0.0, math.cos(float(yaw))], dtype=np.float32)
+        side = np.asarray([forward[2], 0.0, -forward[0]], dtype=np.float32)
+        length = 0.52
+        head = 0.12
+        base = np.asarray([origin[0], FOOT_CONTACT_CONFIG.ground_y + 0.042, origin[2]], dtype=np.float32)
+        tip = base + forward * length
+        left = tip - forward * head + side * (head * 0.45)
+        right = tip - forward * head - side * (head * 0.45)
+        GL.glColor4f(1.0, 0.12, 0.08, 0.95)
+        GL.glLineWidth(1.6)
+        GL.glBegin(GL.GL_LINES)
+        GL.glVertex3f(float(base[0]), float(base[1]), float(base[2]))
+        GL.glVertex3f(float(tip[0]), float(tip[1]), float(tip[2]))
+        GL.glVertex3f(float(tip[0]), float(tip[1]), float(tip[2]))
+        GL.glVertex3f(float(left[0]), float(left[1]), float(left[2]))
+        GL.glVertex3f(float(tip[0]), float(tip[1]), float(tip[2]))
+        GL.glVertex3f(float(right[0]), float(right[1]), float(right[2]))
+        GL.glEnd()
 
     def foot_contact_sides(self, name_to_index: dict[str, int]) -> list[tuple[int, str, int, int]]:
         sides = []

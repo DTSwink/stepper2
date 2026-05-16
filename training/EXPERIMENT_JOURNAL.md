@@ -933,3 +933,325 @@ Accepted foot-slide-aware omni baseline:
 - This replaces the previous pure-AE omni K111 checkpoint as the preferred
   baseline for future omni experiments unless a later visual inspection proves
   otherwise.
+
+Hybrid periodic + transition dataset rollout rule:
+
+- Periodic folders use cyclic indexing and can contribute the full requested
+  rollout K.
+- Non-periodic transition folders do not wrap. When a vectorized non-periodic
+  cohort reaches a clip end during a long AE rollout, the cohort is reset to a
+  fresh valid `(clip, frame)` start instead of producing fake wraparound data.
+  This preserves full `active=1.0` training signal while keeping episode
+  boundaries clean.
+- If a non-periodic clip can support the requested K, starts are sampled only
+  from full-K-safe ranges. Reset-at-end is used when requested K is longer than
+  that clip can possibly provide or when a sampled start reaches the end.
+- Short transition clips are not excluded at K64/K111. Instead, random agent
+  clip sampling is weighted by `1 / expected_active_steps(clip, K)`, so short
+  clips are sampled more often when K is large. This keeps the distribution of
+  active training time per animation roughly uniform rather than letting long
+  loops dominate.
+- Coverage audit on 2026-05-15 found that `active=1.0` was not enough by
+  itself: with 256 rows in one cohort, one row sampled near the end of a
+  non-periodic clip could force a reset after one frame. Future runs therefore
+  use `agent_min_cohort_steps=8` by default, which avoids near-end starts for
+  non-periodic cohorts when the clip is long enough, while still allowing truly
+  short clips to participate.
+- Follow-up audit found the cleaner fix: keep each vectorized batch tied to one
+  animation clip, but reset only the expired rows back into fresh starts in that
+  same clip. This preserves the fast one-clip batched path, avoids fake
+  wraparound, avoids excluding short clips, and avoids the flimsy whole-cohort
+  reset behavior. A small CPU probe at `B16 K32` measured same-clip per-agent
+  reset at `0.316s` versus arbitrary cross-clip per-agent reset at `2.866s`.
+- Important performance note: fully independent per-row resets into arbitrary
+  clips are semantically clean but destroy one-clip vectorization and were far
+  too slow. The accepted implementation is same-clip per-agent reset: each
+  expired row gets a fresh start in its current clip, so the batch remains
+  vectorized by one clip while the agents behave independently at clip ends.
+- For noisy AE + footslide fine-tuning, use `gradient_accumulation_batches=2`
+  as the first stabilizing test: two separate one-clip cohorts are averaged
+  before one optimizer update. This preserves the fast one-clip vectorized
+  rollout while making each update less dependent on a single hard/easy clip.
+
+### 2026-05-15 - Turn Clips And Future-Window Safety
+
+- Problem found on `M_Neutral_Walk_Turn_R_180_Lfoot`: root heading was being
+  computed from the root local `+Z` row, but in the project UE mannequin NPZs
+  local `+Z` is vertical and local `-Y` is the actual character/root heading.
+  This made 180-degree turn clips look orientation-invariant to the code even
+  though root velocity direction flipped in world space.
+- Fix: `heading_yaw_from_root()` now projects root local `-Y` onto the ground
+  plane. On the test clip, old yaw span was `0 deg`; corrected yaw span is
+  `180 deg`. Stable pre-turn and post-turn root/future features now match:
+  frame `5` vs `45` root/future MAE about `0.000001`, while pose features still
+  differ as expected.
+- Rejected idea: do not extrapolate non-periodic root motion past the clip end.
+  That invents command data and can poison transition clips.
+- Accepted rule: non-periodic agents must reset before either the next target
+  frame or the dense future-root window would pass the clip end. With default
+  `future_window=8`, a `55` frame clip has last safe current frame `46`.
+- Short non-periodic clips at `K=111` are not forced to start at frame `1`.
+  Example: the 55-frame turn clip samples starts up to frame `39` with
+  `agent_min_cohort_steps=8`, runs at least 8 valid steps, then same-clip
+  per-agent reset keeps it active without clamped/missing future-root features.
+- The AE prior clean-transition collector also excludes non-periodic current
+  frames whose future-root lookahead would pass the clip end, so the prior is
+  trained in the same factual feature space as controller rollouts.
+- Baseline safety check: both `ue5/animations_omni_only/npz_final` and
+  `ue5/animations_omni_only_full/npz_final` have corrected yaw span `0 deg`
+  and old-vs-new root-delta MAE `0.0` for every clip. The accepted omni
+  baseline checkpoint is therefore not invalidated by this heading fix.
+- Diagnostic file:
+  `training/runs/diagnostics/root_heading_feature_diagnostic_20260515.html`.
+  On `M_Neutral_Walk_Turn_R_180_Lfoot`, stable pre/post-turn frames `5/45`
+  have root/future MAE `0.000001`, while middle-turn frames `25/29` have
+  root/future MAE `0.243082`.
+- Corrected hybrid AE prior:
+  `training/runs/ae_poseaware_hybrid_headingfix_20260515_151658/checkpoints/checkpoint_best.pt`
+  (trained from scratch after the heading/schema/future-window fixes).
+- Corrected controller restart:
+  `training/runs/hybrid_headingfix_from_omni_footslide_baseline_w005_k111_20260515_151853`
+  resumes from accepted baseline
+  `training/runs/footslide_ae_from_omni_k111_allanims_w20_lr1e6_resume_20260514/checkpoints/checkpoint_best_k111.pt`,
+  uses the corrected AE prior above, K111, same-clip per-agent reset,
+  `gradient_accumulation_batches=2`, and simple footslide weight `0.05`.
+- Replacement scheduled run after user correction:
+  `training/runs/hybrid_headingfix_curriculum_from_omni_w005_accum1_omni2x_20260515_152849`.
+  This is the preferred run for this branch. It uses the same corrected AE
+  prior and same accepted omni footslide baseline, but changes:
+  - rollout schedule `1,2,4,8,16,32,64,111` instead of K111-only,
+  - `gradient_accumulation_batches=1`,
+  - periodic/omni group total sampling weight `2`,
+  - non-periodic/transition group total sampling weight `1`,
+  - slower K advancement: `curriculum_min_epochs=80`,
+    `curriculum_min_eligible_clip_visits=0.5`, stall patience `160`, max stage
+    cap `400`.
+  With 15 periodic clips and 214 transition clips, the sampler gives the omni
+  folder about `66.7%` of one-clip cohorts and the transition folder about
+  `33.3%`, instead of letting transition clip count dominate.
+
+### 2026-05-15 - Packed Per-Agent Multi-Clip Rollouts
+
+- The run above exposed a bad statistical side effect of `agent_batch_clips=1`:
+  every optimizer step could be 256 agents from the same animation. At epoch
+  `1914`, the whole batch sampled `M_Neutral_Walk_Arc_F_Small_L`, producing a
+  single-step spike (`ae_score=4.07932`, raw footslide `1.90956`) before the
+  next one-clip batch returned to normal. This is unacceptable for the hybrid
+  dataset because one hard transition can dominate an update.
+- Implemented packed AE-prior rollouts for random-agent training. All clips are
+  prepacked into dense frame tensors, while each row carries its own `clip_id`.
+  Root state, pose lookup, FK, AE transition features, and footslide are then
+  computed on dense batch tensors. Non-cyclic rows reset independently to fresh
+  random clips before their target/future-root frames would be missing.
+- `--agent-batch-clips 0` is now the default for the AE-prior trainer and uses
+  the packed path when contact-physics losses are disabled. `--agent-batch-clips
+  1` remains available as the legacy one-clip cohort path for debugging.
+- Correctness smoke check: for a same-clip batch, packed and legacy losses
+  matched exactly (`abs_diff=0.0`), including AE score and simple footslide.
+  A 256-agent packed sample covered 154 unique clips, confirming true per-agent
+  random clip sampling.
+- K16/B256 benchmark with backward included:
+  - packed per-agent mixed clips: `15.6s` train elapsed for 8 epochs
+    (`18.2s` total wall including setup),
+  - legacy one-clip cohorts: `13.0s` train elapsed for 8 epochs
+    (`15.5s` total wall),
+  - old un-packed mixed clips: `452.9s` train elapsed for 3 epochs
+    (`455.4s` total wall).
+  So packed per-agent sampling costs only about 18-20% over the flawed one-clip
+  shortcut, while being roughly two orders of magnitude faster than the old
+  Python grouped mixed path.
+- Added `--final-stage-random-rollout`. Once the curriculum reaches the last
+  scheduled K, each optimizer microbatch samples its effective rollout length
+  from the schedule rungs themselves, e.g. `{1,2,4,8,16,32,64,111}`, not from
+  every integer in between. Earlier stages still train at their exact scheduled
+  K. This keeps long-horizon training present without making every final-stage
+  update a maximal K111 rollout.
+- Smoke checks:
+  - forced K111 packed rollout with independent resets completed forward +
+    backward,
+  - schedule-rung smoke advanced through `1,2,4` and then sampled effective K
+    only from those rungs.
+- Current run:
+  `training/runs/hybrid_headingfix_curriculum_packed_scheduleK_from_omni_baseline_w005_20260515_173112`.
+  It resumes from accepted omni baseline
+  `training/runs/footslide_ae_from_omni_k111_allanims_w20_lr1e6_resume_20260514/checkpoints/checkpoint_best_k111.pt`,
+  uses corrected hybrid AE prior
+  `training/runs/ae_poseaware_hybrid_headingfix_20260515_151658/checkpoints/checkpoint_best.pt`,
+  packed per-agent random clips, omni/transition group weights `2:1`, simple
+  footslide weight `0.05`, and final-stage schedule-rung rollout sampling.
+- Added `--initial-rollout-k` so a resumed run can start at the current
+  scheduled stage, e.g. K32, while still keeping the full rollout schedule for
+  final-stage schedule-rung sampling.
+- Dataset refresh on 2026-05-15:
+  - Retrained hybrid pose-aware AE after the dataset change:
+    `training/runs/ae_poseaware_hybrid_datasetrefresh_20260515_175707/checkpoints/checkpoint_best.pt`.
+    It finished epoch 800 with best reconstruction about `0.00305`.
+  - The previous controller run was allowed to continue while the AE trained,
+    then stopped after its next saved `checkpoint_last.pt` at epoch `2040`,
+    K32.
+  - Restarted controller from that saved checkpoint with refreshed AE prior,
+    `--initial-rollout-k 32`, packed per-agent random clips, full schedule
+    `1,2,4,8,16,32,64,111`, final-stage schedule-rung sampling, and doubled
+    simple footslide weight `0.10`:
+    `training/runs/hybrid_datasetrefresh_packed_scheduleK_from_epoch2040_w010_20260515_180333`.
+
+### 2026-05-15 - Kaggle K111 Fork Plan
+
+- Prepared a Kaggle fork path for testing the noisy final K111/mixed-K stage on
+  a free Kaggle GPU without touching the local run.
+- Fork point:
+  `training/runs/hybrid_datasetrefresh_packed_scheduleK_from_epoch2040_w010_20260515_180333/checkpoints/checkpoint_best_k64.pt`.
+  This checkpoint reports `rollout_k=64` and `epoch=443`, so it is the clean
+  "beginning of K111" model state for the refreshed hybrid branch.
+- Frozen AE prior for the Kaggle run:
+  `training/runs/ae_poseaware_hybrid_datasetrefresh_20260515_175707/checkpoints/checkpoint_best.pt`.
+- Added Kaggle utilities:
+  - `training/kaggle_prepare_k111_fork.py` packages only the needed source
+    files, the two current `npz_final` folders, the refreshed AE checkpoint,
+    and the K64 fork checkpoint.
+  - `training/kaggle_run_k111.py` resumes training at `--initial-rollout-k 111`
+    with the same packed per-agent sampling, group sampling weights `2:1`,
+    simple footslide weight `0.10`, and optional final-stage schedule-rung
+    random rollout.
+  - `training/kaggle_sync_tensorboard.py` can download Kaggle kernel outputs
+    into a local TensorBoard logdir when Kaggle exposes them.
+- Local dry-run packaging succeeded at
+  `training/kaggle_k111_fork/`. The payload is about 70 MB and does not include
+  full local run history.
+
+### 2026-05-15 - Root Feature Basis Preflight
+
+- Found a real conditioning bug in the root-motion features, exposed by the
+  spin/90-degree turn clips. The canonical pose code and FK use the root heading
+  matrix as a world-to-root row-vector transform, but `root_delta_feature`,
+  `future_root_features`, and the packed AE-prior input path were using its
+  transpose. That made a straight-forward tail after a +/-90 degree turn encode
+  as local backward motion (`dz=-0.4`) instead of forward (`dz=+0.4`).
+- Fixed both `training/train_locomotion.py` and
+  `training/train_locomotion_ae_prior.py` so current and future root features
+  use the same heading basis as canonical joint positions. The model viewer's
+  authored-extension input path now uses the corresponding world-to-local
+  transform too; rendering was not changed.
+- Added `training/preflight_motion_features.py`. Before any long training on
+  hybrid/turn clips, run it against the periodic and non-periodic npz folders.
+  It checks that spin/90-degree turn tails condition as local forward motion and
+  that the packed input builder matches the unpacked builder. Do not restart a
+  long run unless this preflight passes.
+- Current passing diagnostic was written to
+  `training/runs/diagnostics/motion_feature_preflight.json`.
+- Consequence: hybrid/transition checkpoints trained before this fix should be
+  treated as contaminated by wrong root conditioning. Restart from the accepted
+  baseline only after retraining the AE/controller under this corrected feature
+  convention.
+
+### 2026-05-15 - Rootbasis Restart Hygiene
+
+- Arc sanity check before restart: all six `M_Neutral_Walk_Arc_F_*` transition
+  clips now encode local forward motion consistently (`dz ~= +0.39/+0.40`,
+  0% backward frames). The old transposed-basis formula produced backward local
+  motion on 23-94% of arc frames depending on the clip, so the arc hover bug
+  was the same root-feature basis bug, not a separate arc-data issue.
+- TensorBoard cleanup: old event logs were moved out of `training/runs` into
+  `training/tensorboard_archive/20260515_before_rootbasis_restart/`. Checkpoints
+  and run artifacts remain in their original run folders. TensorBoard should now
+  index only new experiments created after this cleanup.
+- Trainers now date-prefix new run names by default, e.g.
+  `YYYYMMDD_HHMMSS_<run_name>`, so TensorBoard sorts future runs
+  alphabetically by creation time. Pass `--no-date-prefix-run-name` only when a
+  caller has already provided a date-first name.
+- Added 30-minute trail checkpoints to the supervised, AE-prior, and transition
+  AE trainers. They are saved as
+  `checkpoint_time_YYYYMMDD_HHMMSS_epoch_XXXXXX.pt` in addition to existing
+  `last`, `best`, and numbered checkpoint rules.
+- Corrected AE prior trained from scratch under the fixed root-feature basis:
+  `training/runs/20260515_235409_ae_poseaware_hybrid_rootbasis_refresh/checkpoints/checkpoint_best.pt`.
+  It used the previous dataset-refresh AE setup and reached best reconstruction
+  about `0.00313`.
+- Restarted local controller run, not Kaggle:
+  `training/runs/20260515_235740_hybrid_rootbasis_from_omni_baseline_w010_mixedk111`.
+  It resumes from accepted omni baseline
+  `training/runs/footslide_ae_from_omni_k111_allanims_w20_lr1e6_resume_20260514/checkpoints/checkpoint_best_k111.pt`,
+  uses the corrected AE prior above, packed per-agent random clips,
+  periodic/non-periodic sampling weights `2:1`, simple footslide weight `0.10`,
+  starts at K111, and uses final-stage schedule-rung mixed K sampling.
+
+### 2026-05-16 - Canonical Body Basis Restart
+
+- Found a second basis mismatch: root/future features were fixed, but
+  canonical body positions and joint canonical velocities were still using the
+  transposed heading basis in one path. This made the hidden body-state input
+  inconsistent with the visible root speed/yaw on +/-90 degree spin clips.
+- Fixed canonical body projection in both trainers so body canonical positions,
+  root deltas, and future root deltas use the same row-vector world-to-heading
+  convention. `training/preflight_motion_features.py` now includes a canonical
+  heading-invariance check for the spin-tail case.
+- Current preflight:
+  `training/runs/diagnostics/motion_feature_preflight.json`.
+  Canonical invariance max abs was about `3.6e-7`, and spin/turn tails encode
+  local forward as `dz ~= +0.4`.
+- Invalidated live run archived out of TensorBoard:
+  `training/runs/20260516_001619_hybrid_rootbasis_from_omni_baseline_w010_curriculum_to_mixedk64/tb`
+  was moved under
+  `training/tensorboard_archive/20260516_canonical_basis_invalidated/`.
+- Retrained the AE prior from scratch under the corrected canonical body basis:
+  `training/runs/20260516_022731_ae_poseaware_hybrid_canonbasis_refresh/checkpoints/checkpoint_best.pt`.
+  Best reconstruction reached about `0.00287`.
+- Restarted the controller with fresh weights, not resumed old weights, because
+  older controller checkpoints were trained against the contaminated input
+  convention:
+  `training/runs/20260516_023559_hybrid_canonbasis_scratch_w010_curriculum_to_mixedk64`.
+  It starts at K1, uses packed per-agent random clips, periodic/non-periodic
+  sampling weights `2:1`, simple footslide weight `0.10`, schedule
+  `1,2,4,8,16,32,64`, and switches to schedule-rung mixed K only at the final
+  K64 stage.
+
+### 2026-05-16 - Rotation Audit Harness
+
+- Added `training/rotation_audit.py` as a reusable rotation/basis tripwire for
+  the hybrid periodic + non-periodic dataset. It is intentionally broader than
+  the earlier motion-feature preflight:
+  - random and dataset 6D rotation roundtrips;
+  - degenerate/collinear 6D fallback conversion;
+  - dataset global rotation orthonormality and determinant checks;
+  - UE Z-up to canonical Y-up vector/rotation consistency;
+  - FK rotation reconstruction from stored local rotations;
+  - synthetic global-yaw equivariance for FK positions/rotations/canonical
+    positions across all 226 clips;
+  - root delta and dense future-root feature invariance under global yaw;
+  - packed trainer path vs unpacked reference for build-input, root-state, FK,
+    and transition features;
+  - footslide-speed invariance under global yaw.
+- Full current audit command:
+  `.tools/python310/python.exe training/rotation_audit.py --frames-per-clip 8 --equivariance-clips 226 --output training/runs/diagnostics/rotation_audit.json`.
+  It passed with `loaded_clips=226` and `failures=0`.
+- Found and fixed one rotation edge case: exact/nearly collinear predicted 6D
+  rows could produce a collapsed matrix in Gram-Schmidt. `rotation_6d_to_matrix`
+  now uses a stable orthogonal fallback for degenerate rows. Normal non-degenerate
+  rotations are unchanged.
+- Inertness check after the fix: dataset stored 6D rotations, one-step model
+  outputs, and sampled K64 rollouts from both
+  `20260516_024659_hybrid_canonbasis_from_k8_w050_curriculum_to_mixedk64/checkpoints/checkpoint_best_k64.pt`
+  and `checkpoint_last.pt` had `fallback_count=0`, `near_1e-5_count=0`,
+  and `old_new_max_abs=0`. So the fix does not change current checkpoints or
+  normal rollout paths; it only catches pathological future outputs.
+- The audit also exposed a non-rotation representation caveat: several source
+  clips contain small animated local translations on non-root bones, especially
+  spine links, while the controller FK intentionally uses fixed rest offsets for
+  all non-pelvis bones. Stored global positions can therefore differ from
+  fixed-offset FK by up to about `0.030 m` on the current full dataset, even
+  though FK rotation reconstruction is exact (`~6.6e-7`). Treat this as a model
+  representation envelope, not a basis bug.
+- Packed-vs-unpacked comparisons must use future-safe frames for non-periodic
+  clips, because the packed training path assumes rows reset before future-root
+  windows would pass the clip end.
+
+### 2026-05-16 - AE-Prior Monitoring Rule
+
+- For AE-prior / non-supervised controller runs, do not rank model quality by
+  ground-truth RMSE unless the question is explicitly about frame-locked
+  imitation. RMSE is misleading here because good behavior may phase-shift or
+  choose a different valid continuation.
+- Use the actual active objective terms for numerical "struggle" checks:
+  frozen AE transition score, generated support-foot slide loss, and their
+  weighted total. Ground-truth RMSE may still be logged as a debug diagnostic,
+  but it should not decide whether an AE-prior model is improving.

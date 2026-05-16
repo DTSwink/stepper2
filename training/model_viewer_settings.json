@@ -2,11 +2,11 @@
   "camera": {
     "yaw": -0.10199999999999898,
     "pitch": 0.4680000000000003,
-    "distance": 3.0498295444648296,
+    "distance": 4.553107837568301,
     "target": [
       -0.01463172398507595,
       0.9171452522277832,
-      0.038552165031433105
+      0.038552284240722656
     ],
     "locked": true
   },
@@ -25,13 +25,21 @@
     "source_npz_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\test\\npz_final\\M_Neutral_Walk_Loop_F.npz"
   },
   "controller": {
-    "max_speed_mps": 1.8,
+    "max_speed_mps": 2.85,
     "acceleration_response": 9.0,
     "deceleration_response": 11.0,
     "turn_rate_dps": 240.0,
     "left_deadzone": 0.24,
     "right_deadzone": 0.26,
     "trajectory_seconds": 1.0,
-    "trajectory_step_seconds": 0.16
+    "trajectory_step_seconds": 0.16,
+    "extend_trajectory": false
+  },
+  "animation_browser": {
+    "folder_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_omni_only\\npz_final",
+    "folder_path_2": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_transitions_only_full_trimmed\\npz_final"
+  },
+  "random_initialization": {
+    "enabled": false
   }
 }

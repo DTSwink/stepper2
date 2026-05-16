@@ -9,6 +9,18 @@ import numpy as np
 
 HELPER_PREFIXES = ("ik_", "weapon_")
 DETAIL_TOKENS = ("thumb", "index", "middle", "ring", "pinky", "metacarpal")
+PER_FRAME_JOINT_ARRAYS = {
+    "local_matrix",
+    "global_matrix",
+    "local_quat_xyzw",
+    "local_rotation_6d",
+    "local_translation",
+    "local_scale",
+    "global_joint_pos",
+    "fbx_lcl_translation",
+    "fbx_lcl_rotation_euler_xyz",
+    "fbx_lcl_scale",
+}
 
 
 def is_helper_name(name: str) -> bool:
@@ -42,6 +54,8 @@ def remap_parents(parents: np.ndarray, keep: list[int]) -> np.ndarray:
 def prune_array(name: str, array: np.ndarray, keep: np.ndarray, joint_count: int) -> np.ndarray:
     if name in {"bone_names", "bone_uids", "parents"}:
         raise ValueError(f"{name} is handled separately")
+    if name in PER_FRAME_JOINT_ARRAYS and array.ndim >= 2 and array.shape[1] == joint_count:
+        return np.take(array, keep, axis=1)
     if array.ndim >= 1 and array.shape[0] == joint_count:
         return np.take(array, keep, axis=0)
     if array.ndim >= 2 and array.shape[1] == joint_count:

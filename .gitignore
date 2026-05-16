@@ -36,6 +36,12 @@ training/*_test.png
 training/*overlay*.png
 training/viewer_settings_*.png
 training/controller_trajectory_*.png
+training/npz_trimmer_screenshot*.png
+_tmp/
+
+# Generated Kaggle payload/probe folders. Keep the reusable scripts tracked.
+training/kaggle_*_fork/
+training/kaggle_*_probe/
 
 # Abandoned adversarial experiments kept locally for reference
 training/train_locomotion_amp.py

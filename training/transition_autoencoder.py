@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -24,7 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 @dataclass
 class AEConfig:
     folder_path: str = "data/npz_final"
+    periodic_folder_path: str = ""
+    nonperiodic_folder_path: str = ""
     run_name: str = "transition_ae"
+    date_prefix_run_name: bool = True
     output_dir: str = "training/runs"
     latent_dim: int = 64
     hidden_dim: int = 512
@@ -42,6 +46,7 @@ class AEConfig:
     stall_patience_epochs: int = 120
     min_delta: float = 1e-6
     tier_eval_every_epochs: int = 25
+    timed_checkpoint_interval_minutes: float = 30.0
     compatibility_weight: float = 0.0
     compatibility_direction_weight: float = 1.0
     compatibility_temporal_weight: float = 1.0
@@ -102,7 +107,7 @@ def set_seed(seed: int) -> None:
 
 
 def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int]:
-    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6 + 2
+    pose_dim = 3 + 6 + clip.J * 3 + clip.Jn * 6 + (2 if cfg.use_contact_state else 0)
     velocity_dim = 3 + clip.J * 3
     input_dim, output_dim = tl.make_batch_dims(clip, cfg)
     next_canon_dim = clip.J * 3
@@ -188,7 +193,9 @@ def collect_clean_feature_rows(
     clip_chunks = []
     idx_chunks = []
     for ci, clip in enumerate(clips):
-        stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - 1
+        stop = clip.cyclic_period if clip.cyclic_animation else clip.T - cfg.future_window
+        if stop <= 1:
+            continue
         idx = torch.arange(1, stop, dtype=torch.long, device=device)
         chunks.append(clean_transition_features(clip, idx, cfg, device).detach().cpu())
         clip_chunks.append(torch.full((idx.numel(),), ci, dtype=torch.long))
@@ -211,10 +218,14 @@ def collect_temporal_skip_features(
     min_skip = max(2, int(min_skip))
     max_skip = max(min_skip, int(max_skip))
     for clip in clips:
-        stop = clip.cyclic_period if cfg.cyclic_animation else clip.T - max_skip
+        stop = clip.cyclic_period if clip.cyclic_animation else min(clip.T - max_skip, clip.T - cfg.future_window)
+        if stop <= 1:
+            continue
         idx = torch.arange(1, stop, dtype=torch.long, device=device)
         for skip in range(min_skip, max_skip + 1):
             chunks.append(transition_features_with_offset(clip, idx, skip, cfg, device).detach().cpu())
+    if not chunks:
+        return torch.empty((0, transition_schema(clips[0], cfg)["total_dim"]), dtype=torch.float32)
     return torch.cat(chunks, dim=0)
 
 
@@ -251,6 +262,18 @@ def make_statue_tier(x: torch.Tensor, schema: dict[str, int]) -> torch.Tensor:
         ),
         dim=-1,
     )
+    if current_output.shape[-1] < output_dim:
+        current_output = torch.cat(
+            (
+                current_output,
+                torch.zeros(
+                    (current_output.shape[0], output_dim - current_output.shape[-1]),
+                    dtype=current_output.dtype,
+                    device=current_output.device,
+                ),
+            ),
+            dim=-1,
+        )
     y[:, output_start : output_start + output_dim] = current_output
     y[:, canon_start : canon_start + canon_dim] = current_pose[:, 9 : 9 + canon_dim]
     y[:, vel_start : vel_start + vel_dim] = 0.0
@@ -379,13 +402,19 @@ def train(args: argparse.Namespace) -> None:
         value = getattr(args, field, None)
         if value is not None:
             setattr(cfg, field, value)
+    if cfg.date_prefix_run_name:
+        cfg.run_name = tl.date_prefixed_run_name(cfg.run_name)
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
     tl.apply_cuda_performance_settings(tl.TrainConfig(device=cfg.device), device)
     locomotion_cfg = tl.TrainConfig()
     locomotion_cfg.cyclic_animation = cfg.cyclic_animation
-    folder = tl.resolve_path(cfg.folder_path)
-    clips = tl.load_clips(folder, locomotion_cfg)
+    clip_specs = tl.clip_specs_from_folders(
+        cfg.folder_path,
+        cfg.periodic_folder_path or None,
+        cfg.nonperiodic_folder_path or None,
+    )
+    clips = tl.load_clips_from_specs(clip_specs, locomotion_cfg)
     clean, feature_clip_ids, _feature_cur_idx = collect_clean_feature_rows(clips, locomotion_cfg, device)
     skip_features = None
     if cfg.compatibility_weight > 0.0 and cfg.compatibility_temporal_weight > 0.0:
@@ -413,7 +442,8 @@ def train(args: argparse.Namespace) -> None:
 
     print(
         f"transition_ae samples={x_norm.shape[0]} dim={x_norm.shape[1]} latent={cfg.latent_dim} "
-        f"compat={cfg.compatibility_weight:g} device={device} folder={folder}",
+        f"compat={cfg.compatibility_weight:g} device={device} "
+        f"folders={[(str(tl.npz_folder_from_path(path)), cyclic) for path, cyclic in clip_specs]}",
         flush=True,
     )
     best = math.inf
@@ -422,6 +452,9 @@ def train(args: argparse.Namespace) -> None:
     stalls = 0
     rows: list[dict[str, float]] = []
     indices = torch.arange(x_norm.shape[0], device=device)
+    start_time = time.perf_counter()
+    timed_interval_seconds = 60.0 * max(0.0, float(cfg.timed_checkpoint_interval_minutes))
+    next_timed_checkpoint_at = start_time + timed_interval_seconds if timed_interval_seconds > 0.0 else math.inf
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
         perm = indices[torch.randperm(indices.numel(), device=device)]
@@ -483,7 +516,10 @@ def train(args: argparse.Namespace) -> None:
                     "mean": mean.detach().cpu(),
                     "std": std.detach().cpu(),
                     "metadata": {
-                        "npz_folder": str(folder),
+                        "npz_folders": [
+                            {"path": str(tl.npz_folder_from_path(path)), "cyclic": cyclic}
+                            for path, cyclic in clip_specs
+                        ],
                         "body_names": clips[0].body_names,
                         "parents_body": clips[0].parents_body.tolist(),
                     },
@@ -526,6 +562,33 @@ def train(args: argparse.Namespace) -> None:
         if target is not None and train_loss <= target:
             print(f"target reached epoch={epoch} loss={train_loss:.6g} target={target:.6g}", flush=True)
             break
+        now_perf = time.perf_counter()
+        if now_perf >= next_timed_checkpoint_at:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "config": asdict(cfg),
+                    "locomotion_config": asdict(locomotion_cfg),
+                    "schema": schema,
+                    "mean": mean.detach().cpu(),
+                    "std": std.detach().cpu(),
+                    "metadata": {
+                        "npz_folders": [
+                            {"path": str(tl.npz_folder_from_path(path)), "cyclic": cyclic}
+                            for path, cyclic in clip_specs
+                        ],
+                        "body_names": clips[0].body_names,
+                        "parents_body": clips[0].parents_body.tolist(),
+                    },
+                    "epoch": epoch,
+                    "best": best,
+                },
+                ckpt_dir / f"checkpoint_time_{stamp}_epoch_{epoch:06d}.pt",
+            )
+            while next_timed_checkpoint_at <= now_perf:
+                next_timed_checkpoint_at += timed_interval_seconds
         if cfg.stall_patience_epochs > 0 and stalls >= cfg.stall_patience_epochs:
             print(f"stopped on stall epoch={epoch} best={best:.6g}", flush=True)
             break

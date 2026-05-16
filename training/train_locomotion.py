@@ -109,6 +109,11 @@ class TrainConfig:
     training_loop: str = "sampled"
     agent_sampling: str = "random"
     agent_batch_clips: int = 1
+    agent_min_cohort_steps: int = 8
+    gradient_accumulation_batches: int = 1
+    periodic_sampling_weight: float = 1.0
+    nonperiodic_sampling_weight: float = 1.0
+    init_pose_sampling: str = "same_clip"
     live_viewer: bool = True
     live_viewer_max_agents: int = 4
     live_viewer_start_visualizing: bool = False
@@ -123,6 +128,7 @@ class TrainConfig:
     comparison_max_frames: int = 0
     enable_early_termination: bool = False
     restart_on_termination: bool = True
+    reset_exhausted_agents: bool = True
     freefall_body_height_offset_m: float = 0.0
     freefall_initial_offset_history: int = 1
     freefall_initial_contacts_off: bool = True
@@ -137,6 +143,7 @@ class TrainConfig:
     exclude_bone_names: tuple[str, ...] = ("root", "attach")
 
     checkpoint_every_epochs: int = 500
+    timed_checkpoint_interval_minutes: float = 30.0
     run_name: str = "locomotion_mlp"
     output_dir: str = "training/runs"
 
@@ -172,6 +179,13 @@ def resolve_path(path_text: str) -> Path:
     return path.resolve()
 
 
+def date_prefixed_run_name(run_name: str, now: float | None = None) -> str:
+    text = str(run_name).strip() or "run"
+    if len(text) >= 15 and text[:8].isdigit() and text[8] == "_" and text[9:15].isdigit():
+        return text
+    return f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now or time.time()))}_{text}"
+
+
 def wrap_angle(x: torch.Tensor) -> torch.Tensor:
     return torch.atan2(torch.sin(x), torch.cos(x))
 
@@ -187,10 +201,21 @@ def rotmat_to_6d(rot: torch.Tensor) -> torch.Tensor:
 
 def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
     # Row-vector Gram-Schmidt. This matches rotmat_to_6d above.
+    # If the network emits degenerate 6D rows, choose a stable orthogonal
+    # fallback instead of returning a collapsed "rotation" matrix.
     a1 = d6[..., 0:3]
     a2 = d6[..., 3:6]
-    b1 = normalize(a1)
-    b2 = normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1)
+    a1_norm = torch.linalg.norm(a1, dim=-1, keepdim=True)
+    fallback_b1 = torch.zeros_like(a1)
+    fallback_b1[..., 0] = 1.0
+    b1 = torch.where(a1_norm > 1e-8, normalize(a1), fallback_b1)
+
+    projected = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    projected_norm = torch.linalg.norm(projected, dim=-1, keepdim=True)
+
+    fallback_axis = F.one_hot(b1.abs().argmin(dim=-1), num_classes=3).to(dtype=d6.dtype, device=d6.device)
+    fallback_projected = fallback_axis - (b1 * fallback_axis).sum(dim=-1, keepdim=True) * b1
+    b2 = torch.where(projected_norm > 1e-8, normalize(projected), normalize(fallback_projected))
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-2)
 
@@ -235,8 +260,9 @@ def yaw_to_row_matrix(yaw: torch.Tensor) -> torch.Tensor:
 
 
 def heading_yaw_from_root(root_rot: torch.Tensor) -> torch.Tensor:
-    # Local +Z row as forward, projected onto the XZ ground plane.
-    forward = root_rot[..., 2, :]
+    # UE mannequin root convention in this project: local +Z is vertical, and
+    # local -Y is the character/root heading. Project it onto the XZ ground plane.
+    forward = -root_rot[..., 1, :]
     return torch.atan2(forward[..., 0], forward[..., 2])
 
 
@@ -275,10 +301,10 @@ def canonicalize_rotations(rot: torch.Tensor, up_axis: int) -> torch.Tensor:
 
 
 class MotionClip:
-    def __init__(self, path: Path, cfg: TrainConfig):
+    def __init__(self, path: Path, cfg: TrainConfig, cyclic_animation: bool | None = None):
         arrays = np.load(path)
         self.path = path
-        self.cyclic_animation = bool(cfg.cyclic_animation)
+        self.cyclic_animation = bool(cfg.cyclic_animation if cyclic_animation is None else cyclic_animation)
         self.source_up_axis = axis_up_axis(arrays)
         self.bone_names = [str(x) for x in arrays["bone_names"]]
         self.parents_full = arrays["parents"].astype(np.int64)
@@ -359,7 +385,9 @@ class MotionClip:
         self.mass_weights = torch.tensor(body_mass.bone_masses_for_names(self.body_names), dtype=torch.float32)
 
         root_delta = self.global_pos - self.root_pos[:, None, :]
-        self.canonical_pos = torch.einsum("tjc,tdc->tjd", root_delta, self.root_heading_rot)
+        # Row-vector convention: root_heading_rot maps world deltas into the
+        # root-heading frame. Keep this in the same basis as root/future deltas.
+        self.canonical_pos = torch.einsum("tjc,tcd->tjd", root_delta, self.root_heading_rot)
 
         self.J = len(self.body_names)
         self.Jn = len(self.non_pelvis)
@@ -406,7 +434,7 @@ class MotionIndexDataset(Dataset):
     def __init__(self, clips: list[MotionClip], cfg: TrainConfig, split: str, max_rollout: int):
         self.items: list[tuple[int, int]] = []
         for ci, clip in enumerate(clips):
-            max_start = clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - max_rollout - 1
+            max_start = clip_rollout_max_start(clip, max_rollout, cfg)
             if max_start < 1:
                 continue
             starts = list(range(1, max_start + 1))
@@ -560,7 +588,7 @@ def fk_from_pose(
     global_rot = torch.stack(global_rot_list, dim=1)
     root_yaw = heading_yaw_from_root(root_rot)
     heading = yaw_to_row_matrix(root_yaw)
-    canon = torch.einsum("bjc,bdc->bjd", global_pos - root_pos[:, None, :], heading)
+    canon = torch.einsum("bjc,bcd->bjd", global_pos - root_pos[:, None, :], heading)
     return global_pos, global_rot, canon
 
 
@@ -617,6 +645,18 @@ def logical_pose_index(clip: MotionClip, idx: torch.Tensor, device: torch.device
     return torch.remainder(idx, clip.cyclic_period)
 
 
+def clip_rollout_max_start(clip: MotionClip, rollout_k: int, cfg: TrainConfig | None = None) -> int:
+    if clip.cyclic_animation:
+        return int(clip.cyclic_period) - 1
+    if cfg is not None:
+        return int(clip.T) - int(cfg.future_window) - int(rollout_k)
+    return int(clip.T) - int(rollout_k) - 1
+
+
+def clip_supports_rollout(clip: MotionClip, rollout_k: int, cfg: TrainConfig | None = None) -> bool:
+    return clip_rollout_max_start(clip, rollout_k, cfg) >= 1
+
+
 def root_state(
     clip: MotionClip,
     idx: torch.Tensor,
@@ -625,7 +665,7 @@ def root_state(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     tensors = clip.tensors(device)
     idx = idx.to(device)
-    if not cfg.cyclic_animation:
+    if not clip.cyclic_animation:
         pos = tensors["root_pos"].index_select(0, idx)
         rot = tensors["root_rot"].index_select(0, idx)
         yaw = tensors["root_yaw"].index_select(0, idx)
@@ -673,7 +713,7 @@ def global_from_clip(
     cfg: TrainConfig,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not cfg.cyclic_animation:
+    if not clip.cyclic_animation:
         tensors = clip.tensors(device)
         idx_device = idx.to(device)
         return (
@@ -689,7 +729,7 @@ def global_from_clip(
 def root_delta_feature(clip: MotionClip, prev_idx: torch.Tensor, cur_idx: torch.Tensor, cfg: TrainConfig, device) -> torch.Tensor:
     prev_pos, _prev_rot, prev_yaw, prev_heading = root_state(clip, prev_idx, cfg, device)
     cur_pos, _cur_rot, cur_yaw, _cur_heading = root_state(clip, cur_idx, cfg, device)
-    delta_local = torch.matmul((cur_pos - prev_pos).unsqueeze(1), prev_heading.transpose(-1, -2)).squeeze(1)
+    delta_local = torch.matmul((cur_pos - prev_pos).unsqueeze(1), prev_heading).squeeze(1)
     dx = delta_local[:, 0] / cfg.max_speed_scale_final
     dz = delta_local[:, 2] / cfg.max_speed_scale_final
     yaw_delta = wrap_angle(cur_yaw - prev_yaw)
@@ -702,9 +742,9 @@ def future_root_features(clip: MotionClip, cur_idx: torch.Tensor, cfg: TrainConf
     cur_idx = cur_idx.to(device)
     cur_pos, _cur_rot, cur_yaw, cur_heading = root_state(clip, cur_idx, cfg, device)
     for k in range(1, cfg.future_window + 1):
-        fut_idx = cur_idx + k if cfg.cyclic_animation else torch.clamp(cur_idx + k, max=clip.T - 1)
+        fut_idx = cur_idx + k if clip.cyclic_animation else torch.clamp(cur_idx + k, max=clip.T - 1)
         fut_pos, _fut_rot, fut_yaw, _fut_heading = root_state(clip, fut_idx, cfg, device)
-        fut_local = torch.matmul((fut_pos - cur_pos).unsqueeze(1), cur_heading.transpose(-1, -2)).squeeze(1)
+        fut_local = torch.matmul((fut_pos - cur_pos).unsqueeze(1), cur_heading).squeeze(1)
         scale_k = k * cfg.max_speed_scale_final
         dx = torch.clamp(fut_local[:, 0] / scale_k, -2.0, 2.0)
         dz = torch.clamp(fut_local[:, 2] / scale_k, -2.0, 2.0)
@@ -1039,7 +1079,11 @@ def run_batch(
                 dead = term_mask.detach()
                 if cfg.restart_on_termination and step + 1 < rollout_k and bool(dead.any()):
                     remaining_steps = rollout_k - step - 1
-                    max_start = max(1, clip.cyclic_period - 1 if cfg.cyclic_animation else clip.T - 1 - remaining_steps)
+                    max_start = clip_rollout_max_start(clip, remaining_steps, cfg)
+                    if max_start < 1:
+                        dead = torch.zeros_like(dead)
+                        alive = alive & (~dead)
+                        continue
                     restart_start = torch.randint(1, max_start + 1, cur_idx.shape, device=device)
                     restart_prev_idx = restart_start - 1
                     restart_cur_idx = restart_start
@@ -1106,16 +1150,59 @@ def run_batch(
     return total_loss, scalars
 
 
-def load_clips(folder: Path, cfg: TrainConfig) -> list[MotionClip]:
-    paths = sorted(folder.glob("*.npz"))
-    if not paths:
-        raise FileNotFoundError(f"No .npz files found in {folder}")
-    clips = [MotionClip(path, cfg) for path in paths]
+def parse_path_list(text: str | None) -> list[Path]:
+    if text is None:
+        return []
+    return [resolve_path(part.strip()) for part in str(text).split(";") if part.strip()]
+
+
+def npz_folder_from_path(folder: Path) -> Path:
+    folder = resolve_path(folder)
+    if any(folder.glob("*.npz")):
+        return folder
+    final_folder = folder / "npz_final"
+    if final_folder.exists() and any(final_folder.glob("*.npz")):
+        return final_folder
+    return folder
+
+
+def load_clips_from_specs(specs: list[tuple[Path, bool | None]], cfg: TrainConfig) -> list[MotionClip]:
+    paths_with_flags: list[tuple[Path, bool | None]] = []
+    for folder, cyclic in specs:
+        npz_folder = npz_folder_from_path(folder)
+        paths = sorted(npz_folder.glob("*.npz"))
+        if not paths:
+            raise FileNotFoundError(f"No .npz files found in {npz_folder}")
+        paths_with_flags.extend((path, cyclic) for path in paths)
+    if not paths_with_flags:
+        raise FileNotFoundError("No .npz files found in requested motion folders")
+    clips = [MotionClip(path, cfg, cyclic_animation=cyclic) for path, cyclic in paths_with_flags]
     first_names = clips[0].body_names
     for clip in clips[1:]:
         if clip.body_names != first_names:
             raise ValueError(f"Skeleton mismatch: {clip.path} does not match {clips[0].path}")
     return clips
+
+
+def load_clips(folder: Path, cfg: TrainConfig) -> list[MotionClip]:
+    return load_clips_from_specs([(folder, None)], cfg)
+
+
+def clip_specs_from_folders(
+    folder_path: str | Path | None,
+    periodic_folder_path: str | None,
+    nonperiodic_folder_path: str | None,
+) -> list[tuple[Path, bool | None]]:
+    specs: list[tuple[Path, bool | None]] = []
+    for folder in parse_path_list(periodic_folder_path):
+        specs.append((folder, True))
+    for folder in parse_path_list(nonperiodic_folder_path):
+        specs.append((folder, False))
+    if specs:
+        return specs
+    if folder_path is None:
+        return [(resolve_path(folder_path or "data/npz_final"), None)]
+    return [(resolve_path(folder_path), None)]
 
 
 def make_batch_dims(clip: MotionClip, cfg: TrainConfig) -> tuple[int, int]:
@@ -1663,8 +1750,12 @@ def train(args: argparse.Namespace) -> None:
         cfg.save_best_every_epochs = args.save_best_every_epochs
     if args.writer_flush_every_epochs is not None:
         cfg.writer_flush_every_epochs = args.writer_flush_every_epochs
+    if args.timed_checkpoint_interval_minutes is not None:
+        cfg.timed_checkpoint_interval_minutes = max(0.0, float(args.timed_checkpoint_interval_minutes))
     if args.run_name is not None:
         cfg.run_name = args.run_name
+    if args.date_prefix_run_name:
+        cfg.run_name = date_prefixed_run_name(cfg.run_name)
     cfg.use_torch_compile = bool(args.compile) and not args.no_compile
     if args.compile_mode is not None:
         cfg.torch_compile_mode = args.compile_mode
@@ -1680,13 +1771,12 @@ def train(args: argparse.Namespace) -> None:
         cfg.disable_validation = not bool(args.validation)
     set_seed(cfg.seed)
 
-    npz_folder = resolve_path(args.folder_path or folder_path)
+    clip_specs = clip_specs_from_folders(args.folder_path or folder_path, args.periodic_folder_path, args.nonperiodic_folder_path)
     device = torch.device(cfg.device)
     profiler = TimingProfiler(cfg.profile_timing, device, cfg.profile_sync_cuda)
     with profiler.section("setup/load_npz_and_precompute"):
-        clips = load_clips(npz_folder, cfg)
-    max_possible = min((clip.cyclic_period if cfg.cyclic_animation else clip.T - 2) for clip in clips)
-    schedule = tuple(k for k in cfg.rollout_schedule if k <= max_possible)
+        clips = load_clips_from_specs(clip_specs, cfg)
+    schedule = tuple(k for k in cfg.rollout_schedule if all(clip_supports_rollout(clip, k, cfg) for clip in clips))
     if not schedule:
         schedule = (1,)
     def make_loaders(max_rollout: int) -> tuple[DataLoader, DataLoader | None]:
@@ -1711,8 +1801,11 @@ def train(args: argparse.Namespace) -> None:
     agent_coverage_cursor = 0
 
     def random_agent_start(max_rollout: int, clip_index: int | None = None) -> tuple[int, int]:
-        ci = agent_rng.randrange(len(clips)) if clip_index is None else int(clip_index)
-        max_start = max(1, clips[ci].cyclic_period - 1 if cfg.cyclic_animation else clips[ci].T - max_rollout - 1)
+        eligible = [ci for ci, clip in enumerate(clips) if clip_supports_rollout(clip, max_rollout, cfg)]
+        if not eligible:
+            raise ValueError(f"No clips support rollout K={max_rollout}")
+        ci = agent_rng.choice(eligible) if clip_index is None or int(clip_index) not in eligible else int(clip_index)
+        max_start = clip_rollout_max_start(clips[ci], max_rollout, cfg)
         return ci, agent_rng.randint(1, max_start)
 
     def reset_agent_coverage_order() -> None:
@@ -1738,7 +1831,8 @@ def train(args: argparse.Namespace) -> None:
             count = min(cfg.batch_size, len(train_loader.dataset.items))
         fixed_clip = None
         if cfg.agent_sampling == "random" and cfg.agent_batch_clips == 1 and len(clips) > 1:
-            fixed_clip = agent_rng.randrange(len(clips))
+            eligible = [ci for ci, clip in enumerate(clips) if clip_supports_rollout(clip, max_rollout, cfg)]
+            fixed_clip = agent_rng.choice(eligible) if eligible else None
         for _ in range(count):
             if cfg.agent_sampling == "coverage":
                 ci, start = coverage_agent_start()
@@ -1792,7 +1886,10 @@ def train(args: argparse.Namespace) -> None:
     with profiler.section("setup/tensorboard_writer"):
         writer = SummaryWriter(run_dir / "tb")
     metadata = {
-        "npz_folder": str(npz_folder),
+        "npz_folders": [
+            {"path": str(npz_folder_from_path(path)), "cyclic": cyclic}
+            for path, cyclic in clip_specs
+        ],
         "source_npz_paths": [str(clip.path) for clip in clips],
         "body_names": clips[0].body_names,
         "parents_body": clips[0].parents_body.tolist(),
@@ -1833,6 +1930,8 @@ def train(args: argparse.Namespace) -> None:
     baseline_val = None
     target_val = None
     start_time = time.perf_counter()
+    timed_interval_seconds = 60.0 * max(0.0, float(cfg.timed_checkpoint_interval_minutes))
+    next_timed_checkpoint_at = start_time + timed_interval_seconds if timed_interval_seconds > 0.0 else math.inf
     target_reached_epoch = None
     target_reached_seconds = None
     pending_best_payload = None
@@ -1992,6 +2091,22 @@ def train(args: argparse.Namespace) -> None:
                     cfg,
                     metadata,
                 )
+        now_perf = time.perf_counter()
+        if now_perf >= next_timed_checkpoint_at:
+            with profiler.section("checkpoint/write_timed"):
+                stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                save_checkpoint(
+                    ckpt_dir / f"checkpoint_time_{stamp}_epoch_{epoch:06d}.pt",
+                    model,
+                    optimizer,
+                    epoch,
+                    best_val,
+                    rollout_k,
+                    cfg,
+                    metadata,
+                )
+            while next_timed_checkpoint_at <= now_perf:
+                next_timed_checkpoint_at += timed_interval_seconds
 
         stage_epochs = stage_epoch
         can_advance_by_loss = (
@@ -2120,6 +2235,16 @@ def train(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a kinematic locomotion imitator from NPZ motion clips.")
     parser.add_argument("--folder-path", default=None, help="Override top-level folder_path.")
+    parser.add_argument(
+        "--periodic-folder-path",
+        default=None,
+        help="Semicolon-separated motion folders that should use cyclic root/pose indexing.",
+    )
+    parser.add_argument(
+        "--nonperiodic-folder-path",
+        default=None,
+        help="Semicolon-separated motion folders that should never sample starts past clip length minus rollout.",
+    )
     parser.add_argument("--max-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--future-window-seconds", type=float, default=None)
@@ -2198,7 +2323,9 @@ def main() -> None:
     parser.add_argument("--save-last-every-epochs", type=int, default=None)
     parser.add_argument("--save-best-every-epochs", type=int, default=None)
     parser.add_argument("--writer-flush-every-epochs", type=int, default=None)
+    parser.add_argument("--timed-checkpoint-interval-minutes", type=float, default=None)
     parser.add_argument("--run-name", default=None)
+    parser.add_argument("--date-prefix-run-name", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-checkpoint", default=None)
     parser.add_argument("--compile", action="store_true", help="Try torch.compile after a forward/backward probe.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile.")

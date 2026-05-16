@@ -37,11 +37,12 @@ Use `--agent-sampling coverage` for small clips. It resets rollout agents across
 the valid start frames uniformly, which avoids the noisy duplicate/missed starts
 you get from pure random reset on tiny datasets.
 
-For multi-clip random-agent experiments, keep `--agent-batch-clips 1` unless you
-are intentionally stress-testing mixed-clip batches. This keeps each training
-batch on a single clip, so the rollout stays vectorized instead of splitting
-into many tiny per-clip groups. `1` is the default for the supervised trainer
-and for the AE-prior trainer.
+For AE-prior multi-clip random-agent experiments, prefer the packed per-agent
+path: leave `--agent-batch-clips 0` and `--packed-agent-rollout` on. Each agent
+samples its own clip and resets independently when a non-cyclic clip would run
+out of valid target/future-root frames, while the trainer keeps the rollout in
+dense tensors. `--agent-batch-clips 1` is the older one-clip cohort shortcut;
+it is fast but can make one hard animation dominate a whole optimizer step.
 
 At the end of every training run, `training/runs/model_comparisons/model_comparison.html`
 is refreshed from that run's `checkpoint_best.pt` and source NPZ. Use
