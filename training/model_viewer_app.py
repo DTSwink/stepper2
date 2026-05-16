@@ -229,14 +229,9 @@ def actor_basename(path: Path) -> str:
 def newest_checkpoint() -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
-    last_checkpoints = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_last.pt"))
-    if last_checkpoints:
-        return max(last_checkpoints, key=lambda p: p.stat().st_mtime)
-    candidates = [
-        path
-        for path in DEFAULT_RUNS_DIR.glob("*/checkpoints/*.pt")
-        if not path.name.startswith("checkpoint_best")
-    ]
+    candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_best*.pt"))
+    if not candidates:
+        candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_last.pt"))
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -1505,6 +1500,7 @@ class ModelViewerApp(tk.Tk):
         self.build_settings_tab(settings_tab)
 
         self.bind_class("StepperSpacePlay", "<space>", self.on_space_play)
+        self.bind_class("StepperSpacePlay", "<KeyPress-Alt_L>", self.on_left_alt_restart)
         self.install_space_play_bindtag(self)
         self.bind("<Left>", lambda _event: self.step_frame(-1))
         self.bind("<Right>", lambda _event: self.step_frame(1))
@@ -1527,6 +1523,11 @@ class ModelViewerApp(tk.Tk):
 
     def on_space_play(self, _event: tk.Event) -> str:
         self.toggle_play()
+        return "break"
+
+    def on_left_alt_restart(self, _event: tk.Event) -> str:
+        if self.playing:
+            self.restart_playback_at_zero()
         return "break"
 
     def install_space_play_bindtag(self, widget: tk.Widget) -> None:
@@ -2447,6 +2448,20 @@ class ModelViewerApp(tk.Tk):
             if actor.kind == "model":
                 actor.reset_generation()
         self.update_timeline()
+        self.draw()
+
+    def restart_playback_at_zero(self) -> None:
+        self.frame = 0.0
+        self.playback_accumulator = 0.0
+        if self.controller_enabled_var.get():
+            self.clear_controller_root_motion()
+        else:
+            for actor in self.actors:
+                if actor.kind == "model":
+                    actor.reset_generation()
+                    actor.start_async_generation(8, extend_authored=self.extend_playback_active(actor))
+        self.update_timeline()
+        self.invalidate_shadow_cache()
         self.draw()
 
     def step_frame(self, delta: int) -> None:

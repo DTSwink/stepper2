@@ -30,6 +30,7 @@ def mirror_checkpoints(run_name: str) -> None:
         target = dst / path.name
         if not target.exists() or target.stat().st_size != path.stat().st_size or target.stat().st_mtime < path.stat().st_mtime:
             shutil.copy2(path, target)
+            print(f"mirrored checkpoint at {target}", flush=True)
         copied.append(path.name)
     manifest = dst.parent / "CHECKPOINTS_ARE_HERE.txt"
     manifest.write_text(

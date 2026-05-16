@@ -1330,6 +1330,12 @@ def step_adaptive_lr(
 def save_checkpoint(path: Path, model, optimizer, epoch: int, best_val: float, rollout_k: int, cfg, metadata) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint_payload(model, optimizer, epoch, best_val, rollout_k, cfg, metadata), path)
+    size_mb = path.stat().st_size / (1024.0 * 1024.0)
+    print(
+        f"new saved checkpoint at {path} epoch={epoch} K={rollout_k} "
+        f"best_val={best_val:.8g} size_mb={size_mb:.2f}",
+        flush=True,
+    )
 
 
 def checkpoint_payload(model, optimizer, epoch: int, best_val: float, rollout_k: int, cfg, metadata) -> dict:
@@ -1354,6 +1360,19 @@ def clone_checkpoint_payload(payload: dict) -> dict:
 def save_payload(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+    size_mb = path.stat().st_size / (1024.0 * 1024.0)
+    epoch = payload.get("epoch", "?")
+    rollout_k = payload.get("rollout_k", "?")
+    best_val = payload.get("best_val", "?")
+    if isinstance(best_val, float):
+        best_text = f"{best_val:.8g}"
+    else:
+        best_text = str(best_val)
+    print(
+        f"new saved checkpoint at {path} epoch={epoch} K={rollout_k} "
+        f"best_val={best_text} size_mb={size_mb:.2f}",
+        flush=True,
+    )
 
 
 def update_model_comparison_html(clip_path: Path, ckpt_dir: Path, cfg: TrainConfig) -> None:
