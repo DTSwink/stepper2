@@ -27,7 +27,6 @@ from tqdm import tqdm
 
 import body_mass
 import contact_physics as cp
-from visual_report_bridge import VisualReportBridge
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -113,12 +112,14 @@ class TrainConfig:
     gradient_accumulation_batches: int = 1
     periodic_sampling_weight: float = 1.0
     nonperiodic_sampling_weight: float = 1.0
+    synthetic_agent_fraction: float = 0.0
     init_pose_sampling: str = "same_clip"
+    agent_fixed_start_frame: int = 0
     live_viewer: bool = True
     live_viewer_max_agents: int = 4
     live_viewer_start_visualizing: bool = False
     live_viewer_close_on_exit: bool = False
-    visual_reporter: bool = True
+    visual_reporter: bool = False
     visual_report_interval_seconds: float = 60.0
     visual_report_device: str = "cpu"
     visual_report_max_frames: int = 180
@@ -137,6 +138,20 @@ class TrainConfig:
     simple_footslide_loss_weight: float = 0.0
     simple_footslide_threshold_mps: float = 0.0
     simple_footslide_gt_margin: float = 1.05
+    turn_idle_footslide_tolerance_divisor: float = 1.0
+    support_envelope_enabled: bool = True
+    support_envelope_knn: int = 32
+    support_envelope_margin: float = 1.05
+    support_envelope_cache_dir: str = "training/runs/cache/support_envelopes"
+    foot_yaw_loss_weight: float = 0.0
+    foot_yaw_loss_scale_radps: float = 1.0
+    foot_yaw_loss_scale_checkpoint: str = ""
+    motion_floor_loss_weight: float = 0.0
+    motion_floor_margin: float = 0.9
+    include_transition_foot_motion: bool = False
+    foot_slide_scale_mps: float = 1.0
+    foot_yaw_scale_radps: float = 10.0
+    root_lookahead_steps: int = 0
 
     end_effector_bones: tuple[str, ...] = ("foot_l", "ball_l", "foot_r", "ball_r")
     exclude_bone_prefixes: tuple[str, ...] = ("ik_", "weapon_")
@@ -1719,8 +1734,9 @@ def train(args: argparse.Namespace) -> None:
         cfg.live_viewer_start_visualizing = True
     if args.live_viewer_close_on_exit:
         cfg.live_viewer_close_on_exit = True
-    if args.visual_reporter is not None:
-        cfg.visual_reporter = bool(args.visual_reporter)
+    if args.visual_reporter is not None and bool(args.visual_reporter):
+        print("visual reporter disabled: use the standalone model viewer instead", flush=True)
+    cfg.visual_reporter = False
     if args.visual_report_interval_seconds is not None:
         cfg.visual_report_interval_seconds = max(1.0, float(args.visual_report_interval_seconds))
     if args.visual_report_device is not None:
@@ -1888,20 +1904,6 @@ def train(args: argparse.Namespace) -> None:
         with profiler.section("setup/live_viewer_launch"):
             live_bridge = LiveTrainingBridge(run_dir, cfg)
             live_bridge.start()
-    visual_report_bridge = None
-    if cfg.visual_reporter:
-        with profiler.section("setup/visual_reporter_launch"):
-            try:
-                visual_report_bridge = VisualReportBridge(
-                    run_dir,
-                    npz_path=clips[0].path,
-                    interval_seconds=cfg.visual_report_interval_seconds,
-                    device=cfg.visual_report_device,
-                    max_frames=cfg.visual_report_max_frames,
-                )
-                visual_report_bridge.start()
-            except Exception as exc:
-                print(f"visual reporter disabled: {exc}", flush=True)
     with profiler.section("setup/tensorboard_writer"):
         writer = SummaryWriter(run_dir / "tb")
     metadata = {
@@ -2247,8 +2249,6 @@ def train(args: argparse.Namespace) -> None:
         )
     if live_bridge is not None:
         live_bridge.close()
-    if visual_report_bridge is not None:
-        visual_report_bridge.close()
 
 
 def main() -> None:

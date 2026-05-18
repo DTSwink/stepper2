@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import contact_physics as cp
 import train_locomotion as tl
 
 
@@ -41,6 +42,7 @@ class AEConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     cyclic_animation: bool = False
     input_noise_std: float = 0.0
+    input_noise_mask: str = "all"
     std_floor: float = 1e-4
     target_loss_reduction: float = 0.995
     stall_patience_epochs: int = 120
@@ -50,17 +52,57 @@ class AEConfig:
     compatibility_weight: float = 0.0
     compatibility_direction_weight: float = 1.0
     compatibility_temporal_weight: float = 1.0
+    compatibility_statue_weight: float = 0.0
+    compatibility_damped_weight: float = 0.0
+    compatibility_damped_factor: float = 0.35
+    structured_denoise_statue_weight: float = 0.0
+    structured_denoise_damped_weight: float = 0.0
+    structured_denoise_damped_factor: float = 0.35
     compatibility_temporal_min_skip: int = 2
     compatibility_temporal_max_skip: int = 8
     compatibility_hidden_dim: int = 256
     compatibility_num_hidden_layers: int = 2
+    include_transition_foot_motion: bool = False
+    foot_slide_scale_mps: float = 1.0
+    foot_yaw_scale_radps: float = 10.0
+    root_lookahead_steps: int = 0
+    conditional_root_window: bool = False
+    condition_body_dropout_prob: float = 0.0
+
+
+def conditional_transition_indices(schema: dict[str, int], device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    condition: list[int] = []
+    condition.extend(range(0, int(schema["input_dim"])))
+    root_lookahead_dim = int(schema.get("root_lookahead_dim", 0))
+    if root_lookahead_dim > 0:
+        start = int(schema["root_lookahead_start"])
+        condition.extend(range(start, start + root_lookahead_dim))
+    target_start = int(schema["next_output_start"])
+    target_end = int(schema.get("root_lookahead_start", schema["total_dim"]))
+    target = list(range(target_start, target_end))
+    return (
+        torch.tensor(condition, dtype=torch.long, device=device),
+        torch.tensor(target, dtype=torch.long, device=device),
+    )
 
 
 class TransitionAutoencoder(nn.Module):
-    def __init__(self, dim: int, cfg: AEConfig):
+    def __init__(self, dim: int, cfg: AEConfig, schema: dict[str, int] | None = None):
         super().__init__()
+        self.conditional_root_window = bool(getattr(cfg, "conditional_root_window", False))
+        if self.conditional_root_window:
+            if schema is None:
+                raise ValueError("conditional_root_window=True requires a transition schema")
+            condition_indices, target_indices = conditional_transition_indices(schema)
+            self.register_buffer("condition_indices", condition_indices)
+            self.register_buffer("target_indices", target_indices)
+            net_input_dim = int(condition_indices.numel())
+            net_output_dim = int(target_indices.numel())
+        else:
+            net_input_dim = int(dim)
+            net_output_dim = int(dim)
         encoder: list[nn.Module] = []
-        in_dim = dim
+        in_dim = net_input_dim
         for _ in range(cfg.num_hidden_layers):
             encoder += [nn.Linear(in_dim, cfg.hidden_dim), nn.LayerNorm(cfg.hidden_dim), nn.GELU()]
             in_dim = cfg.hidden_dim
@@ -70,7 +112,7 @@ class TransitionAutoencoder(nn.Module):
         for _ in range(cfg.num_hidden_layers):
             decoder += [nn.Linear(in_dim, cfg.hidden_dim), nn.LayerNorm(cfg.hidden_dim), nn.GELU()]
             in_dim = cfg.hidden_dim
-        decoder += [nn.Linear(in_dim, dim)]
+        decoder += [nn.Linear(in_dim, net_output_dim)]
         self.net = nn.Sequential(*(encoder + decoder))
         self.compatibility_head = None
         if cfg.compatibility_weight > 0.0:
@@ -87,7 +129,14 @@ class TransitionAutoencoder(nn.Module):
             self.compatibility_head = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.conditional_root_window:
+            x = x.index_select(-1, self.condition_indices)
         return self.net(x)
+
+    def target(self, x: torch.Tensor) -> torch.Tensor:
+        if self.conditional_root_window:
+            return x.index_select(-1, self.target_indices)
+        return x
 
     def has_compatibility_head(self) -> bool:
         return self.compatibility_head is not None
@@ -112,6 +161,10 @@ def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int
     input_dim, output_dim = tl.make_batch_dims(clip, cfg)
     next_canon_dim = clip.J * 3
     next_velocity_dim = 3 + clip.J * 3
+    transition_foot_motion_dim = 4 if getattr(cfg, "include_transition_foot_motion", False) else 0
+    root_lookahead_dim = max(0, int(getattr(cfg, "root_lookahead_steps", 0))) * 3
+    base_total_dim = input_dim + output_dim + next_canon_dim + next_velocity_dim
+    total_without_root_lookahead = base_total_dim + transition_foot_motion_dim
     return {
         "pose_dim": pose_dim,
         "velocity_dim": velocity_dim,
@@ -119,13 +172,74 @@ def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int
         "output_dim": output_dim,
         "next_canon_dim": next_canon_dim,
         "next_velocity_dim": next_velocity_dim,
-        "total_dim": input_dim + output_dim + next_canon_dim + next_velocity_dim,
+        "transition_foot_motion_dim": transition_foot_motion_dim,
+        "root_lookahead_dim": root_lookahead_dim,
+        "total_dim": total_without_root_lookahead + root_lookahead_dim,
         "input_root_start": pose_dim * 2 + velocity_dim,
         "input_root_end": input_dim,
         "next_output_start": input_dim,
         "next_canon_start": input_dim + output_dim,
         "next_velocity_start": input_dim + output_dim + next_canon_dim,
+        "transition_foot_motion_start": base_total_dim,
+        "root_lookahead_start": total_without_root_lookahead,
     }
+
+
+def transition_foot_motion_features(
+    clip: tl.MotionClip,
+    cur_idx: torch.Tensor,
+    cur_pose: dict[str, torch.Tensor],
+    next_pose: dict[str, torch.Tensor],
+    cfg: tl.TrainConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = tl.root_state(clip, cur_idx + 1, cfg, device)
+    cur_pos, cur_rot, _cur_canon = tl.fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
+    next_pos, next_rot, _next_canon = tl.fk_from_pose(clip, next_root_pos, next_root_rot, next_pose, device)
+    foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
+    toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
+    slide = cp.foot_slide_speeds(
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        foot_indices,
+        toe_indices,
+        clip.fps,
+    )
+    yaw = cp.foot_vertical_yaw_speeds(
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        foot_indices,
+        toe_indices,
+        clip.fps,
+    )
+    slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
+    yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+    return torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1)
+
+
+def root_lookahead_features(
+    clip: tl.MotionClip,
+    cur_idx: torch.Tensor,
+    cfg: tl.TrainConfig,
+    device: torch.device,
+) -> torch.Tensor:
+    steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+    if steps <= 0:
+        return torch.empty((cur_idx.shape[0], 0), dtype=torch.float32, device=device)
+    feats = []
+    for offset in range(1, steps + 1):
+        prev_idx = cur_idx + offset
+        next_idx = cur_idx + offset + 1
+        if not clip.cyclic_animation:
+            prev_idx = torch.clamp(prev_idx, max=clip.T - 1)
+            next_idx = torch.clamp(next_idx, max=clip.T - 1)
+        feats.append(tl.root_delta_feature(clip, prev_idx, next_idx, cfg, device))
+    return torch.cat(feats, dim=-1)
 
 
 def transition_feature_from_next_pose(
@@ -143,16 +257,18 @@ def transition_feature_from_next_pose(
     pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
     joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
     joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
-    return torch.cat(
-        (
-            model_input,
-            next_output,
-            next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
-            pelvis_next_vel,
-            joint_next_vel,
-        ),
-        dim=-1,
-    )
+    parts = [
+        model_input,
+        next_output,
+        next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
+        pelvis_next_vel,
+        joint_next_vel,
+    ]
+    if getattr(cfg, "include_transition_foot_motion", False):
+        parts.append(transition_foot_motion_features(clip, cur_idx, cur_pose, next_pose, cfg, device))
+    if max(0, int(getattr(cfg, "root_lookahead_steps", 0))) > 0:
+        parts.append(root_lookahead_features(clip, cur_idx, cfg, device))
+    return torch.cat(parts, dim=-1)
 
 
 def clean_transition_features(
@@ -240,7 +356,44 @@ def denormalise(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch
 def alteration_mask(schema: dict[str, int], device: torch.device) -> torch.Tensor:
     mask = torch.ones(schema["total_dim"], device=device)
     mask[schema["input_root_start"] : schema["input_root_end"]] = 0.0
+    root_lookahead_dim = int(schema.get("root_lookahead_dim", 0))
+    if root_lookahead_dim > 0:
+        start = int(schema["root_lookahead_start"])
+        mask[start : start + root_lookahead_dim] = 0.0
     return mask
+
+
+def input_noise_mask(schema: dict[str, int], mode: str, device: torch.device) -> torch.Tensor:
+    mode = str(mode).lower()
+    if mode in ("all", "full"):
+        return torch.ones(schema["total_dim"], device=device)
+    if mode in ("nonroot", "body", "body_transition"):
+        return alteration_mask(schema, device)
+    if mode in ("none", "off"):
+        return torch.zeros(schema["total_dim"], device=device)
+    raise ValueError(f"Unknown input_noise_mask={mode!r}. Use all, nonroot, or none.")
+
+
+def apply_condition_body_dropout(
+    x: torch.Tensor,
+    schema: dict[str, int],
+    probability: float,
+) -> torch.Tensor:
+    probability = float(max(0.0, min(1.0, probability)))
+    if probability <= 0.0:
+        return x
+    rows = torch.rand((x.shape[0], 1), dtype=x.dtype, device=x.device) < probability
+    if not bool(rows.any()):
+        return x
+    mask = torch.zeros((1, x.shape[-1]), dtype=torch.bool, device=x.device)
+    input_dim = int(schema["input_dim"])
+    mask[:, :input_dim] = True
+    root_start = int(schema["input_root_start"])
+    root_end = int(schema["input_root_end"])
+    mask[:, root_start:root_end] = False
+    y = x.clone()
+    y[rows.expand_as(y) & mask.expand_as(y)] = 0.0
+    return y
 
 
 def make_statue_tier(x: torch.Tensor, schema: dict[str, int]) -> torch.Tensor:
@@ -280,6 +433,12 @@ def make_statue_tier(x: torch.Tensor, schema: dict[str, int]) -> torch.Tensor:
     return y
 
 
+def make_damped_transition_tier(x: torch.Tensor, schema: dict[str, int], factor: float) -> torch.Tensor:
+    statue = make_statue_tier(x, schema)
+    factor = float(max(0.0, min(1.0, factor)))
+    return statue + factor * (x - statue)
+
+
 def make_tiers(x_norm: torch.Tensor, schema: dict[str, int]) -> dict[str, torch.Tensor]:
     mask = alteration_mask(schema, x_norm.device).unsqueeze(0)
     tier2 = x_norm + 0.05 * torch.randn_like(x_norm) * mask
@@ -305,7 +464,8 @@ def reconstruction_errors(model: nn.Module, x_norm: torch.Tensor, batch_size: in
     for start in range(0, x_norm.shape[0], batch_size):
         batch = x_norm[start : start + batch_size]
         recon = model(batch)
-        values.append(F.mse_loss(recon, batch, reduction="none").mean(dim=-1))
+        target = model.target(batch) if hasattr(model, "target") else batch
+        values.append(F.mse_loss(recon, target, reduction="none").mean(dim=-1))
     return torch.cat(values, dim=0)
 
 
@@ -348,6 +508,11 @@ def sample_direction_negatives(
     root_start = schema["input_root_start"]
     root_end = schema["input_root_end"]
     negative[:, root_start:root_end] = batch[:, root_start:root_end]
+    root_lookahead_dim = int(schema.get("root_lookahead_dim", 0))
+    if root_lookahead_dim > 0:
+        lookahead_start = int(schema["root_lookahead_start"])
+        lookahead_end = lookahead_start + root_lookahead_dim
+        negative[:, lookahead_start:lookahead_end] = batch[:, lookahead_start:lookahead_end]
     return negative
 
 
@@ -356,6 +521,8 @@ def compatibility_bce_loss(
     positive: torch.Tensor,
     direction_negative: torch.Tensor | None,
     temporal_negative: torch.Tensor | None,
+    statue_negative: torch.Tensor | None,
+    damped_negative: torch.Tensor | None,
     cfg: AEConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     zero = positive.new_zeros(())
@@ -364,9 +531,13 @@ def compatibility_bce_loss(
             "compat_pos_loss": zero,
             "compat_direction_loss": zero,
             "compat_temporal_loss": zero,
+            "compat_statue_loss": zero,
+            "compat_damped_loss": zero,
             "compat_pos_acc": zero,
             "compat_direction_acc": zero,
             "compat_temporal_acc": zero,
+            "compat_statue_acc": zero,
+            "compat_damped_acc": zero,
         }
 
     pos_logits = model.compatibility_logits(positive)
@@ -374,8 +545,12 @@ def compatibility_bce_loss(
     total = pos_loss
     direction_loss = zero
     temporal_loss = zero
+    statue_loss = zero
+    damped_loss = zero
     direction_acc = zero
     temporal_acc = zero
+    statue_acc = zero
+    damped_acc = zero
     if direction_negative is not None and cfg.compatibility_direction_weight > 0.0:
         direction_logits = model.compatibility_logits(direction_negative)
         direction_loss = F.binary_cross_entropy_with_logits(direction_logits, torch.zeros_like(direction_logits))
@@ -386,13 +561,27 @@ def compatibility_bce_loss(
         temporal_loss = F.binary_cross_entropy_with_logits(temporal_logits, torch.zeros_like(temporal_logits))
         total = total + cfg.compatibility_temporal_weight * temporal_loss
         temporal_acc = (temporal_logits < 0.0).float().mean()
+    if statue_negative is not None and cfg.compatibility_statue_weight > 0.0:
+        statue_logits = model.compatibility_logits(statue_negative)
+        statue_loss = F.binary_cross_entropy_with_logits(statue_logits, torch.zeros_like(statue_logits))
+        total = total + cfg.compatibility_statue_weight * statue_loss
+        statue_acc = (statue_logits < 0.0).float().mean()
+    if damped_negative is not None and cfg.compatibility_damped_weight > 0.0:
+        damped_logits = model.compatibility_logits(damped_negative)
+        damped_loss = F.binary_cross_entropy_with_logits(damped_logits, torch.zeros_like(damped_logits))
+        total = total + cfg.compatibility_damped_weight * damped_loss
+        damped_acc = (damped_logits < 0.0).float().mean()
     return total, {
         "compat_pos_loss": pos_loss.detach(),
         "compat_direction_loss": direction_loss.detach(),
         "compat_temporal_loss": temporal_loss.detach(),
+        "compat_statue_loss": statue_loss.detach(),
+        "compat_damped_loss": damped_loss.detach(),
         "compat_pos_acc": (pos_logits > 0.0).float().mean().detach(),
         "compat_direction_acc": direction_acc.detach(),
         "compat_temporal_acc": temporal_acc.detach(),
+        "compat_statue_acc": statue_acc.detach(),
+        "compat_damped_acc": damped_acc.detach(),
     }
 
 
@@ -409,6 +598,10 @@ def train(args: argparse.Namespace) -> None:
     tl.apply_cuda_performance_settings(tl.TrainConfig(device=cfg.device), device)
     locomotion_cfg = tl.TrainConfig()
     locomotion_cfg.cyclic_animation = cfg.cyclic_animation
+    locomotion_cfg.include_transition_foot_motion = bool(cfg.include_transition_foot_motion)
+    locomotion_cfg.foot_slide_scale_mps = float(cfg.foot_slide_scale_mps)
+    locomotion_cfg.foot_yaw_scale_radps = float(cfg.foot_yaw_scale_radps)
+    locomotion_cfg.root_lookahead_steps = max(0, int(cfg.root_lookahead_steps))
     clip_specs = tl.clip_specs_from_folders(
         cfg.folder_path,
         cfg.periodic_folder_path or None,
@@ -427,17 +620,35 @@ def train(args: argparse.Namespace) -> None:
         )
     mean = clean.mean(dim=0)
     std = clean.std(dim=0).clamp_min(cfg.std_floor)
+    schema = transition_schema(clips[0], locomotion_cfg)
     x_norm = normalise(clean, mean, std).to(device)
     clip_ids = feature_clip_ids.to(device)
     skip_norm = normalise(skip_features, mean, std).to(device) if skip_features is not None else None
+    statue_norm = None
+    if (
+        (cfg.compatibility_weight > 0.0 and cfg.compatibility_statue_weight > 0.0)
+        or cfg.structured_denoise_statue_weight > 0.0
+    ):
+        statue_norm = normalise(make_statue_tier(clean, schema), mean, std).to(device)
+    damped_norm = None
+    if (
+        (cfg.compatibility_weight > 0.0 and cfg.compatibility_damped_weight > 0.0)
+        or cfg.structured_denoise_damped_weight > 0.0
+    ):
+        denoise_factor = (
+            cfg.structured_denoise_damped_factor
+            if cfg.structured_denoise_damped_weight > 0.0
+            else cfg.compatibility_damped_factor
+        )
+        damped_norm = normalise(make_damped_transition_tier(clean, schema, denoise_factor), mean, std).to(device)
     mean = mean.to(device)
     std = std.to(device)
-    schema = transition_schema(clips[0], locomotion_cfg)
+    noise_mask = input_noise_mask(schema, cfg.input_noise_mask, device).unsqueeze(0)
 
     run_dir = tl.resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
     writer = SummaryWriter(run_dir / "tb")
-    model = TransitionAutoencoder(schema["total_dim"], cfg).to(device)
+    model = TransitionAutoencoder(schema["total_dim"], cfg, schema).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
     print(
@@ -461,6 +672,8 @@ def train(args: argparse.Namespace) -> None:
         loss_sum = torch.zeros((), device=device)
         recon_sum = torch.zeros((), device=device)
         compat_sum = torch.zeros((), device=device)
+        structured_statue_sum = torch.zeros((), device=device)
+        structured_damped_sum = torch.zeros((), device=device)
         compat_parts_sum: dict[str, torch.Tensor] = {}
         loss_count = 0
         for start in range(0, perm.numel(), cfg.batch_size):
@@ -468,9 +681,20 @@ def train(args: argparse.Namespace) -> None:
             batch = x_norm.index_select(0, batch_indices)
             noisy = batch
             if cfg.input_noise_std > 0.0:
-                noisy = batch + cfg.input_noise_std * torch.randn_like(batch)
+                noisy = batch + cfg.input_noise_std * torch.randn_like(batch) * noise_mask
+            if cfg.conditional_root_window and cfg.condition_body_dropout_prob > 0.0:
+                noisy = apply_condition_body_dropout(noisy, schema, cfg.condition_body_dropout_prob)
             recon = model(noisy)
-            recon_loss = F.huber_loss(recon, batch)
+            clean_target = model.target(batch)
+            recon_loss = F.huber_loss(recon, clean_target)
+            structured_statue_loss = torch.zeros((), device=device)
+            if statue_norm is not None and cfg.structured_denoise_statue_weight > 0.0:
+                statue_input = statue_norm.index_select(0, batch_indices)
+                structured_statue_loss = F.huber_loss(model(statue_input), clean_target)
+            structured_damped_loss = torch.zeros((), device=device)
+            if damped_norm is not None and cfg.structured_denoise_damped_weight > 0.0:
+                damped_input = damped_norm.index_select(0, batch_indices)
+                structured_damped_loss = F.huber_loss(model(damped_input), clean_target)
             compat_loss = torch.zeros((), device=device)
             compat_parts: dict[str, torch.Tensor] = {}
             if cfg.compatibility_weight > 0.0:
@@ -479,25 +703,42 @@ def train(args: argparse.Namespace) -> None:
                 if skip_norm is not None:
                     skip_indices = torch.randint(0, skip_norm.shape[0], batch_indices.shape, device=device)
                     temporal_negative = skip_norm.index_select(0, skip_indices)
+                statue_negative = None
+                if statue_norm is not None:
+                    statue_negative = statue_norm.index_select(0, batch_indices)
+                damped_negative = None
+                if damped_norm is not None:
+                    damped_negative = damped_norm.index_select(0, batch_indices)
                 compat_loss, compat_parts = compatibility_bce_loss(
                     model,
                     batch,
                     direction_negative,
                     temporal_negative,
+                    statue_negative,
+                    damped_negative,
                     cfg,
                 )
-            loss = recon_loss + cfg.compatibility_weight * compat_loss
+            loss = (
+                recon_loss
+                + cfg.structured_denoise_statue_weight * structured_statue_loss
+                + cfg.structured_denoise_damped_weight * structured_damped_loss
+                + cfg.compatibility_weight * compat_loss
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             loss_sum = loss_sum + loss.detach()
             recon_sum = recon_sum + recon_loss.detach()
+            structured_statue_sum = structured_statue_sum + structured_statue_loss.detach()
+            structured_damped_sum = structured_damped_sum + structured_damped_loss.detach()
             compat_sum = compat_sum + compat_loss.detach()
             for key, value in compat_parts.items():
                 compat_parts_sum[key] = compat_parts_sum.get(key, torch.zeros((), device=device)) + value
             loss_count += 1
         train_loss = float((loss_sum / max(1, loss_count)).cpu())
         train_recon = float((recon_sum / max(1, loss_count)).cpu())
+        train_structured_statue = float((structured_statue_sum / max(1, loss_count)).cpu())
+        train_structured_damped = float((structured_damped_sum / max(1, loss_count)).cpu())
         train_compat = float((compat_sum / max(1, loss_count)).cpu())
         if baseline is None:
             baseline = train_loss
@@ -530,6 +771,8 @@ def train(args: argparse.Namespace) -> None:
             )
         writer.add_scalar("loss/train", train_loss, epoch)
         writer.add_scalar("loss/reconstruction", train_recon, epoch)
+        writer.add_scalar("loss/structured_denoise_statue", train_structured_statue, epoch)
+        writer.add_scalar("loss/structured_denoise_damped", train_structured_damped, epoch)
         writer.add_scalar("loss/compatibility", train_compat, epoch)
         writer.add_scalar("loss/best", best, epoch)
         for key, value in compat_parts_sum.items():
@@ -556,6 +799,7 @@ def train(args: argparse.Namespace) -> None:
         elif epoch % 10 == 0:
             print(
                 f"epoch={epoch:04d} loss={train_loss:.6g} recon={train_recon:.6g} "
+                f"struct_statue={train_structured_statue:.6g} struct_damped={train_structured_damped:.6g} "
                 f"compat={train_compat:.6g} best={best:.6g} stalls={stalls}",
                 flush=True,
             )

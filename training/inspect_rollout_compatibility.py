@@ -50,7 +50,7 @@ def load_controller(path: Path, clip: tl.MotionClip, cfg: tl.TrainConfig, device
 def load_prior(path: Path, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = tae.AEConfig(**ckpt["config"])
-    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg).to(device)
+    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt
@@ -117,15 +117,17 @@ def candidate_root_slices(
     device: torch.device,
     schema: dict,
     steps: int,
-) -> list[torch.Tensor]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     idx = torch.arange(1, steps + 1, dtype=torch.long, device=device)
     root_start = schema["input_root_start"]
     root_end = schema["input_root_end"]
     roots = []
+    features = []
     for clip in clips:
         clean = tae.clean_transition_features(clip, idx, cfg, device)
+        features.append(clean)
         roots.append(clean[:, root_start:root_end])
-    return roots
+    return roots, features
 
 
 def write_rows(path: Path, rows: list[dict[str, object]], score_fields: list[str]) -> None:
@@ -161,19 +163,24 @@ def main() -> None:
     cfg = tl.TrainConfig()
     cfg.cyclic_animation = args.cyclic_animation
     folder = tl.resolve_path(args.folder_path)
+    prior, prior_ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
+    apply_config_dict(cfg, prior_ckpt.get("locomotion_config", {}))
+    cfg.cyclic_animation = args.cyclic_animation
     clips = tl.load_clips(folder, cfg)
     names = [short_name(clip.path) for clip in clips]
     model, _controller_ckpt = load_controller(tl.resolve_path(args.checkpoint_path), clips[0], cfg, device)
     clips = tl.load_clips(folder, cfg)
-    prior, prior_ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
     mean = prior_ckpt["mean"].to(device)
     std = prior_ckpt["std"].to(device)
     schema = prior_ckpt["schema"]
     root_start = schema["input_root_start"]
     root_end = schema["input_root_end"]
+    root_lookahead_dim = int(schema.get("root_lookahead_dim", 0))
+    root_lookahead_start = int(schema.get("root_lookahead_start", root_end))
+    root_lookahead_end = root_lookahead_start + root_lookahead_dim
 
     steps = min(args.max_steps, min((clip.cyclic_period if cfg.cyclic_animation else clip.T - 1) - 1 for clip in clips))
-    roots = candidate_root_slices(clips, cfg, device, schema, steps)
+    roots, clean_features = candidate_root_slices(clips, cfg, device, schema, steps)
     score_fields = [f"score_{name}" for name in names]
     rows: list[dict[str, object]] = []
 
@@ -183,6 +190,11 @@ def main() -> None:
         for root_slice in roots:
             paired = generated.clone()
             paired[:, root_start:root_end] = root_slice
+            if root_lookahead_dim > 0:
+                source_index = len(scores)
+                paired[:, root_lookahead_start:root_lookahead_end] = clean_features[source_index][
+                    : paired.shape[0], root_lookahead_start:root_lookahead_end
+                ]
             scores.append(float(prior_score(prior, mean, std, paired, args.compatibility_score_weight).mean().cpu()))
         order = sorted(range(len(scores)), key=lambda i: scores[i])
         commanded_rank = order.index(commanded_index) + 1

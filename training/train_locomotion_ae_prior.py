@@ -17,9 +17,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import contact_physics as cp
+import support_envelope as se
 import train_locomotion as tl
 import transition_autoencoder as tae
-from visual_report_bridge import VisualReportBridge
+import window_transition_autoencoder as wae
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -46,8 +47,14 @@ def refresh_live_viewer(args: argparse.Namespace, checkpoint_path: Path) -> None
 
 def load_prior(path: Path, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    if "window_size" in ckpt:
+        model, ckpt = wae.load_window_model(path, device)
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+        return model, ckpt
     cfg = tae.AEConfig(**ckpt["config"])
-    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg).to(device)
+    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     for param in model.parameters():
@@ -55,16 +62,70 @@ def load_prior(path: Path, device: torch.device):
     return model, ckpt
 
 
-def load_prior_bundle(paths: list[Path], device: torch.device):
+def resolve_checkpoint_reference(path_text: str | Path) -> Path:
+    path = Path(path_text)
+    candidates = [path]
+    text = str(path_text).replace("\\", "/")
+    for marker in ("/stepper/", "stepper/"):
+        if marker in text:
+            rel = text.split(marker, 1)[1]
+            candidates.append(PROJECT_ROOT / rel)
+            break
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return tl.resolve_path(str(path_text))
+
+
+def apply_locomotion_config_dict(cfg: tl.TrainConfig, values: dict) -> None:
+    valid = set(tl.TrainConfig.__dataclass_fields__.keys())
+    for key, value in values.items():
+        if key in valid:
+            setattr(cfg, key, value)
+
+
+def load_prior_bundle(paths: list[Path], device: torch.device, weights: list[float] | None = None):
     bundle = []
-    for path in paths:
+    weights = weights or [1.0 for _path in paths]
+    for prior_i, path in enumerate(paths):
         prior, ckpt = load_prior(path, device)
+        weight = float(weights[prior_i])
+        if "window_size" in ckpt:
+            window_size = int(ckpt["window_size"])
+            base_path = resolve_checkpoint_reference(ckpt["base_prior_checkpoint"])
+            base_ckpt = torch.load(base_path, map_location=device, weights_only=False)
+            locomotion_cfg = tl.TrainConfig()
+            apply_locomotion_config_dict(locomotion_cfg, base_ckpt.get("locomotion_config", {}))
+            bundle.append(
+                {
+                    "kind": "window",
+                    "path": path,
+                    "model": prior,
+                    "mean": base_ckpt["mean"].to(device),
+                    "std": base_ckpt["std"].to(device),
+                    "locomotion_config": locomotion_cfg,
+                    "window_size": window_size,
+                    "feature_dim": int(ckpt["feature_dim"]),
+                    "schema": dict(ckpt.get("schema", {})),
+                    "anchor_first_root": bool(ckpt.get("anchor_first_root", False)),
+                    "base_prior_checkpoint": base_path,
+                    "weight": weight,
+                    "label": f"prior_{prior_i}_window_w{window_size:02d}",
+                }
+            )
+            continue
+        locomotion_cfg = tl.TrainConfig()
+        apply_locomotion_config_dict(locomotion_cfg, ckpt.get("locomotion_config", {}))
         bundle.append(
             {
+                "kind": "transition",
                 "path": path,
                 "model": prior,
                 "mean": ckpt["mean"].to(device),
                 "std": ckpt["std"].to(device),
+                "locomotion_config": locomotion_cfg,
+                "weight": weight,
+                "label": f"prior_{prior_i}_transition",
             }
         )
     return bundle
@@ -81,15 +142,50 @@ def ae_score(
 ) -> torch.Tensor:
     x = (features - mean) / std
     recon = prior(x)
+    target = prior.target(x) if hasattr(prior, "target") else x
     if loss_type == "huber":
-        error = F.huber_loss(recon, x, reduction="none", delta=huber_delta)
+        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
     else:
-        error = F.mse_loss(recon, x, reduction="none")
+        error = F.mse_loss(recon, target, reduction="none")
     score = error.mean(dim=-1)
     if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
         compatibility = F.softplus(-prior.compatibility_logits(x))
         score = score + compatibility_weight * compatibility
     return score.mean()
+
+
+def ae_score_normalized(
+    prior,
+    x: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    compatibility_weight: float = 0.0,
+) -> torch.Tensor:
+    recon = prior(x)
+    target = prior.target(x) if hasattr(prior, "target") else x
+    if loss_type == "huber":
+        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
+    else:
+        error = F.mse_loss(recon, target, reduction="none")
+    score = error.mean(dim=-1)
+    if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
+        compatibility = F.softplus(-prior.compatibility_logits(x))
+        score = score + compatibility_weight * compatibility
+    return score.mean()
+
+
+def prior_transition_cfg(prior_info: dict[str, object], fallback_cfg: tl.TrainConfig) -> tl.TrainConfig:
+    cfg = prior_info.get("locomotion_config")
+    return cfg if isinstance(cfg, tl.TrainConfig) else fallback_cfg
+
+
+def transition_feature_root_lookahead_steps(prior_info: dict[str, object], fallback_cfg: tl.TrainConfig) -> int:
+    return max(0, int(getattr(prior_transition_cfg(prior_info, fallback_cfg), "root_lookahead_steps", 0)))
+
+
+def transition_feature_horizon(cfg: tl.TrainConfig) -> int:
+    root_lookahead_steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+    return max(int(cfg.future_window), root_lookahead_steps + 1)
 
 
 class AnyStartDataset(torch.utils.data.Dataset):
@@ -115,7 +211,7 @@ class AnyStartDataset(torch.utils.data.Dataset):
 def clip_future_safe_current_max(clip: tl.MotionClip, cfg: tl.TrainConfig) -> int:
     if clip.cyclic_animation:
         return int(clip.cyclic_period) - 1
-    return int(clip.T) - int(cfg.future_window) - 1
+    return int(clip.T) - transition_feature_horizon(cfg) - 1
 
 
 def clip_any_start_max(clip: tl.MotionClip, cfg: tl.TrainConfig) -> int:
@@ -133,11 +229,12 @@ def clip_sample_start_max(
     if clip.cyclic_animation:
         return int(clip.cyclic_period) - 1
     requested_k = max(1, int(requested_k))
-    full_k_max_start = int(clip.T) - int(cfg.future_window) - requested_k
+    horizon = transition_feature_horizon(cfg)
+    full_k_max_start = int(clip.T) - horizon - requested_k
     max_start = full_k_max_start if full_k_max_start >= 1 else clip_any_start_max(clip, cfg)
     min_cohort_steps = max(1, int(min_cohort_steps))
     if min_cohort_steps > 1:
-        guaranteed_max_start = int(clip.T) - int(cfg.future_window) - min_cohort_steps
+        guaranteed_max_start = int(clip.T) - horizon - min_cohort_steps
         if guaranteed_max_start >= 1:
             max_start = min(max_start, guaranteed_max_start)
     return max_start
@@ -167,6 +264,11 @@ def expected_active_rollout_steps(
 
 def clip_is_idle(clip: tl.MotionClip) -> bool:
     return "idle" in Path(clip.path).stem.lower()
+
+
+def clip_is_turn_in_place(clip: tl.MotionClip) -> bool:
+    stem = Path(clip.path).stem.lower()
+    return "stand_turn" in stem and any(token in stem for token in ("045", "090", "135", "180"))
 
 
 @torch.no_grad()
@@ -204,6 +306,7 @@ def simple_generated_footslide_loss(
     next_pos: torch.Tensor,
     next_rot: torch.Tensor,
     threshold_mps: float,
+    special_tolerance_divisor: float = 1.0,
 ) -> torch.Tensor:
     foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
     toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
@@ -217,13 +320,22 @@ def simple_generated_footslide_loss(
         clip.fps,
     )
     support_speed = speeds.mean(dim=-1) if clip_is_idle(clip) else speeds.amin(dim=-1)
-    return F.relu(support_speed - float(threshold_mps)).mean()
+    threshold = float(threshold_mps)
+    if clip_is_idle(clip) or clip_is_turn_in_place(clip):
+        threshold = threshold / max(1.0, float(special_tolerance_divisor))
+    return F.relu(support_speed - threshold).mean()
 
 
 class PackedClips:
     """Dense multi-clip storage for Isaac-style per-agent random rollouts."""
 
-    def __init__(self, clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device):
+    def __init__(
+        self,
+        clips: list[tl.MotionClip],
+        cfg: tl.TrainConfig,
+        device: torch.device,
+        synthetic_clip_indices: set[int] | None = None,
+    ):
         if not clips:
             raise ValueError("PackedClips needs at least one clip")
         first = clips[0]
@@ -233,6 +345,7 @@ class PackedClips:
         self.clips = clips
         self.cfg = cfg
         self.device = device
+        synthetic_clip_indices = synthetic_clip_indices or set()
         self.prototype = first
         self.J = first.J
         self.Jn = first.Jn
@@ -251,11 +364,17 @@ class PackedClips:
         self.lengths = torch.tensor(lengths, dtype=torch.long, device=device)
         self.periods = torch.tensor([clip.cyclic_period for clip in clips], dtype=torch.long, device=device)
         self.cyclic = torch.tensor([clip.cyclic_animation for clip in clips], dtype=torch.bool, device=device)
+        self.synthetic = torch.tensor(
+            [i in synthetic_clip_indices for i in range(len(clips))],
+            dtype=torch.bool,
+            device=device,
+        )
         self.idle = torch.tensor([clip_is_idle(clip) for clip in clips], dtype=torch.bool, device=device)
+        self.turn_in_place = torch.tensor([clip_is_turn_in_place(clip) for clip in clips], dtype=torch.bool, device=device)
         self.future_safe_max = torch.where(
             self.cyclic,
             self.periods - 1,
-            self.lengths - int(cfg.future_window) - 1,
+            self.lengths - transition_feature_horizon(cfg) - 1,
         )
 
         tensors = [clip.tensors(device) for clip in clips]
@@ -267,6 +386,38 @@ class PackedClips:
         self.canonical_pos = torch.cat([t["canonical_pos"] for t in tensors], dim=0)
         self.contacts = torch.cat([t["contacts"] for t in tensors], dim=0)
         self.local_offsets = torch.stack([t["local_offsets"] for t in tensors], dim=0)
+        self.support_slide_bound_mps: torch.Tensor | None = None
+        self.support_foot_yaw_bound_radps: torch.Tensor | None = None
+        self.support_envelope_metadata: dict[str, float | int | str] = {}
+        if cfg.support_envelope_enabled and (
+            cfg.simple_footslide_loss_weight > 0.0 or cfg.foot_yaw_loss_weight > 0.0
+        ):
+            env_cfg = se.SupportEnvelopeConfig(
+                margin=float(cfg.support_envelope_margin),
+                knn=int(cfg.support_envelope_knn),
+                cache_dir=str(cfg.support_envelope_cache_dir),
+            )
+            real_indices = [i for i in range(len(clips)) if i not in synthetic_clip_indices]
+            envelope = se.load_or_build_support_envelope(
+                clips,
+                cfg,
+                device,
+                synthetic_clip_indices=synthetic_clip_indices,
+                real_clip_indices=real_indices,
+                env_cfg=env_cfg,
+            )
+            self.support_slide_bound_mps = envelope["slide_bound_mps"].to(device)  # type: ignore[union-attr]
+            self.support_foot_yaw_bound_radps = envelope["foot_yaw_bound_radps"].to(device)  # type: ignore[union-attr]
+            self.support_envelope_metadata = envelope["metadata"]  # type: ignore[assignment]
+            print(
+                "support envelope "
+                f"cache_hit={self.support_envelope_metadata.get('cache_hit')} "
+                f"real_transitions={self.support_envelope_metadata.get('source_real_transitions')} "
+                f"targets={self.support_envelope_metadata.get('target_transitions')} "
+                f"max_real_slide={self.support_envelope_metadata.get('max_real_slide_mps'):.6g} "
+                f"max_real_foot_yaw={self.support_envelope_metadata.get('max_real_foot_yaw_radps'):.6g}",
+                flush=True,
+            )
 
         self.root0_pos = torch.stack([t["root_pos"][0] for t in tensors], dim=0)
         self.root0_rot = torch.stack([t["root_rot"][0] for t in tensors], dim=0)
@@ -281,22 +432,124 @@ class PackedClips:
 
         self.stage_clip_indices = torch.arange(len(clips), dtype=torch.long, device=device)
         self.stage_clip_probs = torch.full((len(clips),), 1.0 / len(clips), dtype=torch.float32, device=device)
+        self.real_stage_clip_indices = self.stage_clip_indices
+        self.real_stage_clip_probs = self.stage_clip_probs
+        self.synthetic_stage_clip_indices = torch.empty((0,), dtype=torch.long, device=device)
+        self.synthetic_stage_clip_probs = torch.empty((0,), dtype=torch.float32, device=device)
 
-    def update_stage_sampling(self, indices: list[int], weights: list[float]) -> None:
+    def _set_pool(self, indices: list[int], weights: list[float]) -> tuple[torch.Tensor, torch.Tensor]:
         if not indices:
-            raise ValueError("Packed stage sampling needs at least one clip")
+            return (
+                torch.empty((0,), dtype=torch.long, device=self.device),
+                torch.empty((0,), dtype=torch.float32, device=self.device),
+            )
         idx = torch.tensor(indices, dtype=torch.long, device=self.device)
         w = torch.tensor(weights, dtype=torch.float32, device=self.device).clamp_min(0.0)
         if float(w.sum().detach().cpu()) <= 0.0:
             w = torch.ones_like(w)
-        self.stage_clip_indices = idx
-        self.stage_clip_probs = w / w.sum()
+        return idx, w / w.sum()
 
-    def sample_starts(self, count: int, requested_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-        choices = torch.multinomial(self.stage_clip_probs, int(count), replacement=True)
-        clip_ids = self.stage_clip_indices.index_select(0, choices)
+    def update_stage_sampling(
+        self,
+        indices: list[int],
+        weights: list[float],
+        synthetic_indices: list[int] | None = None,
+        synthetic_weights: list[float] | None = None,
+    ) -> None:
+        if not indices:
+            raise ValueError("Packed stage sampling needs at least one real clip")
+        self.real_stage_clip_indices, self.real_stage_clip_probs = self._set_pool(indices, weights)
+        self.synthetic_stage_clip_indices, self.synthetic_stage_clip_probs = self._set_pool(
+            synthetic_indices or [],
+            synthetic_weights or [],
+        )
+        self.stage_clip_indices = self.real_stage_clip_indices
+        self.stage_clip_probs = self.real_stage_clip_probs
+
+    def _sample_from_pool(
+        self,
+        count: int,
+        requested_k: int,
+        indices: torch.Tensor,
+        probs: torch.Tensor,
+        require_full: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if int(count) <= 0:
+            return (
+                torch.empty((0,), dtype=torch.long, device=self.device),
+                torch.empty((0,), dtype=torch.long, device=self.device),
+            )
+        if indices.numel() == 0:
+            raise ValueError("cannot sample starts from an empty clip pool")
+        if require_full:
+            cyclic = self.cyclic.index_select(0, indices)
+            lengths = self.lengths.index_select(0, indices)
+            full_support = torch.logical_or(
+                cyclic,
+                lengths - transition_feature_horizon(self.cfg) - max(1, int(requested_k)) >= 1,
+            )
+            if not bool(full_support.any()):
+                raise ValueError(f"no clips in this pool support a full K={requested_k} rollout")
+            indices = indices[full_support]
+            probs = probs[full_support]
+            probs = probs / probs.sum().clamp_min(1e-12)
+        choices = torch.multinomial(probs, int(count), replacement=True)
+        clip_ids = indices.index_select(0, choices)
         max_start = self.clip_sample_start_max(clip_ids, requested_k)
-        starts = (torch.rand(int(count), device=self.device) * max_start.float()).floor().long() + 1
+        if int(self.cfg.agent_fixed_start_frame) > 0:
+            starts = torch.minimum(
+                torch.full_like(max_start, int(self.cfg.agent_fixed_start_frame)),
+                max_start,
+            ).clamp_min(1)
+        else:
+            starts = (torch.rand(int(count), device=self.device) * max_start.float()).floor().long() + 1
+        return clip_ids, starts
+
+    def sample_starts(
+        self,
+        count: int,
+        requested_k: int,
+        synthetic: bool = False,
+        require_full: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if synthetic:
+            return self._sample_from_pool(
+                count,
+                requested_k,
+                self.synthetic_stage_clip_indices,
+                self.synthetic_stage_clip_probs,
+                require_full=require_full,
+            )
+        return self._sample_from_pool(
+            count,
+            requested_k,
+            self.real_stage_clip_indices,
+            self.real_stage_clip_probs,
+            require_full=require_full,
+        )
+
+    def sample_starts_for_existing_groups(
+        self,
+        synthetic_mask: torch.Tensor,
+        requested_k: int,
+        require_full: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        synthetic_mask = synthetic_mask.to(self.device).bool()
+        count = int(synthetic_mask.numel())
+        clip_ids = torch.empty((count,), dtype=torch.long, device=self.device)
+        starts = torch.empty((count,), dtype=torch.long, device=self.device)
+        for want_synthetic in (False, True):
+            rows = (synthetic_mask == want_synthetic).nonzero(as_tuple=False).flatten()
+            if rows.numel() == 0:
+                continue
+            new_clip_ids, new_starts = self.sample_starts(
+                int(rows.numel()),
+                requested_k,
+                synthetic=want_synthetic,
+                require_full=require_full,
+            )
+            clip_ids[rows] = new_clip_ids
+            starts[rows] = new_starts
         return clip_ids, starts
 
     def clip_sample_start_max(self, clip_ids: torch.Tensor, requested_k: int) -> torch.Tensor:
@@ -304,12 +557,13 @@ class PackedClips:
         cyclic = self.cyclic.index_select(0, clip_ids)
         period_max = self.periods.index_select(0, clip_ids) - 1
         lengths = self.lengths.index_select(0, clip_ids)
-        any_start_max = lengths - int(self.cfg.future_window) - 1
+        horizon = transition_feature_horizon(self.cfg)
+        any_start_max = lengths - horizon - 1
         requested_k = max(1, int(requested_k))
-        full_k_max = lengths - int(self.cfg.future_window) - requested_k
+        full_k_max = lengths - horizon - requested_k
         max_start = torch.where(full_k_max >= 1, full_k_max, any_start_max)
         min_steps = max(1, int(self.cfg.agent_min_cohort_steps))
-        guaranteed = lengths - int(self.cfg.future_window) - min_steps
+        guaranteed = lengths - horizon - min_steps
         max_start = torch.where(guaranteed >= 1, torch.minimum(max_start, guaranteed), max_start)
         return torch.where(cyclic, period_max, max_start).clamp_min(1)
 
@@ -423,25 +677,56 @@ def packed_build_input(
         ),
         dim=-1,
     )
-    future_feats = []
-    for k in range(1, cfg.future_window + 1):
-        fut_pos, _fut_rot, fut_yaw, _fut_heading = packed.root_state(clip_ids, cur_idx + k)
-        fut_local = torch.matmul((fut_pos - cur_pos).unsqueeze(1), cur_heading).squeeze(1)
-        scale_k = k * cfg.max_speed_scale_final
-        dyaw = tl.wrap_angle(fut_yaw - cur_yaw)
-        future_feats.append(
-            torch.stack(
-                (
-                    torch.clamp(fut_local[:, 0] / scale_k, -2.0, 2.0),
-                    torch.clamp(fut_local[:, 2] / scale_k, -2.0, 2.0),
-                    torch.cos(dyaw),
-                    torch.sin(dyaw),
-                ),
-                dim=-1,
-            )
-        )
-    future_feat = torch.cat(future_feats, dim=-1)
+    future_steps = int(cfg.future_window)
+    future_offsets = torch.arange(1, future_steps + 1, device=cur_idx.device, dtype=cur_idx.dtype)
+    b = cur_idx.shape[0]
+    flat_clip_ids = clip_ids.reshape(b, 1).expand(b, future_steps).reshape(-1)
+    flat_idx = (cur_idx.reshape(b, 1) + future_offsets.reshape(1, future_steps)).reshape(-1)
+    fut_pos, _fut_rot, fut_yaw, _fut_heading = packed.root_state(flat_clip_ids, flat_idx)
+    fut_pos = fut_pos.reshape(b, future_steps, 3)
+    fut_yaw = fut_yaw.reshape(b, future_steps)
+    fut_local = torch.matmul((fut_pos - cur_pos[:, None, :]).unsqueeze(-2), cur_heading[:, None, :, :]).squeeze(-2)
+    scale = future_offsets.to(dtype=fut_local.dtype).reshape(1, future_steps) * cfg.max_speed_scale_final
+    dyaw = tl.wrap_angle(fut_yaw - cur_yaw[:, None])
+    future_feat = torch.stack(
+        (
+            torch.clamp(fut_local[:, :, 0] / scale, -2.0, 2.0),
+            torch.clamp(fut_local[:, :, 2] / scale, -2.0, 2.0),
+            torch.cos(dyaw),
+            torch.sin(dyaw),
+        ),
+        dim=-1,
+    ).reshape(b, future_steps * 4)
     return torch.cat((current, previous, pelvis_vel, joint_vel, root_feat, future_feat), dim=-1)
+
+
+def packed_root_lookahead_features(
+    packed: PackedClips,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    cfg: tl.TrainConfig,
+) -> torch.Tensor:
+    steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+    if steps <= 0:
+        return torch.empty((cur_idx.shape[0], 0), dtype=torch.float32, device=cur_idx.device)
+    b = cur_idx.shape[0]
+    offsets = torch.arange(1, steps + 2, device=cur_idx.device, dtype=cur_idx.dtype)
+    flat_clip_ids = clip_ids.reshape(b, 1).expand(b, steps + 1).reshape(-1)
+    flat_idx = (cur_idx.reshape(b, 1) + offsets.reshape(1, steps + 1)).reshape(-1)
+    pos, _rot, yaw, heading = packed.root_state(flat_clip_ids, flat_idx)
+    pos = pos.reshape(b, steps + 1, 3)
+    yaw = yaw.reshape(b, steps + 1)
+    heading = heading.reshape(b, steps + 1, 3, 3)
+    delta_local = torch.matmul((pos[:, 1:] - pos[:, :-1]).unsqueeze(-2), heading[:, :-1]).squeeze(-2)
+    features = torch.stack(
+        (
+            delta_local[:, :, 0] / cfg.max_speed_scale_final,
+            delta_local[:, :, 2] / cfg.max_speed_scale_final,
+            tl.wrap_angle(yaw[:, 1:] - yaw[:, :-1]) / cfg.max_turn_rate_scale_final,
+        ),
+        dim=-1,
+    )
+    return features.reshape(b, steps * 3)
 
 
 def packed_transition_feature_from_next_pose(
@@ -459,16 +744,135 @@ def packed_transition_feature_from_next_pose(
     pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
     joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
     joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
-    return torch.cat(
-        (
-            model_input,
-            next_output,
-            next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
-            pelvis_next_vel,
-            joint_next_vel,
-        ),
-        dim=-1,
+    parts = [
+        model_input,
+        next_output,
+        next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
+        pelvis_next_vel,
+        joint_next_vel,
+    ]
+    if getattr(cfg, "include_transition_foot_motion", False):
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = packed.root_state(clip_ids, cur_idx)
+        next_root_pos, next_root_rot, _next_yaw, _next_heading = packed.root_state(clip_ids, cur_idx + 1)
+        cur_pos, cur_rot, _cur_canon = packed.fk_from_pose(clip_ids, cur_root_pos, cur_root_rot, cur_pose)
+        next_pos, next_rot, _next_canon = packed.fk_from_pose(clip_ids, next_root_pos, next_root_rot, next_pose)
+        slide = cp.foot_slide_speeds(
+            cur_pos,
+            cur_rot,
+            next_pos,
+            next_rot,
+            packed.foot_indices,
+            packed.toe_indices,
+            packed.fps,
+        )
+        yaw = cp.foot_vertical_yaw_speeds(
+            cur_pos,
+            cur_rot,
+            next_pos,
+            next_rot,
+            packed.foot_indices,
+            packed.toe_indices,
+            packed.fps,
+        )
+        slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
+        yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+        parts.append(torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1))
+    root_lookahead_steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+    if root_lookahead_steps > 0:
+        parts.append(packed_root_lookahead_features(packed, clip_ids, cur_idx, cfg))
+    return torch.cat(parts, dim=-1)
+
+
+def packed_transform_transition_feature_to_anchor(
+    raw: torch.Tensor,
+    packed: PackedClips,
+    clip_ids: torch.Tensor,
+    prev_idx: torch.Tensor,
+    cur_idx: torch.Tensor,
+    next_idx: torch.Tensor,
+    anchor_clip_ids: torch.Tensor,
+    anchor_idx: torch.Tensor,
+    cfg: tl.TrainConfig,
+    schema: dict[str, int],
+) -> torch.Tensor:
+    out = raw.clone()
+    b = raw.shape[0]
+    j_count = int(schema["next_canon_dim"]) // 3
+    pose_dim = int(schema["pose_dim"])
+    velocity_dim = int(schema["velocity_dim"])
+    input_dim = int(schema["input_dim"])
+    next_canon_start = int(schema["next_canon_start"])
+    next_velocity_start = int(schema["next_velocity_start"])
+
+    anchor_pos, _anchor_rot, anchor_yaw, anchor_heading = packed.root_state(anchor_clip_ids, anchor_idx)
+
+    def root_info(row_clip_ids: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pos, _rot, yaw, _heading = packed.root_state(row_clip_ids, idx)
+        return pos, yaw
+
+    def anchor_pose_positions(base: int, row_clip_ids: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        frame_pos, frame_yaw = root_info(row_clip_ids, idx)
+        pelvis_local = raw[:, base : base + 3].reshape(b, 1, 3)
+        pelvis_anchor = wae.anchor_local_positions(pelvis_local, frame_pos, frame_yaw, anchor_pos, anchor_yaw).reshape(b, 3)
+        canon_start = base + 9
+        canon_end = canon_start + j_count * 3
+        canon_local = raw[:, canon_start:canon_end].reshape(b, j_count, 3)
+        canon_anchor = wae.anchor_local_positions(canon_local, frame_pos, frame_yaw, anchor_pos, anchor_yaw)
+        out[:, base : base + 3] = pelvis_anchor
+        out[:, canon_start:canon_end] = canon_anchor.reshape(b, j_count * 3)
+        return pelvis_anchor, canon_anchor
+
+    prev_pelvis, prev_canon = anchor_pose_positions(pose_dim, clip_ids, prev_idx)
+    cur_pelvis, cur_canon = anchor_pose_positions(0, clip_ids, cur_idx)
+
+    velocity_start = pose_dim * 2
+    out[:, velocity_start : velocity_start + 3] = (cur_pelvis - prev_pelvis) / cfg.pose_delta_scale_final
+    out[:, velocity_start + 3 : velocity_start + velocity_dim] = (
+        (cur_canon - prev_canon).reshape(b, j_count * 3) / cfg.pose_delta_scale_final
     )
+
+    prev_root_pos, prev_root_yaw = root_info(clip_ids, prev_idx)
+    cur_root_pos, cur_root_yaw = root_info(clip_ids, cur_idx)
+    root_start = velocity_start + velocity_dim
+    root_delta_anchor = torch.matmul((cur_root_pos - prev_root_pos).unsqueeze(1), anchor_heading).squeeze(1)
+    out[:, root_start] = root_delta_anchor[:, 0] / cfg.max_speed_scale_final
+    out[:, root_start + 1] = root_delta_anchor[:, 2] / cfg.max_speed_scale_final
+    out[:, root_start + 2] = tl.wrap_angle(cur_root_yaw - prev_root_yaw) / cfg.max_turn_rate_scale_final
+
+    future_start = root_start + 3
+    for k in range(1, cfg.future_window + 1):
+        fut_idx = cur_idx + k
+        fut_pos, fut_yaw = root_info(clip_ids, fut_idx)
+        fut_anchor = torch.matmul((fut_pos - anchor_pos).unsqueeze(1), anchor_heading).squeeze(1)
+        horizon_frames = (fut_idx - anchor_idx).to(dtype=raw.dtype).clamp_min(1.0)
+        scale = horizon_frames * cfg.max_speed_scale_final
+        offset = future_start + (k - 1) * 4
+        out[:, offset] = torch.clamp(fut_anchor[:, 0] / scale, -2.0, 2.0)
+        out[:, offset + 1] = torch.clamp(fut_anchor[:, 2] / scale, -2.0, 2.0)
+        dyaw = tl.wrap_angle(fut_yaw - anchor_yaw)
+        out[:, offset + 2] = torch.cos(dyaw)
+        out[:, offset + 3] = torch.sin(dyaw)
+
+    next_output_start = input_dim
+    next_root_pos, next_root_yaw = root_info(clip_ids, next_idx)
+    next_pelvis_local = raw[:, next_output_start : next_output_start + 3].reshape(b, 1, 3)
+    next_pelvis = wae.anchor_local_positions(
+        next_pelvis_local,
+        next_root_pos,
+        next_root_yaw,
+        anchor_pos,
+        anchor_yaw,
+    ).reshape(b, 3)
+    out[:, next_output_start : next_output_start + 3] = next_pelvis
+
+    next_canon = raw[:, next_canon_start : next_canon_start + j_count * 3].reshape(b, j_count, 3)
+    next_canon_anchor = wae.anchor_local_positions(next_canon, next_root_pos, next_root_yaw, anchor_pos, anchor_yaw)
+    out[:, next_canon_start : next_canon_start + j_count * 3] = next_canon_anchor.reshape(b, j_count * 3)
+    out[:, next_velocity_start : next_velocity_start + 3] = (next_pelvis - cur_pelvis) / cfg.pose_delta_scale_final
+    out[:, next_velocity_start + 3 : next_velocity_start + velocity_dim] = (
+        (next_canon_anchor - cur_canon).reshape(b, j_count * 3) / cfg.pose_delta_scale_final
+    )
+    return out
 
 
 def packed_generated_footslide_loss(
@@ -494,6 +898,161 @@ def packed_generated_footslide_loss(
     return F.relu(support_speed - float(threshold_mps)).mean()
 
 
+def packed_support_footslide_speeds(
+    packed: PackedClips,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    clip_ids: torch.Tensor,
+) -> torch.Tensor:
+    speeds = cp.foot_slide_speeds(
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        packed.foot_indices,
+        packed.toe_indices,
+        packed.fps,
+    )
+    idle_mask = packed.idle.index_select(0, clip_ids.to(packed.device).long())
+    return torch.where(idle_mask, speeds.mean(dim=-1), speeds.amin(dim=-1))
+
+
+def packed_envelope_footslide_loss(
+    packed: PackedClips,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    fallback_threshold_mps: float,
+    special_tolerance_divisor: float = 1.0,
+) -> torch.Tensor:
+    support_speed = packed_support_footslide_speeds(
+        packed,
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        clip_ids,
+    )
+    if packed.support_slide_bound_mps is not None:
+        bounds = packed.support_slide_bound_mps.index_select(0, packed.frame_index(clip_ids, cur_idx))
+    else:
+        bounds = torch.full_like(support_speed, float(fallback_threshold_mps))
+    divisor = max(1.0, float(special_tolerance_divisor))
+    if divisor > 1.0:
+        rows = clip_ids.to(packed.device).long()
+        special = torch.logical_or(
+            packed.idle.index_select(0, rows),
+            packed.turn_in_place.index_select(0, rows),
+        )
+        bounds = torch.where(special, bounds / divisor, bounds)
+    return F.relu(support_speed - bounds).mean()
+
+
+def packed_vertical_foot_yaw_loss(
+    packed: PackedClips,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    scale_radps: float,
+) -> torch.Tensor:
+    speeds = cp.foot_vertical_yaw_speeds(
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        packed.foot_indices,
+        packed.toe_indices,
+        packed.fps,
+    ).amax(dim=-1)
+    if packed.support_foot_yaw_bound_radps is None:
+        bounds = torch.zeros_like(speeds)
+    else:
+        bounds = packed.support_foot_yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
+    scale = max(float(scale_radps), 1e-6)
+    return (F.relu(speeds - bounds) / scale).mean()
+
+
+@torch.no_grad()
+def estimate_forward_foot_yaw_scale(
+    model: torch.nn.Module,
+    packed: PackedClips,
+    cfg: tl.TrainConfig,
+    device: torch.device,
+) -> float:
+    """Scale yaw-excess so the current forward-walk checkpoint has max loss 1."""
+    if packed.support_foot_yaw_bound_radps is None:
+        return 1.0
+    candidates = []
+    for ci, clip in enumerate(packed.clips):
+        if bool(packed.synthetic[ci].detach().cpu()):
+            continue
+        stem = Path(clip.path).stem.lower()
+        score = 0
+        if "walk" in stem:
+            score += 1
+        if "loop_f" in stem or stem.endswith("_f") or "forward" in stem:
+            score += 4
+        if "stand" in stem or "idle" in stem or "turn" in stem:
+            score -= 2
+        candidates.append((score, ci))
+    if not candidates:
+        return 1.0
+    _score, clip_id = max(candidates, key=lambda item: item[0])
+    clip = packed.clips[clip_id]
+    max_cur = int(clip.cyclic_period) - 1 if clip.cyclic_animation else int(clip.T) - transition_feature_horizon(cfg) - 1
+    max_cur = max(1, max_cur)
+    clip_ids = torch.tensor([clip_id], dtype=torch.long, device=device)
+    prev_idx = torch.tensor([0], dtype=torch.long, device=device)
+    cur_idx = torch.tensor([1], dtype=torch.long, device=device)
+    prev_pose = packed.get_pose(clip_ids, prev_idx)
+    cur_pose = packed.get_pose(clip_ids, cur_idx)
+    max_excess = torch.zeros((), device=device)
+    was_training = model.training
+    model.eval()
+    for _step in range(max_cur):
+        inp = packed_build_input(packed, clip_ids, prev_idx, cur_idx, prev_pose, cur_pose, cfg)
+        raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
+        pred_pose, _raw_pose = tl.output_to_pose(raw_out, packed.prototype)
+        target_idx = cur_idx + 1
+        root_pos, root_rot, _yaw, _heading = packed.root_state(clip_ids, target_idx)
+        pred_global_pos, pred_global_rot, pred_canon = packed.fk_from_pose(clip_ids, root_pos, root_rot, pred_pose)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = packed.root_state(clip_ids, cur_idx)
+        cur_global_pos, cur_global_rot, _cur_canon = packed.fk_from_pose(clip_ids, cur_root_pos, cur_root_rot, cur_pose)
+        speeds = cp.foot_vertical_yaw_speeds(
+            cur_global_pos,
+            cur_global_rot,
+            pred_global_pos,
+            pred_global_rot,
+            packed.foot_indices,
+            packed.toe_indices,
+            packed.fps,
+        ).amax(dim=-1)
+        bounds = packed.support_foot_yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
+        max_excess = torch.maximum(max_excess, F.relu(speeds - bounds).amax())
+        next_pose = {
+            "pelvis_pos": pred_pose["pelvis_pos"],
+            "pelvis_rot6": pred_pose["pelvis_rot6"],
+            "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
+            "canon_pos": pred_canon,
+            "contacts": pred_pose["contacts"],
+        }
+        prev_pose = cur_pose
+        cur_pose = next_pose
+        prev_idx = cur_idx
+        cur_idx = target_idx
+    model.train(was_training)
+    scale = float(max_excess.detach().cpu())
+    return max(scale, 1e-6)
+
+
 def run_batch_ae_truncated(
     model: torch.nn.Module,
     priors: list[dict[str, object]],
@@ -506,6 +1065,8 @@ def run_batch_ae_truncated(
     compatibility_score_weight: float = 0.0,
     reset_sampler=None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if any(prior_info.get("kind") == "window" for prior_info in priors):
+        raise NotImplementedError("Window AE priors currently require --packed-agent-rollout.")
     clip_indices, starts = batch[0], batch[1]
     init_clip_indices = batch[2] if len(batch) >= 4 else None
     init_starts = batch[3] if len(batch) >= 4 else None
@@ -660,15 +1221,21 @@ def run_batch_ae_truncated(
                 "canon_pos": pred_canon,
                 "contacts": pred_pose["contacts"],
             }
-            features = tae.transition_feature_from_next_pose(
-                clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
-            )
             prior_scores = [
                 ae_score(
                     prior_info["model"],
                     prior_info["mean"],
                     prior_info["std"],
-                    features[active],
+                    tae.transition_feature_from_next_pose(
+                        clip,
+                        prev_idx,
+                        cur_idx,
+                        prev_pose,
+                        cur_pose,
+                        next_pose,
+                        prior_transition_cfg(prior_info, cfg),
+                        device,
+                    )[active],
                     cfg.ae_score_loss,
                     cfg.ae_huber_delta,
                     compatibility_score_weight,
@@ -686,6 +1253,7 @@ def run_batch_ae_truncated(
                     pred_global_pos[active],
                     pred_global_rot[active],
                     cfg.simple_footslide_threshold_mps,
+                    cfg.turn_idle_footslide_tolerance_divisor,
                 )
                 step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
             term_mask = torch.zeros(cur_idx.shape[0], dtype=torch.bool, device=device)
@@ -718,11 +1286,22 @@ def run_batch_ae_truncated(
             scores.append(score.detach())
             if cfg.simple_footslide_loss_weight > 0.0:
                 footslide_losses.append(simple_slide_loss.detach())
-            motion_sizes.append((next_pose["canon_pos"][active] - cur_pose["canon_pos"][active]).square().mean().sqrt().detach())
+            motion_sizes.append(
+                (next_pose["canon_pos"][active].detach() - cur_pose["canon_pos"][active].detach())
+                .square()
+                .mean()
+                .sqrt()
+            )
             if compute_diagnostics:
                 target_pose = tl.get_pose_from_clip(clip, target_idx[active], device)
                 target_global_pos, _target_global_rot = tl.global_from_clip(clip, target_idx[active], cfg, device)
-                joint_rmses.append((pred_global_pos[active] - target_global_pos).square().sum(dim=-1).mean().sqrt().detach())
+                joint_rmses.append(
+                    (pred_global_pos[active].detach() - target_global_pos.detach())
+                    .square()
+                    .sum(dim=-1)
+                    .mean()
+                    .sqrt()
+                )
                 ee_idx = tensors["end_effectors"]
                 ee_rmses.append(
                     (
@@ -812,6 +1391,8 @@ def run_batch_ae_resetting(
     compute_diagnostics: bool = True,
     compatibility_score_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    if any(prior_info.get("kind") == "window" for prior_info in priors):
+        raise NotImplementedError("Window AE priors currently require --packed-agent-rollout.")
     clip_indices, starts = batch[0].long().cpu(), batch[1].long().cpu()
     init_clip_indices = batch[2].long().cpu() if len(batch) >= 4 else None
     init_starts = batch[3].long().cpu() if len(batch) >= 4 else None
@@ -944,22 +1525,21 @@ def run_batch_ae_resetting(
                 "canon_pos": pred_canon,
                 "contacts": pred_pose["contacts"],
             }
-            features = tae.transition_feature_from_next_pose(
-                clip,
-                local_prev_idx,
-                local_cur_idx,
-                local_prev_pose,
-                local_cur_pose,
-                next_pose,
-                cfg,
-                device,
-            )
             prior_scores = [
                 ae_score(
                     prior_info["model"],
                     prior_info["mean"],
                     prior_info["std"],
-                    features,
+                    tae.transition_feature_from_next_pose(
+                        clip,
+                        local_prev_idx,
+                        local_cur_idx,
+                        local_prev_pose,
+                        local_cur_pose,
+                        next_pose,
+                        prior_transition_cfg(prior_info, cfg),
+                        device,
+                    ),
                     cfg.ae_score_loss,
                     cfg.ae_huber_delta,
                     compatibility_score_weight,
@@ -981,6 +1561,7 @@ def run_batch_ae_resetting(
                     pred_global_pos,
                     pred_global_rot,
                     cfg.simple_footslide_threshold_mps,
+                    cfg.turn_idle_footslide_tolerance_divisor,
                 )
                 step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
                 footslide_values.append(simple_slide_loss.detach() * n_rows)
@@ -1015,13 +1596,26 @@ def run_batch_ae_resetting(
             step_count += n_rows
             score_values.append(score.detach() * n_rows)
             score_counts.append(n_rows)
-            motion_values.append((next_pose["canon_pos"] - local_cur_pose["canon_pos"]).square().mean().sqrt().detach() * n_rows)
+            motion_values.append(
+                (next_pose["canon_pos"].detach() - local_cur_pose["canon_pos"].detach())
+                .square()
+                .mean()
+                .sqrt()
+                * n_rows
+            )
             motion_counts.append(n_rows)
             if compute_diagnostics:
                 tensors = clip.tensors(device)
                 target_pose = tl.get_pose_from_clip(clip, local_target_idx, device)
                 target_global_pos, _target_global_rot = tl.global_from_clip(clip, local_target_idx, cfg, device)
-                joint_values.append((pred_global_pos - target_global_pos).square().sum(dim=-1).mean().sqrt().detach() * n_rows)
+                joint_values.append(
+                    (pred_global_pos.detach() - target_global_pos.detach())
+                    .square()
+                    .sum(dim=-1)
+                    .mean()
+                    .sqrt()
+                    * n_rows
+                )
                 joint_counts.append(n_rows)
                 ee_idx = tensors["end_effectors"]
                 ee_values.append(
@@ -1074,8 +1668,16 @@ def run_batch_ae_packed(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     clip_ids = batch[0].long().to(device)
     starts = batch[1].long().to(device)
-    init_clip_ids = batch[2].long().to(device) if len(batch) >= 4 else None
-    init_starts = batch[3].long().to(device) if len(batch) >= 4 else None
+    init_clip_ids = None
+    init_starts = None
+    episode_lengths = None
+    if len(batch) == 3:
+        episode_lengths = batch[2].long().to(device).clamp(1, int(rollout_k))
+    elif len(batch) >= 4:
+        init_clip_ids = batch[2].long().to(device)
+        init_starts = batch[3].long().to(device)
+        if len(batch) >= 5:
+            episode_lengths = batch[4].long().to(device).clamp(1, int(rollout_k))
     prev_idx = starts - 1
     cur_idx = starts.clone()
     if init_clip_ids is None or init_starts is None:
@@ -1092,27 +1694,76 @@ def run_batch_ae_packed(
     ee_values: list[torch.Tensor] = []
     output_values: list[torch.Tensor] = []
     footslide_values: list[torch.Tensor] = []
+    foot_yaw_values: list[torch.Tensor] = []
+    motion_floor_values: list[torch.Tensor] = []
+    prior_raw_values: dict[str, list[torch.Tensor]] = {
+        str(prior_info.get("label", f"prior_{i}")): []
+        for i, prior_info in enumerate(priors)
+    }
+    prior_weighted_values: dict[str, list[torch.Tensor]] = {
+        str(prior_info.get("label", f"prior_{i}")): []
+        for i, prior_info in enumerate(priors)
+    }
+    transition_priors = [prior_info for prior_info in priors if prior_info.get("kind") != "window"]
+    window_priors = [prior_info for prior_info in priors if prior_info.get("kind") == "window"]
+    window_buffers: list[list[torch.Tensor]] = [[] for _prior_info in window_priors]
+    window_clip_buffers: list[list[torch.Tensor]] = [[] for _prior_info in window_priors]
+    window_prev_idx_buffers: list[list[torch.Tensor]] = [[] for _prior_info in window_priors]
+    window_cur_idx_buffers: list[list[torch.Tensor]] = [[] for _prior_info in window_priors]
+    window_next_idx_buffers: list[list[torch.Tensor]] = [[] for _prior_info in window_priors]
+    window_valid_counts = [
+        torch.zeros_like(clip_ids, dtype=torch.long, device=device)
+        for _prior_info in window_priors
+    ]
+    if transition_priors:
+        ae_denominator = max(1, int(rollout_k))
+    elif window_priors:
+        min_window = min(int(prior_info["window_size"]) for prior_info in window_priors)
+        ae_denominator = max(1, int(rollout_k) - min_window + 1)
+    else:
+        ae_denominator = max(1, int(rollout_k))
 
-    def reset_rows(mask: torch.Tensor, remaining_steps: int) -> None:
+    def reset_rows(mask: torch.Tensor, requested_steps: int | torch.Tensor) -> None:
         nonlocal clip_ids, prev_idx, cur_idx, prev_pose, cur_pose
-        if not bool(mask.any()) or remaining_steps <= 0:
+        if not bool(mask.any()):
             return
         rows = mask.nonzero(as_tuple=False).flatten()
-        new_clip_ids, new_starts = packed.sample_starts(int(rows.numel()), max(1, int(remaining_steps)))
-        new_prev_pose = packed.get_pose(new_clip_ids, new_starts - 1)
-        new_cur_pose = packed.get_pose(new_clip_ids, new_starts)
-        clip_ids[rows] = new_clip_ids
-        prev_idx[rows] = new_starts - 1
-        cur_idx[rows] = new_starts
-        for key in prev_pose:
-            replaced_prev = prev_pose[key].clone()
-            replaced_cur = cur_pose[key].clone()
-            replaced_prev[rows] = new_prev_pose[key]
-            replaced_cur[rows] = new_cur_pose[key]
-            prev_pose[key] = replaced_prev
-            cur_pose[key] = replaced_cur
+        if isinstance(requested_steps, torch.Tensor):
+            row_requested = requested_steps.index_select(0, rows).clamp_min(1)
+        else:
+            row_requested = torch.full((rows.numel(),), max(1, int(requested_steps)), dtype=torch.long, device=device)
+        for requested in torch.unique(row_requested).tolist():
+            requested_int = max(1, int(requested))
+            sub = rows[row_requested == requested_int]
+            if sub.numel() == 0:
+                continue
+            row_synthetic = packed.synthetic.index_select(0, clip_ids.index_select(0, sub))
+            new_clip_ids, new_starts = packed.sample_starts_for_existing_groups(
+                row_synthetic,
+                requested_int,
+                require_full=episode_lengths is not None,
+            )
+            new_prev_pose = packed.get_pose(new_clip_ids, new_starts - 1)
+            new_cur_pose = packed.get_pose(new_clip_ids, new_starts)
+            clip_ids[sub] = new_clip_ids
+            prev_idx[sub] = new_starts - 1
+            cur_idx[sub] = new_starts
+            for key in prev_pose:
+                replaced_prev = prev_pose[key].clone()
+                replaced_cur = cur_pose[key].clone()
+                replaced_prev[sub] = new_prev_pose[key]
+                replaced_cur[sub] = new_cur_pose[key]
+                prev_pose[key] = replaced_prev
+                cur_pose[key] = replaced_cur
+        for valid_counts in window_valid_counts:
+            valid_counts[rows] = 0
 
     for step in range(int(rollout_k)):
+        if episode_lengths is not None and step > 0:
+            boundary = torch.remainder(torch.full_like(episode_lengths, step), episode_lengths) == 0
+            if bool(boundary.any()):
+                remaining = torch.full_like(episode_lengths, int(rollout_k) - step)
+                reset_rows(boundary, torch.minimum(episode_lengths, remaining).clamp_min(1))
         if step > 0:
             safe_max = packed.future_safe_max.index_select(0, clip_ids)
             expired = torch.logical_and(~packed.cyclic.index_select(0, clip_ids), cur_idx > safe_max)
@@ -1131,52 +1782,208 @@ def run_batch_ae_packed(
             "canon_pos": pred_canon,
             "contacts": pred_pose["contacts"],
         }
-        features = packed_transition_feature_from_next_pose(
-            packed,
-            clip_ids,
-            prev_idx,
-            cur_idx,
-            prev_pose,
-            cur_pose,
-            next_pose,
-            cfg,
-        )
-        prior_scores = [
-            ae_score(
+        prior_scores: list[tuple[torch.Tensor, float, str]] = []
+        for prior_info in transition_priors:
+            raw_score = ae_score(
                 prior_info["model"],
                 prior_info["mean"],
                 prior_info["std"],
-                features,
+                packed_transition_feature_from_next_pose(
+                    packed,
+                    clip_ids,
+                    prev_idx,
+                    cur_idx,
+                    prev_pose,
+                    cur_pose,
+                    next_pose,
+                    prior_transition_cfg(prior_info, cfg),
+                ),
                 cfg.ae_score_loss,
                 cfg.ae_huber_delta,
                 compatibility_score_weight,
             )
-            for prior_info in priors
-        ]
-        score = torch.stack(prior_scores).mean()
-        step_loss = cfg.ae_loss_weight * score
+            prior_scores.append(
+                (
+                    raw_score,
+                    float(prior_info.get("weight", 1.0)),
+                    str(prior_info.get("label", "transition")),
+                )
+            )
+        for prior_i, prior_info in enumerate(window_priors):
+            features = packed_transition_feature_from_next_pose(
+                packed,
+                clip_ids,
+                prev_idx,
+                cur_idx,
+                prev_pose,
+                cur_pose,
+                next_pose,
+                prior_transition_cfg(prior_info, cfg),
+            )
+            window_size = int(prior_info["window_size"])
+            if bool(prior_info.get("anchor_first_root", False)):
+                window_buffers[prior_i].append(features)
+                window_clip_buffers[prior_i].append(clip_ids.detach().clone())
+                window_prev_idx_buffers[prior_i].append(prev_idx.detach().clone())
+                window_cur_idx_buffers[prior_i].append(cur_idx.detach().clone())
+                window_next_idx_buffers[prior_i].append((cur_idx + 1).detach().clone())
+            else:
+                x = (features - prior_info["mean"]) / prior_info["std"]
+                window_buffers[prior_i].append(x)
+            if len(window_buffers[prior_i]) > window_size:
+                window_buffers[prior_i] = window_buffers[prior_i][-window_size:]
+                window_clip_buffers[prior_i] = window_clip_buffers[prior_i][-window_size:]
+                window_prev_idx_buffers[prior_i] = window_prev_idx_buffers[prior_i][-window_size:]
+                window_cur_idx_buffers[prior_i] = window_cur_idx_buffers[prior_i][-window_size:]
+                window_next_idx_buffers[prior_i] = window_next_idx_buffers[prior_i][-window_size:]
+            window_valid_counts[prior_i] = window_valid_counts[prior_i] + 1
+            if len(window_buffers[prior_i]) >= window_size:
+                ready = window_valid_counts[prior_i] >= window_size
+                if bool(ready.any()):
+                    if bool(prior_info.get("anchor_first_root", False)):
+                        schema = dict(prior_info.get("schema", {}))
+                        if not schema:
+                            raise ValueError(f"Anchored window prior {prior_info.get('path')} is missing schema metadata.")
+                        anchor_clip_ids = window_clip_buffers[prior_i][-window_size][ready]
+                        anchor_idx = window_cur_idx_buffers[prior_i][-window_size][ready]
+                        parts = []
+                        for raw_part, clip_part, prev_part, cur_part, next_part in zip(
+                            window_buffers[prior_i][-window_size:],
+                            window_clip_buffers[prior_i][-window_size:],
+                            window_prev_idx_buffers[prior_i][-window_size:],
+                            window_cur_idx_buffers[prior_i][-window_size:],
+                            window_next_idx_buffers[prior_i][-window_size:],
+                        ):
+                            anchored = packed_transform_transition_feature_to_anchor(
+                                raw_part[ready],
+                                packed,
+                                clip_part[ready],
+                                prev_part[ready],
+                                cur_part[ready],
+                                next_part[ready],
+                                anchor_clip_ids,
+                                anchor_idx,
+                                prior_transition_cfg(prior_info, cfg),
+                                schema,
+                            )
+                            parts.append((anchored - prior_info["mean"]) / prior_info["std"])
+                        window_x = torch.cat(parts, dim=-1)
+                    else:
+                        window_x = torch.cat([part[ready] for part in window_buffers[prior_i][-window_size:]], dim=-1)
+                    raw_score = ae_score_normalized(
+                        prior_info["model"],
+                        window_x,
+                        cfg.ae_score_loss,
+                        cfg.ae_huber_delta,
+                        compatibility_score_weight,
+                    )
+                    raw_score = raw_score * ready.float().mean()
+                    prior_scores.append(
+                        (
+                            raw_score,
+                            float(prior_info.get("weight", 1.0)),
+                            str(prior_info.get("label", f"window_w{window_size:02d}")),
+                        )
+                    )
+        score = (
+            torch.stack([raw_score * weight for raw_score, weight, _label in prior_scores]).sum()
+            if prior_scores
+            else torch.zeros((), device=device)
+        )
+        if prior_scores:
+            total_loss = total_loss + cfg.ae_loss_weight * score / ae_denominator
+            for raw_score, weight, label in prior_scores:
+                prior_raw_values.setdefault(label, []).append(raw_score.detach())
+                prior_weighted_values.setdefault(label, []).append((raw_score * weight).detach())
+        step_loss = torch.zeros((), device=device)
         simple_slide_loss = torch.zeros((), device=device)
-        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = packed.root_state(clip_ids, cur_idx)
-        cur_global_pos, cur_global_rot, _cur_canon = packed.fk_from_pose(clip_ids, cur_root_pos, cur_root_rot, cur_pose)
+        needs_current_global = cfg.simple_footslide_loss_weight > 0.0 or cfg.foot_yaw_loss_weight > 0.0
+        cur_global_pos: torch.Tensor | None = None
+        cur_global_rot: torch.Tensor | None = None
+        if needs_current_global:
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = packed.root_state(clip_ids, cur_idx)
+            cur_global_pos, cur_global_rot, _cur_canon = packed.fk_from_pose(
+                clip_ids,
+                cur_root_pos,
+                cur_root_rot,
+                cur_pose,
+            )
         if cfg.simple_footslide_loss_weight > 0.0:
-            simple_slide_loss = packed_generated_footslide_loss(
+            assert cur_global_pos is not None and cur_global_rot is not None
+            simple_slide_loss = packed_envelope_footslide_loss(
                 packed,
                 cur_global_pos,
                 cur_global_rot,
                 pred_global_pos,
                 pred_global_rot,
-                cfg.simple_footslide_threshold_mps,
                 clip_ids,
+                cur_idx,
+                cfg.simple_footslide_threshold_mps,
+                cfg.turn_idle_footslide_tolerance_divisor,
             )
             step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
+        foot_yaw_loss = torch.zeros((), device=device)
+        if cfg.foot_yaw_loss_weight > 0.0:
+            assert cur_global_pos is not None and cur_global_rot is not None
+            foot_yaw_loss = packed_vertical_foot_yaw_loss(
+                packed,
+                cur_global_pos,
+                cur_global_rot,
+                pred_global_pos,
+                pred_global_rot,
+                clip_ids,
+                cur_idx,
+                cfg.foot_yaw_loss_scale_radps,
+            )
+            step_loss = step_loss + cfg.foot_yaw_loss_weight * foot_yaw_loss
+        motion_floor_loss = torch.zeros((), device=device)
+        if cfg.motion_floor_loss_weight > 0.0:
+            motion_schema = tae.transition_schema(packed.prototype, cfg)
+            source_cur_pose_for_motion = packed.get_pose(clip_ids, cur_idx)
+            source_prev_pose_for_motion = packed.get_pose(clip_ids, prev_idx)
+            target_pose_for_motion = packed.get_pose(clip_ids, target_idx)
+            generated_features_for_motion = packed_transition_feature_from_next_pose(
+                packed,
+                clip_ids,
+                prev_idx,
+                cur_idx,
+                prev_pose,
+                cur_pose,
+                next_pose,
+                cfg,
+            )
+            target_features_for_motion = packed_transition_feature_from_next_pose(
+                packed,
+                clip_ids,
+                prev_idx,
+                cur_idx,
+                source_prev_pose_for_motion,
+                source_cur_pose_for_motion,
+                target_pose_for_motion,
+                cfg,
+            )
+            motion_start = int(motion_schema["next_velocity_start"])
+            motion_end = int(motion_schema["transition_foot_motion_start"])
+            generated_motion = generated_features_for_motion[:, motion_start:motion_end].square().mean(dim=-1).sqrt()
+            target_motion = target_features_for_motion[:, motion_start:motion_end].square().mean(dim=-1).sqrt().detach()
+            motion_floor_loss = F.relu(cfg.motion_floor_margin * target_motion - generated_motion).mean()
+            step_loss = step_loss + cfg.motion_floor_loss_weight * motion_floor_loss
 
         if cfg.enable_contact_physics_losses:
             raise NotImplementedError("Packed AE rollouts currently require --no-contact-physics-losses")
 
         total_loss = total_loss + step_loss / max(1, int(rollout_k))
-        score_values.append(score.detach())
+        if prior_scores:
+            score_values.append(score.detach())
         footslide_values.append(simple_slide_loss.detach())
-        motion_values.append((next_pose["canon_pos"] - cur_pose["canon_pos"]).square().mean().sqrt().detach())
+        foot_yaw_values.append(foot_yaw_loss.detach())
+        motion_floor_values.append(motion_floor_loss.detach())
+        motion_values.append(
+            (next_pose["canon_pos"].detach() - cur_pose["canon_pos"].detach())
+            .square()
+            .mean()
+            .sqrt()
+        )
         if compute_diagnostics:
             target_pose = packed.get_pose(clip_ids, target_idx)
             target_root_pos, target_root_rot, _target_yaw, _target_heading = packed.root_state(clip_ids, target_idx)
@@ -1186,7 +1993,13 @@ def run_batch_ae_packed(
                 target_root_rot,
                 target_pose,
             )
-            joint_values.append((pred_global_pos - target_global_pos).square().sum(dim=-1).mean().sqrt().detach())
+            joint_values.append(
+                (pred_global_pos.detach() - target_global_pos.detach())
+                .square()
+                .sum(dim=-1)
+                .mean()
+                .sqrt()
+            )
             ee_idx = packed.prototype.end_effectors_tensor.to(device)
             ee_values.append(
                 (
@@ -1221,7 +2034,11 @@ def run_batch_ae_packed(
         "ee_rmse": mean_metric(ee_values),
         "output_mse": mean_metric(output_values),
         "simple_footslide": mean_metric(footslide_values),
+        "foot_yaw": mean_metric(foot_yaw_values),
+        "motion_floor": mean_metric(motion_floor_values),
         "active_fraction": 1.0,
+        **{f"ae_raw/{label}": mean_metric(values) for label, values in prior_raw_values.items()},
+        **{f"ae_weighted/{label}": mean_metric(values) for label, values in prior_weighted_values.items()},
     }
 
 
@@ -1294,7 +2111,9 @@ def train(args: argparse.Namespace) -> None:
     cfg.gradient_accumulation_batches = max(1, int(args.gradient_accumulation_batches))
     cfg.periodic_sampling_weight = max(0.0, float(args.periodic_sampling_weight))
     cfg.nonperiodic_sampling_weight = max(0.0, float(args.nonperiodic_sampling_weight))
+    cfg.synthetic_agent_fraction = min(1.0, max(0.0, float(args.synthetic_agent_fraction)))
     cfg.init_pose_sampling = args.init_pose_sampling
+    cfg.agent_fixed_start_frame = max(0, int(args.agent_fixed_start_frame))
     cfg.enable_contact_physics_losses = not args.no_contact_physics_losses
     cfg.enable_early_termination = args.enable_early_termination
     cfg.restart_on_termination = not args.no_restart_on_termination
@@ -1314,23 +2133,85 @@ def train(args: argparse.Namespace) -> None:
     cfg.simple_footslide_loss_weight = args.simple_footslide_loss_weight
     cfg.simple_footslide_threshold_mps = args.simple_footslide_threshold_mps
     cfg.simple_footslide_gt_margin = args.simple_footslide_gt_margin
+    cfg.turn_idle_footslide_tolerance_divisor = max(1.0, float(args.turn_idle_footslide_tolerance_divisor))
+    cfg.support_envelope_enabled = bool(args.support_envelope)
+    cfg.support_envelope_knn = max(1, int(args.support_envelope_knn))
+    cfg.support_envelope_margin = float(args.support_envelope_margin)
+    cfg.support_envelope_cache_dir = str(args.support_envelope_cache_dir)
+    cfg.foot_yaw_loss_weight = float(args.foot_yaw_loss_weight)
+    cfg.foot_yaw_loss_scale_radps = max(0.0, float(args.foot_yaw_loss_scale_radps))
+    cfg.foot_yaw_loss_scale_checkpoint = str(args.foot_yaw_loss_scale_checkpoint or "")
+    cfg.motion_floor_loss_weight = max(0.0, float(args.motion_floor_loss_weight))
+    cfg.motion_floor_margin = max(0.0, float(args.motion_floor_margin))
     cfg.timed_checkpoint_interval_minutes = max(0.0, float(args.timed_checkpoint_interval_minutes))
     if cfg.init_pose_sampling != "same_clip" and cfg.training_loop != "agents":
         raise ValueError("--init-pose-sampling random_dataset currently requires --training-loop agents")
+    will_use_packed_rollout = (
+        args.packed_agent_rollout
+        and cfg.training_loop == "agents"
+        and cfg.agent_sampling == "random"
+        and args.agent_batch_clips != 1
+        and not cfg.enable_contact_physics_losses
+    )
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
     tl.apply_cuda_performance_settings(cfg, device)
     profiler = tl.TimingProfiler(args.profile_timing, device, args.profile_sync_cuda)
 
-    clip_specs = tl.clip_specs_from_folders(args.folder_path, args.periodic_folder_path, args.nonperiodic_folder_path)
+    real_clip_specs = tl.clip_specs_from_folders(args.folder_path, args.periodic_folder_path, args.nonperiodic_folder_path)
+    synthetic_clip_specs = [(folder, False) for folder in tl.parse_path_list(args.synthetic_folder_path)]
+    real_clip_count = sum(
+        len(list(tl.npz_folder_from_path(folder).glob("*.npz")))
+        for folder, _cyclic in real_clip_specs
+    )
+    synthetic_clip_count = sum(
+        len(list(tl.npz_folder_from_path(folder).glob("*.npz")))
+        for folder, _cyclic in synthetic_clip_specs
+    )
+    if cfg.synthetic_agent_fraction > 0.0 and synthetic_clip_count <= 0:
+        raise ValueError("--synthetic-agent-fraction > 0 requires --synthetic-folder-path with .npz files")
+    clip_specs = real_clip_specs + synthetic_clip_specs
+    synthetic_clip_indices = set(range(real_clip_count, real_clip_count + synthetic_clip_count))
+    real_clip_indices = [i for i in range(real_clip_count)]
     with profiler.section("setup/load_npz_and_prior"):
         clips = tl.load_clips_from_specs(clip_specs, cfg)
+        if real_clip_count <= 0:
+            raise ValueError("At least one real/non-synthetic clip is required")
         prior_paths = [tl.resolve_path(args.prior_checkpoint)]
         prior_paths.extend(tl.resolve_path(path) for path in args.extra_prior_checkpoint)
-        priors = load_prior_bundle(prior_paths, device)
-        if cfg.simple_footslide_loss_weight > 0.0 and cfg.simple_footslide_threshold_mps <= 0.0:
+        if len(args.extra_prior_weight) > len(args.extra_prior_checkpoint):
+            raise ValueError("--extra-prior-weight was provided more times than --extra-prior-checkpoint")
+        prior_weights = [float(args.prior_weight)]
+        prior_weights.extend(float(weight) for weight in args.extra_prior_weight)
+        while len(prior_weights) < len(prior_paths):
+            prior_weights.append(1.0)
+        priors = load_prior_bundle(prior_paths, device, prior_weights)
+        print(
+            "AE priors: "
+            + ", ".join(
+                f"{prior_info.get('label')} weight={float(prior_info.get('weight', 1.0)):.6g} "
+                f"path={prior_info.get('path')}"
+                for prior_info in priors
+            ),
+            flush=True,
+        )
+        max_prior_root_lookahead = max(
+            [max(0, int(getattr(prior_transition_cfg(prior_info, cfg), "root_lookahead_steps", 0))) for prior_info in priors]
+            or [0]
+        )
+        if max_prior_root_lookahead > max(0, int(getattr(cfg, "root_lookahead_steps", 0))):
+            cfg.root_lookahead_steps = max_prior_root_lookahead
+            print(
+                f"transition feature horizon uses root_lookahead_steps={cfg.root_lookahead_steps} from AE prior",
+                flush=True,
+            )
+        if (
+            cfg.simple_footslide_loss_weight > 0.0
+            and cfg.simple_footslide_threshold_mps <= 0.0
+            and not (cfg.support_envelope_enabled and will_use_packed_rollout)
+        ):
             cfg.simple_footslide_threshold_mps = compute_groundtruth_support_slide_threshold(
-                clips,
+                clips[:real_clip_count],
                 cfg,
                 device,
                 cfg.simple_footslide_gt_margin,
@@ -1360,24 +2241,26 @@ def train(args: argparse.Namespace) -> None:
     ckpt_dir = run_dir / "checkpoints"
     writer = SummaryWriter(run_dir / "tb")
     schedule = tuple(max(1, int(k)) for k in cfg.rollout_schedule) or (1,)
-    visual_report_bridge = None
     if args.visual_reporter:
-        try:
-            visual_report_bridge = VisualReportBridge(
-                run_dir,
-                npz_path=clips[0].path,
-                interval_seconds=args.visual_report_interval_seconds,
-                device=args.visual_report_device,
-                max_frames=args.visual_report_max_frames,
-            )
-            visual_report_bridge.start()
-        except Exception as exc:
-            print(f"visual reporter disabled: {exc}", flush=True)
+        print("visual reporter disabled: use the standalone model viewer instead", flush=True)
     metadata = {
         "npz_folders": [
             {"path": str(tl.npz_folder_from_path(path)), "cyclic": cyclic}
-            for path, cyclic in clip_specs
+            for path, cyclic in real_clip_specs
         ],
+        "synthetic_npz_folders": [
+            {"path": str(tl.npz_folder_from_path(path)), "cyclic": cyclic}
+            for path, cyclic in synthetic_clip_specs
+        ],
+        "real_clip_count": int(real_clip_count),
+        "synthetic_folder_path": str(args.synthetic_folder_path or ""),
+        "synthetic_clip_count": int(synthetic_clip_count),
+        "synthetic_agent_fraction": float(cfg.synthetic_agent_fraction),
+        "synthetic_policy": (
+            "synthetic clips are controller rollout roots only; AE prior training must not include them"
+            if synthetic_clip_count
+            else "none"
+        ),
         "body_names": clips[0].body_names,
         "parents_body": clips[0].parents_body.tolist(),
         "pelvis_index": clips[0].pelvis,
@@ -1387,13 +2270,25 @@ def train(args: argparse.Namespace) -> None:
         "output_dim": output_dim,
         "ae_prior_checkpoint": str(prior_paths[0]),
         "ae_prior_checkpoints": [str(path) for path in prior_paths],
-        "ae_prior_weights": [1.0 / len(prior_paths) for _path in prior_paths],
+        "ae_prior_weights": prior_weights,
+        "real_clip_paths": [str(c.path) for c in clips[:real_clip_count]],
+        "synthetic_clip_paths": [str(c.path) for c in clips[real_clip_count:]],
         "loss_type": "pure_transition_ae_prior",
         "ae_score_loss": args.ae_score_loss,
         "ae_huber_delta": args.ae_huber_delta,
         "simple_footslide_loss_weight": cfg.simple_footslide_loss_weight,
         "simple_footslide_threshold_mps": cfg.simple_footslide_threshold_mps,
         "simple_footslide_gt_margin": cfg.simple_footslide_gt_margin,
+        "turn_idle_footslide_tolerance_divisor": cfg.turn_idle_footslide_tolerance_divisor,
+        "support_envelope_enabled": cfg.support_envelope_enabled,
+        "support_envelope_knn": cfg.support_envelope_knn,
+        "support_envelope_margin": cfg.support_envelope_margin,
+        "support_envelope_cache_dir": cfg.support_envelope_cache_dir,
+        "foot_yaw_loss_weight": cfg.foot_yaw_loss_weight,
+        "foot_yaw_loss_scale_radps": cfg.foot_yaw_loss_scale_radps,
+        "foot_yaw_loss_scale_checkpoint": cfg.foot_yaw_loss_scale_checkpoint,
+        "motion_floor_loss_weight": cfg.motion_floor_loss_weight,
+        "motion_floor_margin": cfg.motion_floor_margin,
         "init_pose_sampling": cfg.init_pose_sampling,
         "agent_min_cohort_steps": cfg.agent_min_cohort_steps,
         "gradient_accumulation_batches": cfg.gradient_accumulation_batches,
@@ -1407,21 +2302,28 @@ def train(args: argparse.Namespace) -> None:
         "agent_clip_sampling_policy": (
             (
                 "packed per-agent random clips: periodic group total weight "
-                f"{cfg.periodic_sampling_weight:g}, nonperiodic group total weight {cfg.nonperiodic_sampling_weight:g}"
+                f"{cfg.periodic_sampling_weight:g}, nonperiodic group total weight {cfg.nonperiodic_sampling_weight:g}, "
+                f"synthetic fixed agent fraction {cfg.synthetic_agent_fraction:g}"
             )
             if cfg.reset_exhausted_agents
             else "weighted by inverse expected active rollout steps to reduce truncation imbalance"
         ),
         "packed_agent_rollout": bool(
-            args.packed_agent_rollout
-            and
-            cfg.training_loop == "agents"
-            and cfg.agent_sampling == "random"
-            and args.agent_batch_clips != 1
-            and not cfg.enable_contact_physics_losses
+            will_use_packed_rollout
         ),
         "final_stage_random_rollout": bool(args.final_stage_random_rollout),
         "final_stage_random_rollout_choices": list(schedule),
+        "mixed_rollout_cohorts": bool(args.mixed_rollout_cohorts),
+        "mixed_rollout_cohort_choices": (
+            [int(k) for k in tl.parse_rollout_schedule(args.mixed_rollout_cohort_schedule)]
+            if args.mixed_rollout_cohort_schedule
+            else list(schedule)
+        ),
+        "mixed_rollout_cohort_weights": [
+            float(part)
+            for part in args.mixed_rollout_cohort_weights.replace(";", ",").split(",")
+            if part.strip()
+        ],
         "compile_enabled": compile_enabled,
     }
 
@@ -1434,20 +2336,37 @@ def train(args: argparse.Namespace) -> None:
     rollout_k = schedule[rollout_idx]
     packed = None
     if (
-        args.packed_agent_rollout
-        and
-        cfg.training_loop == "agents"
-        and cfg.agent_sampling == "random"
-        and args.agent_batch_clips != 1
-        and not cfg.enable_contact_physics_losses
+        will_use_packed_rollout
     ):
         with profiler.section("setup/pack_clips"):
-            packed = PackedClips(clips, cfg, device)
+            packed = PackedClips(clips, cfg, device, synthetic_clip_indices=synthetic_clip_indices)
+            if packed.support_envelope_metadata:
+                metadata["support_envelope"] = dict(packed.support_envelope_metadata)
+            if cfg.foot_yaw_loss_weight > 0.0 and cfg.foot_yaw_loss_scale_radps <= 0.0:
+                scale = estimate_forward_foot_yaw_scale(model, packed, cfg, device)
+                cfg.foot_yaw_loss_scale_radps = scale
+                metadata["foot_yaw_loss_scale_radps"] = float(scale)
+                metadata["foot_yaw_loss_auto_scale_radps"] = float(scale)
+                print(
+                    f"auto foot_yaw_loss_scale_radps={scale:.6g} "
+                    "(max forward-walk autoreg excess on the current checkpoint)",
+                    flush=True,
+                )
+    if cfg.synthetic_agent_fraction > 0.0 and packed is None:
+        raise ValueError(
+            "--synthetic-agent-fraction currently requires packed random agents: "
+            "--training-loop agents --agent-sampling random --agent-batch-clips 0 --packed-agent-rollout "
+            "and --no-contact-physics-losses"
+        )
+    if cfg.foot_yaw_loss_weight > 0.0 and packed is None:
+        raise ValueError("--foot-yaw-loss-weight currently requires the packed random-agent rollout path")
     agent_rng = random.Random(cfg.seed + 4817)
     agent_coverage_order: list[tuple[int, int]] = []
     agent_coverage_cursor = 0
     stage_clip_indices: list[int] = []
     stage_clip_weights: list[float] = []
+    synthetic_stage_clip_indices: list[int] = []
+    synthetic_stage_clip_weights: list[float] = []
 
     def make_loader(max_rollout: int) -> tuple[tl.MotionIndexDataset, DataLoader]:
         dataset = AnyStartDataset(clips, cfg, max_rollout)
@@ -1461,10 +2380,14 @@ def train(args: argparse.Namespace) -> None:
         return dataset, loader
 
     def refresh_stage_sampling(max_rollout: int) -> None:
-        nonlocal stage_clip_indices, stage_clip_weights
-        stage_clip_indices = [ci for ci, clip in enumerate(clips) if clip_supports_any_start(clip, cfg)]
+        nonlocal stage_clip_indices, stage_clip_weights, synthetic_stage_clip_indices, synthetic_stage_clip_weights
+        supported_indices = [ci for ci, clip in enumerate(clips) if clip_supports_any_start(clip, cfg)]
+        stage_clip_indices = [ci for ci in supported_indices if ci not in synthetic_clip_indices]
+        synthetic_stage_clip_indices = [ci for ci in supported_indices if ci in synthetic_clip_indices]
         if not stage_clip_indices:
             raise ValueError("No clips support one-step training")
+        if cfg.synthetic_agent_fraction > 0.0 and not synthetic_stage_clip_indices:
+            raise ValueError("Synthetic agent fraction requested, but no synthetic clips support one-step training")
         periodic_indices = [ci for ci in stage_clip_indices if clips[ci].cyclic_animation]
         nonperiodic_indices = [ci for ci in stage_clip_indices if not clips[ci].cyclic_animation]
         group_counts = {
@@ -1493,8 +2416,14 @@ def train(args: argparse.Namespace) -> None:
             ]
         if not any(weight > 0.0 for weight in stage_clip_weights):
             stage_clip_weights = [1.0 for _ in stage_clip_indices]
+        synthetic_stage_clip_weights = [1.0 for _ in synthetic_stage_clip_indices]
         if packed is not None:
-            packed.update_stage_sampling(stage_clip_indices, stage_clip_weights)
+            packed.update_stage_sampling(
+                stage_clip_indices,
+                stage_clip_weights,
+                synthetic_stage_clip_indices,
+                synthetic_stage_clip_weights,
+            )
 
     def reset_agent_coverage_order(dataset: tl.MotionIndexDataset) -> None:
         nonlocal agent_coverage_order, agent_coverage_cursor
@@ -1516,11 +2445,15 @@ def train(args: argparse.Namespace) -> None:
         else:
             ci = int(clip_index)
         max_start = clip_sample_start_max(clips[ci], cfg, max_rollout, cfg.agent_min_cohort_steps)
+        if cfg.agent_fixed_start_frame > 0:
+            return ci, min(cfg.agent_fixed_start_frame, max_start)
         return ci, agent_rng.randint(1, max_start)
 
     def random_initial_pose_start() -> tuple[int, int]:
-        ci = agent_rng.randrange(len(clips))
+        ci = agent_rng.choice(real_clip_indices)
         max_start = max(1, clips[ci].cyclic_period - 1 if clips[ci].cyclic_animation else clips[ci].T - 1)
+        if cfg.agent_fixed_start_frame > 0:
+            return ci, min(cfg.agent_fixed_start_frame, max_start)
         return ci, agent_rng.randint(1, max_start)
 
     def random_agent_reset_batch(count: int, max_rollout: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1529,20 +2462,163 @@ def train(args: argparse.Namespace) -> None:
         clip_ids = [ci] * int(count)
         starts = []
         for _ in range(int(count)):
-            starts.append(agent_rng.randint(1, max_start))
+            if cfg.agent_fixed_start_frame > 0:
+                starts.append(min(cfg.agent_fixed_start_frame, max_start))
+            else:
+                starts.append(agent_rng.randint(1, max_start))
         return torch.tensor(clip_ids, dtype=torch.long), torch.tensor(starts, dtype=torch.long)
 
-    def agent_batch(dataset: tl.MotionIndexDataset, max_rollout: int) -> tuple[torch.Tensor, ...]:
-        clip_ids = []
-        starts = []
-        init_clip_ids = []
-        init_starts = []
+    def mixed_rollout_choices(max_rollout: int) -> list[int]:
+        if not args.mixed_rollout_cohorts:
+            return []
+        raw = (
+            tl.parse_rollout_schedule(args.mixed_rollout_cohort_schedule)
+            if args.mixed_rollout_cohort_schedule
+            else schedule
+        )
+        choices = sorted({int(k) for k in raw if 1 <= int(k) <= int(max_rollout)})
+        if not choices:
+            raise ValueError(f"--mixed-rollout-cohorts has no choices <= current K={max_rollout}")
+        return choices
+
+    def mixed_rollout_weights(choices: list[int]) -> list[float]:
+        if not args.mixed_rollout_cohort_weights:
+            return [1.0 for _choice in choices]
+        raw = [
+            float(part)
+            for part in args.mixed_rollout_cohort_weights.replace(";", ",").split(",")
+            if part.strip()
+        ]
+        full_choices = (
+            tl.parse_rollout_schedule(args.mixed_rollout_cohort_schedule)
+            if args.mixed_rollout_cohort_schedule
+            else schedule
+        )
+        if len(raw) != len(full_choices):
+            raise ValueError(
+                "--mixed-rollout-cohort-weights must have the same number of entries as "
+                "--mixed-rollout-cohort-schedule"
+            )
+        by_choice = {int(choice): max(0.0, float(weight)) for choice, weight in zip(full_choices, raw)}
+        weights = [by_choice[int(choice)] for choice in choices]
+        if sum(weights) <= 0.0:
+            raise ValueError("--mixed-rollout-cohort-weights must contain at least one positive value")
+        return weights
+
+    def make_mixed_rollout_lengths(count: int, max_rollout: int) -> torch.Tensor | None:
+        choices = mixed_rollout_choices(max_rollout)
+        if not choices:
+            return None
+        weights = mixed_rollout_weights(choices)
+        weight_sum = sum(weights)
+        expected = [int(count) * weight / weight_sum for weight in weights]
+        counts = [int(math.floor(value)) for value in expected]
+        leftover = int(count) - sum(counts)
+        order = sorted(
+            range(len(choices)),
+            key=lambda i: (expected[i] - counts[i], weights[i]),
+            reverse=True,
+        )
+        for i in order[:leftover]:
+            counts[i] += 1
+        lengths: list[int] = []
+        for choice, choice_count in zip(choices, counts):
+            lengths.extend([choice] * choice_count)
+        agent_rng.shuffle(lengths)
+        return torch.tensor(lengths, dtype=torch.long)
+
+    def agent_batch(
+        dataset: tl.MotionIndexDataset,
+        max_rollout: int,
+        cohort_lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        clip_ids: list[int] = []
+        starts: list[int] = []
+        init_clip_ids: list[int] = []
+        init_starts: list[int] = []
         fixed_clip = None
         if args.agent_batch_clips == 1 and cfg.agent_sampling == "random" and len(clips) > 1:
             fixed_clip = agent_rng.choices(stage_clip_indices, weights=stage_clip_weights, k=1)[0]
+
+        if (
+            packed is not None
+            and cfg.agent_sampling == "random"
+            and args.agent_batch_clips != 1
+            and (cfg.synthetic_agent_fraction > 0.0 or cohort_lengths is not None)
+        ):
+            lengths_dev = (
+                cohort_lengths.to(device).long().clamp(1, int(max_rollout))
+                if cohort_lengths is not None
+                else torch.full((cfg.batch_size,), int(max_rollout), dtype=torch.long, device=device)
+            )
+            synthetic_count = int(round(cfg.batch_size * cfg.synthetic_agent_fraction))
+            synthetic_count = min(cfg.batch_size, max(0, synthetic_count))
+            real_count = cfg.batch_size - synthetic_count
+            synthetic_rows = torch.zeros((cfg.batch_size,), dtype=torch.bool, device=device)
+            if synthetic_count > 0:
+                synthetic_rows[torch.randperm(cfg.batch_size, device=device)[:synthetic_count]] = True
+            all_clip_ids = torch.empty((cfg.batch_size,), dtype=torch.long, device=device)
+            all_starts = torch.empty((cfg.batch_size,), dtype=torch.long, device=device)
+            for want_synthetic in (False, True):
+                group_rows = (synthetic_rows == want_synthetic).nonzero(as_tuple=False).flatten()
+                if group_rows.numel() == 0:
+                    continue
+                group_lengths = lengths_dev.index_select(0, group_rows)
+                for requested in torch.unique(group_lengths).tolist():
+                    requested_int = max(1, int(requested))
+                    sub_rows = group_rows[group_lengths == requested_int]
+                    new_clip_ids, new_starts = packed.sample_starts(
+                        int(sub_rows.numel()),
+                        requested_int,
+                        synthetic=want_synthetic,
+                        require_full=cohort_lengths is not None,
+                    )
+                    all_clip_ids[sub_rows] = new_clip_ids
+                    all_starts[sub_rows] = new_starts
+            order = torch.randperm(cfg.batch_size, device=device)
+            all_clip_ids = all_clip_ids.index_select(0, order).detach().cpu()
+            all_starts = all_starts.index_select(0, order).detach().cpu()
+            synthetic_rows = synthetic_rows.index_select(0, order).detach().cpu()
+            lengths_cpu = lengths_dev.index_select(0, order).detach().cpu()
+            if cfg.init_pose_sampling == "random_dataset" or bool(synthetic_rows.any()):
+                init_clip_ids_auto = all_clip_ids.clone()
+                init_starts_auto = all_starts.clone()
+                random_init_pairs = [random_initial_pose_start() for _ in range(int(synthetic_rows.sum().item()))]
+                if random_init_pairs:
+                    init_clip_ids_auto[synthetic_rows] = torch.tensor(
+                        [ci for ci, _start in random_init_pairs],
+                        dtype=torch.long,
+                    )
+                    init_starts_auto[synthetic_rows] = torch.tensor(
+                        [start for _ci, start in random_init_pairs],
+                        dtype=torch.long,
+                    )
+                if cfg.init_pose_sampling == "random_dataset":
+                    random_real_pairs = [random_initial_pose_start() for _ in range(int((~synthetic_rows).sum().item()))]
+                    if random_real_pairs:
+                        init_clip_ids_auto[~synthetic_rows] = torch.tensor(
+                            [ci for ci, _start in random_real_pairs],
+                            dtype=torch.long,
+                        )
+                        init_starts_auto[~synthetic_rows] = torch.tensor(
+                            [start for _ci, start in random_real_pairs],
+                            dtype=torch.long,
+                        )
+                init_clip_tensor = init_clip_ids_auto
+                init_start_tensor = init_starts_auto
+                if cohort_lengths is not None:
+                    return all_clip_ids, all_starts, init_clip_tensor, init_start_tensor, lengths_cpu
+                return all_clip_ids, all_starts, init_clip_tensor, init_start_tensor
+            if cohort_lengths is not None:
+                return all_clip_ids, all_starts, lengths_cpu
+            return all_clip_ids, all_starts
+
         for _ in range(cfg.batch_size):
             if cfg.agent_sampling == "coverage":
                 ci, start = coverage_agent_start(dataset)
+                if cfg.agent_fixed_start_frame > 0:
+                    max_start = clip_sample_start_max(clips[ci], cfg, max_rollout, cfg.agent_min_cohort_steps)
+                    start = min(cfg.agent_fixed_start_frame, max_start)
             else:
                 ci, start = random_agent_start(max_rollout, fixed_clip)
             clip_ids.append(ci)
@@ -1552,13 +2628,19 @@ def train(args: argparse.Namespace) -> None:
                 init_clip_ids.append(init_ci)
                 init_starts.append(init_start)
         if cfg.init_pose_sampling == "random_dataset":
-            return (
+            result = (
                 torch.tensor(clip_ids, dtype=torch.long),
                 torch.tensor(starts, dtype=torch.long),
                 torch.tensor(init_clip_ids, dtype=torch.long),
                 torch.tensor(init_starts, dtype=torch.long),
             )
-        return torch.tensor(clip_ids, dtype=torch.long), torch.tensor(starts, dtype=torch.long)
+            if cohort_lengths is not None:
+                return (*result, cohort_lengths.cpu())
+            return result
+        result = (torch.tensor(clip_ids, dtype=torch.long), torch.tensor(starts, dtype=torch.long))
+        if cohort_lengths is not None:
+            return (*result, cohort_lengths.cpu())
+        return result
 
     def sample_effective_rollout_k() -> int:
         if not args.final_stage_random_rollout or rollout_idx != len(schedule) - 1:
@@ -1572,6 +2654,18 @@ def train(args: argparse.Namespace) -> None:
         f"samples={len(dataset)} loop={cfg.training_loop} packed={packed is not None}",
         flush=True,
     )
+    if cfg.agent_fixed_start_frame > 0:
+        print(f"agent_fixed_start_frame={cfg.agent_fixed_start_frame}", flush=True)
+    if cfg.synthetic_agent_fraction > 0.0:
+        synthetic_per_batch = int(round(cfg.batch_size * cfg.synthetic_agent_fraction))
+        real_per_batch = cfg.batch_size - synthetic_per_batch
+        print(
+            f"synthetic agent sampler: real_per_batch={real_per_batch} "
+            f"synthetic_per_batch={synthetic_per_batch} "
+            f"fraction={synthetic_per_batch / max(1, cfg.batch_size):.6f} "
+            f"synthetic_folder={args.synthetic_folder_path}",
+            flush=True,
+        )
     best = math.inf
     stalls = 0
     stage_start_epoch = 1
@@ -1598,13 +2692,20 @@ def train(args: argparse.Namespace) -> None:
         if cfg.training_loop == "agents":
             train_iter = []
             rollout_iter = []
+            rollout_report_iter = []
             for _ in range(max(1, args.agent_batches_per_epoch) * cfg.gradient_accumulation_batches):
-                effective_k = sample_effective_rollout_k()
-                train_iter.append(agent_batch(dataset, effective_k))
+                effective_k = int(rollout_k) if args.mixed_rollout_cohorts else sample_effective_rollout_k()
+                cohort_lengths = make_mixed_rollout_lengths(cfg.batch_size, effective_k)
+                train_iter.append(agent_batch(dataset, effective_k, cohort_lengths))
                 rollout_iter.append(effective_k)
+                if cohort_lengths is not None:
+                    rollout_report_iter.append(float(cohort_lengths.float().mean().item()))
+                else:
+                    rollout_report_iter.append(float(effective_k))
         else:
             train_iter = list(loader)
             rollout_iter = [int(rollout_k) for _ in train_iter]
+            rollout_report_iter = [float(rollout_k) for _ in train_iter]
         stage_batches += len(train_iter)
         for accum_start in range(0, len(train_iter), cfg.gradient_accumulation_batches):
             accum_batches = train_iter[accum_start : accum_start + cfg.gradient_accumulation_batches]
@@ -1637,8 +2738,18 @@ def train(args: argparse.Namespace) -> None:
         train_score = float(np.mean([p["ae_score"] for p in parts]))
         motion_rms = float(np.mean([p["canon_step_rms"] for p in parts]))
         footslide_loss = float(np.mean([p["simple_footslide"] for p in parts]))
+        foot_yaw_loss = float(np.mean([p.get("foot_yaw", 0.0) for p in parts]))
+        motion_floor_loss = float(np.mean([p.get("motion_floor", 0.0) for p in parts]))
+        ae_raw_by_prior = {
+            key.removeprefix("ae_raw/"): float(np.mean([p.get(key, 0.0) for p in parts]))
+            for key in sorted({key for p in parts for key in p.keys() if key.startswith("ae_raw/")})
+        }
+        ae_weighted_by_prior = {
+            key.removeprefix("ae_weighted/"): float(np.mean([p.get(key, 0.0) for p in parts]))
+            for key in sorted({key for p in parts for key in p.keys() if key.startswith("ae_weighted/")})
+        }
         active_fraction = float(np.mean([p["active_fraction"] for p in parts]))
-        effective_rollout_mean = float(np.mean(rollout_iter)) if rollout_iter else float(rollout_k)
+        effective_rollout_mean = float(np.mean(rollout_report_iter)) if rollout_report_iter else float(rollout_k)
         effective_rollout_max = float(np.max(rollout_iter)) if rollout_iter else float(rollout_k)
         if compute_diagnostics:
             last_diagnostics["joint_rmse"] = float(np.mean([p["joint_rmse"] for p in parts]))
@@ -1653,16 +2764,49 @@ def train(args: argparse.Namespace) -> None:
             "ee_rmse": ee_rmse,
             "output_mse": output_mse,
         }[args.best_metric]
+        weighted_ae_score = cfg.ae_loss_weight * train_score
+        weighted_footslide = cfg.simple_footslide_loss_weight * footslide_loss
+        weighted_foot_yaw = cfg.foot_yaw_loss_weight * foot_yaw_loss
+        weighted_motion_floor = cfg.motion_floor_loss_weight * motion_floor_loss
         writer.add_scalar("loss/train_total", train_total, epoch)
-        writer.add_scalar("loss/ae_score", train_score, epoch)
+        writer.add_scalar("loss/ae_score", weighted_ae_score, epoch)
+        writer.add_scalar("loss/weighted_ae_score", weighted_ae_score, epoch)
+        writer.add_scalar("monitor/raw_ae_score", train_score, epoch)
+        for label, value in ae_weighted_by_prior.items():
+            writer.add_scalar(f"loss/ae_weighted/{label}", cfg.ae_loss_weight * value, epoch)
+        for label, value in ae_raw_by_prior.items():
+            writer.add_scalar(f"monitor/ae_raw/{label}", value, epoch)
+        writer.add_scalar("monitor/raw_simple_footslide", footslide_loss, epoch)
         writer.add_scalar(
-            "loss/weighted_simple_footslide",
-            cfg.simple_footslide_loss_weight * footslide_loss,
+            "loss/simple_footslide",
+            weighted_footslide,
             epoch,
         )
+        writer.add_scalar(
+            "loss/weighted_simple_footslide",
+            weighted_footslide,
+            epoch,
+        )
+        if cfg.foot_yaw_loss_weight > 0.0:
+            writer.add_scalar("loss/foot_yaw", weighted_foot_yaw, epoch)
+            writer.add_scalar("loss/weighted_foot_yaw", weighted_foot_yaw, epoch)
+            writer.add_scalar("monitor/raw_foot_yaw", foot_yaw_loss, epoch)
+            writer.add_scalar("monitor/foot_yaw_loss_scale_radps", cfg.foot_yaw_loss_scale_radps, epoch)
+        if cfg.motion_floor_loss_weight > 0.0:
+            writer.add_scalar("loss/motion_floor", weighted_motion_floor, epoch)
+            writer.add_scalar("loss/weighted_motion_floor", weighted_motion_floor, epoch)
+            writer.add_scalar("monitor/raw_motion_floor", motion_floor_loss, epoch)
+            writer.add_scalar("monitor/motion_floor_margin", cfg.motion_floor_margin, epoch)
         writer.add_scalar("curriculum/active_fraction", active_fraction, epoch)
         writer.add_scalar("optim/gradient_accumulation_batches", cfg.gradient_accumulation_batches, epoch)
-        writer.add_scalar("monitor/simple_footslide_threshold_mps", cfg.simple_footslide_threshold_mps, epoch)
+        if cfg.support_envelope_enabled and packed is not None and packed.support_slide_bound_mps is not None:
+            writer.add_scalar(
+                "monitor/simple_footslide_bound_mean_mps",
+                float(packed.support_slide_bound_mps.mean().detach().cpu()),
+                epoch,
+            )
+        else:
+            writer.add_scalar("monitor/simple_footslide_threshold_mps", cfg.simple_footslide_threshold_mps, epoch)
         writer.add_scalar("motion/canon_step_rms", motion_rms, epoch)
         if compute_diagnostics:
             writer.add_scalar("accuracy/joint_rmse_m", joint_rmse, epoch)
@@ -1673,6 +2817,8 @@ def train(args: argparse.Namespace) -> None:
         writer.add_scalar("curriculum/effective_rollout_k_mean", effective_rollout_mean, epoch)
         writer.add_scalar("curriculum/effective_rollout_k_max", effective_rollout_max, epoch)
         eligible_clip_count = max(1, sum(clip_supports_any_start(clip, cfg) for clip in clips))
+        real_eligible_clip_count = max(1, sum(clip_supports_any_start(clips[ci], cfg) for ci in real_clip_indices))
+        synthetic_eligible_clip_count = sum(clip_supports_any_start(clips[ci], cfg) for ci in synthetic_clip_indices)
         min_stage_batches = (
             math.ceil(float(args.curriculum_min_eligible_clip_visits) * eligible_clip_count)
             if args.curriculum_min_eligible_clip_visits > 0.0
@@ -1680,6 +2826,9 @@ def train(args: argparse.Namespace) -> None:
         )
         writer.add_scalar("curriculum/stage_batches", stage_batches, epoch)
         writer.add_scalar("curriculum/eligible_clips", eligible_clip_count, epoch)
+        writer.add_scalar("curriculum/real_eligible_clips", real_eligible_clip_count, epoch)
+        writer.add_scalar("curriculum/synthetic_eligible_clips", synthetic_eligible_clip_count, epoch)
+        writer.add_scalar("curriculum/synthetic_agent_fraction", cfg.synthetic_agent_fraction, epoch)
         if min_stage_batches > 0:
             writer.add_scalar("curriculum/min_stage_batches", min_stage_batches, epoch)
         improved = selection_metric < best - cfg.curriculum_min_delta
@@ -1689,8 +2838,6 @@ def train(args: argparse.Namespace) -> None:
             tl.save_checkpoint(ckpt_dir / "checkpoint_best.pt", model, opt, epoch, best, rollout_k, cfg, metadata)
             tl.save_checkpoint(ckpt_dir / f"checkpoint_best_k{rollout_k:02d}.pt", model, opt, epoch, best, rollout_k, cfg, metadata)
         save_live_period = args.save_live_every_epochs
-        if args.visual_reporter and save_live_period <= 0:
-            save_live_period = args.visual_report_save_every_epochs
         if save_live_period > 0 and epoch % save_live_period == 0:
             last_path = ckpt_dir / "checkpoint_last.pt"
             tl.save_checkpoint(last_path, model, opt, epoch, best, rollout_k, cfg, metadata)
@@ -1728,10 +2875,12 @@ def train(args: argparse.Namespace) -> None:
         )
         print(
             f"epoch={epoch:04d} K={rollout_k:02d} ae={train_total:.6g} best_{args.best_metric}={best:.6g} "
-            f"ae_score={train_score:.6g} footslide={footslide_loss:.6g} "
-            f"joint_rmse={joint_rmse:.6g} ee_rmse={ee_rmse:.6g} motion_rms={motion_rms:.6g} "
+            f"ae_score={train_score:.6g} footslide={footslide_loss:.6g} footyaw={foot_yaw_loss:.6g} "
+            f"motionfloor={motion_floor_loss:.6g} joint_rmse={joint_rmse:.6g} ee_rmse={ee_rmse:.6g} motion_rms={motion_rms:.6g} "
             f"active={active_fraction:.3f} stalls={stalls} stage_batches={stage_batches}/{min_stage_batches} "
-            f"eligible_clips={eligible_clip_count} effective_k={effective_rollout_mean:.1f} "
+            f"eligible_clips={eligible_clip_count} real_clips={real_eligible_clip_count} "
+            f"synthetic_clips={synthetic_eligible_clip_count} synthetic_frac={cfg.synthetic_agent_fraction:.3f} "
+            f"effective_k={effective_rollout_mean:.1f} "
             f"elapsed_s={time.perf_counter() - start_time:.1f}",
             flush=True,
         )
@@ -1761,8 +2910,6 @@ def train(args: argparse.Namespace) -> None:
     refresh_live_viewer(args, last_path)
     writer.close()
     profiler.write_csv(run_dir / "timing_profile.csv", time.perf_counter() - process_start_time)
-    if visual_report_bridge is not None:
-        visual_report_bridge.close()
 
 
 def main() -> None:
@@ -1778,12 +2925,33 @@ def main() -> None:
         default=None,
         help="Semicolon-separated motion folders that use non-cyclic indexing; exhausted rows can reset to fresh starts.",
     )
+    parser.add_argument(
+        "--synthetic-folder-path",
+        default=None,
+        help=(
+            "Semicolon-separated synthetic NPZ folders used only as controller rollout roots. "
+            "These clips are excluded from AE prior training and random init pose sampling."
+        ),
+    )
     parser.add_argument("--prior-checkpoint", required=True)
+    parser.add_argument(
+        "--prior-weight",
+        type=float,
+        default=1.0,
+        help="Weight for --prior-checkpoint inside the AE prior loss.",
+    )
     parser.add_argument(
         "--extra-prior-checkpoint",
         action="append",
         default=[],
-        help="Additional frozen AE prior checkpoint. All priors are averaged with equal weight.",
+        help="Additional frozen AE prior checkpoint.",
+    )
+    parser.add_argument(
+        "--extra-prior-weight",
+        action="append",
+        type=float,
+        default=[],
+        help="Weight for each --extra-prior-checkpoint, in the same order. Defaults to 1.0 when omitted.",
     )
     parser.add_argument("--run-name", default="locomotion_pure_ae")
     parser.add_argument("--date-prefix-run-name", action=argparse.BooleanOptionalAction, default=True)
@@ -1836,10 +3004,25 @@ def main() -> None:
         help="Total sampling weight assigned to non-cyclic transition clips as a group.",
     )
     parser.add_argument(
+        "--synthetic-agent-fraction",
+        type=float,
+        default=0.0,
+        help="Fixed fraction of each packed random-agent batch sampled from --synthetic-folder-path.",
+    )
+    parser.add_argument(
         "--init-pose-sampling",
         choices=("same_clip", "random_dataset"),
         default="same_clip",
         help="Initial body pose source. random_dataset keeps the sampled root clip but initializes the pose from any clip.",
+    )
+    parser.add_argument(
+        "--agent-fixed-start-frame",
+        type=int,
+        default=0,
+        help=(
+            "If >0, force every sampled agent start/reset to this frame index, "
+            "clamped to each clip's valid range. Use 1 for the first trainable frame."
+        ),
     )
     parser.add_argument("--max-epochs", type=int, default=500)
     parser.add_argument("--rollout-schedule", default="1")
@@ -1871,6 +3054,28 @@ def main() -> None:
         default=False,
         help="At the last scheduled K, sample each agent microbatch rollout length from the rollout schedule rungs.",
     )
+    parser.add_argument(
+        "--mixed-rollout-cohorts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Inside each packed-agent batch, split rows across rollout-length cohorts and reset each row when "
+            "its cohort episode ends. The outer GPU rollout still runs at the current K."
+        ),
+    )
+    parser.add_argument(
+        "--mixed-rollout-cohort-schedule",
+        default="",
+        help="Comma-separated cohort lengths, for example 2,4,8,16,32. Empty means use --rollout-schedule entries <= current K.",
+    )
+    parser.add_argument(
+        "--mixed-rollout-cohort-weights",
+        default="",
+        help=(
+            "Comma-separated weights/percentages for --mixed-rollout-cohort-schedule. "
+            "They are normalized, so 5,10,15 and 1,2,3 are equivalent."
+        ),
+    )
     parser.add_argument("--stop-on-final-stall", action="store_true")
     parser.add_argument("--max-train-seconds", type=float, default=0.0)
     parser.add_argument("--timed-checkpoint-interval-minutes", type=float, default=30.0)
@@ -1892,7 +3097,7 @@ def main() -> None:
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--live-npz-path", default="data/npz_final/testcasc.npz")
     parser.add_argument("--live-output-path", default="training/runs/model_comparisons/model_comparison.html")
-    parser.add_argument("--visual-reporter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--visual-reporter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--visual-report-save-every-epochs", type=int, default=20)
     parser.add_argument("--visual-report-interval-seconds", type=float, default=60.0)
     parser.add_argument("--visual-report-device", default="cpu")
@@ -1941,6 +3146,73 @@ def main() -> None:
         type=float,
         default=1.05,
         help="Multiplier for the auto threshold from ground-truth support slide.",
+    )
+    parser.add_argument(
+        "--turn-idle-footslide-tolerance-divisor",
+        type=float,
+        default=1.0,
+        help=(
+            "Divide the simple footslide tolerance by this value for idle and stand-turn clips. "
+            "Idle still uses both feet pinned; stand-turn clips still use the best support foot."
+        ),
+    )
+    parser.add_argument(
+        "--support-envelope",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use cached root-conditioned support envelopes for simple footslide and vertical foot-yaw losses. "
+            "Synthetic clips get cached bounds but do not define them."
+        ),
+    )
+    parser.add_argument(
+        "--support-envelope-knn",
+        type=int,
+        default=32,
+        help="Number of nearest real root-motion situations used to build the zero-loss support envelope.",
+    )
+    parser.add_argument(
+        "--support-envelope-margin",
+        type=float,
+        default=1.05,
+        help="Safety multiplier applied to root-conditioned ground-truth support bounds.",
+    )
+    parser.add_argument(
+        "--support-envelope-cache-dir",
+        default="training/runs/cache/support_envelopes",
+        help="Directory for cached per-frame support envelopes.",
+    )
+    parser.add_argument(
+        "--foot-yaw-loss-weight",
+        type=float,
+        default=0.0,
+        help="Extra loss on vertical-axis foot/toe angular speed above the cached root-conditioned support envelope.",
+    )
+    parser.add_argument(
+        "--foot-yaw-loss-scale-radps",
+        type=float,
+        default=0.0,
+        help=(
+            "Scale for vertical foot-yaw excess. If <=0 and the packed path is used, it is set so the current "
+            "checkpoint's forward-walk autoreg max excess has loss 1."
+        ),
+    )
+    parser.add_argument(
+        "--foot-yaw-loss-scale-checkpoint",
+        default="",
+        help="Metadata-only note for the checkpoint used to choose foot-yaw scaling; model weights come from --resume-checkpoint.",
+    )
+    parser.add_argument(
+        "--motion-floor-loss-weight",
+        type=float,
+        default=0.0,
+        help="One-sided loss that prevents generated local body motion from dropping below the source transition's motion RMS.",
+    )
+    parser.add_argument(
+        "--motion-floor-margin",
+        type=float,
+        default=0.9,
+        help="Fraction of source transition local body motion RMS required before the motion-floor loss becomes zero.",
     )
     parser.add_argument(
         "--compatibility-score-weight",

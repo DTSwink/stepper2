@@ -22,7 +22,8 @@
     "hand_height": 0.032
   },
   "startup": {
-    "source_npz_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\test\\npz_final\\M_Neutral_Walk_Loop_F.npz"
+    "source_npz_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\test\\npz_final\\M_Neutral_Walk_Loop_F.npz",
+    "checkpoint_policy": "last"
   },
   "controller": {
     "max_speed_mps": 2.85,
@@ -37,7 +38,8 @@
   },
   "animation_browser": {
     "folder_path": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_omni_only\\npz_final",
-    "folder_path_2": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_transitions_only_full_trimmed\\npz_final"
+    "folder_path_2": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_transitions_only_full_trimmed\\npz_final",
+    "folder_path_3": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\ue5\\animations_synthetic\\npz_final"
   },
   "random_initialization": {
     "enabled": false

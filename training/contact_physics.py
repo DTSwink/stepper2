@@ -231,6 +231,54 @@ def foot_slide_speeds(
     return torch.stack(speeds, dim=-1)
 
 
+def _matrix_log_vector(rot: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    cos_theta = ((rot.diagonal(dim1=-2, dim2=-1).sum(dim=-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    theta = torch.acos(cos_theta)
+    skew_vec = torch.stack(
+        (
+            rot[..., 2, 1] - rot[..., 1, 2],
+            rot[..., 0, 2] - rot[..., 2, 0],
+            rot[..., 1, 0] - rot[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    sin_theta = torch.sin(theta)
+    scale = torch.where(
+        theta.abs() < eps,
+        torch.full_like(theta, 0.5),
+        theta / (2.0 * sin_theta.clamp_min(eps)),
+    )
+    return skew_vec * scale.unsqueeze(-1)
+
+
+def foot_vertical_yaw_speeds(
+    prev_positions: torch.Tensor,
+    prev_rotations: torch.Tensor,
+    cur_positions: torch.Tensor,
+    cur_rotations: torch.Tensor,
+    foot_indices: tuple[int, int],
+    toe_indices: tuple[int, int],
+    fps: float,
+    cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
+) -> torch.Tensor:
+    """Return vertical-axis angular speed for each foot in rad/s.
+
+    For each side, compute the world rotation delta for the foot and toe, extract
+    its vertical-axis component with an atan2 form, and return the larger
+    absolute speed. This keeps toe-to-heel pitch out of the metric and avoids the
+    very sharp acos gradients of a full SO(3) log near 180 degrees.
+    """
+    speeds = []
+    for foot_index, toe_index in zip(foot_indices, toe_indices):
+        part_speeds = []
+        for index in (foot_index, toe_index):
+            delta = prev_rotations[:, index].transpose(-1, -2) @ cur_rotations[:, index]
+            yaw_delta = torch.atan2(delta[:, 0, 2] - delta[:, 2, 0], delta[:, 0, 0] + delta[:, 2, 2])
+            part_speeds.append(yaw_delta.abs() * float(fps))
+        speeds.append(torch.stack(part_speeds, dim=-1).amax(dim=-1))
+    return torch.stack(speeds, dim=-1)
+
+
 def foot_contact_point_speeds(
     prev_positions: torch.Tensor,
     prev_rotations: torch.Tensor,

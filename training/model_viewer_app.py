@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from OpenGL import GL, GLU
 from pyopengltk import OpenGLFrame
@@ -32,6 +33,8 @@ if str(FBX_PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(FBX_PIPELINE_DIR))
 
 import train_locomotion as tl
+import contact_physics as cp
+import transition_autoencoder as tae
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
     FootContactConfig,
@@ -47,6 +50,7 @@ from visualize_model import apply_config_dict, load_model
 DEFAULT_NPZ_DIR = PROJECT_ROOT / "data" / "npz_final"
 DEFAULT_ANIMATION_LIBRARY_DIR = PROJECT_ROOT / "ue5" / "animations_omni_only" / "npz_final"
 DEFAULT_ANIMATION_LIBRARY_DIR_2 = PROJECT_ROOT / "ue5" / "animations_transitions_only_full_trimmed" / "npz_final"
+DEFAULT_ANIMATION_LIBRARY_DIR_3 = PROJECT_ROOT / "ue5" / "animations_synthetic" / "npz_final"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 APP_ICON = PROJECT_ROOT / "training" / "assets" / "stepper_model_viewer.ico"
 SETTINGS_PATH = PROJECT_ROOT / "training" / "model_viewer_settings.json"
@@ -226,12 +230,28 @@ def actor_basename(path: Path) -> str:
     return path.stem
 
 
-def newest_checkpoint() -> Path | None:
+def normalize_checkpoint_policy(value: object) -> str:
+    text = str(value).strip().lower().replace("_", " ")
+    if text in {"best", "best checkpoint"}:
+        return "best"
+    return "last"
+
+
+def checkpoint_policy_label(policy: object) -> str:
+    return "Best" if normalize_checkpoint_policy(policy) == "best" else "Last saved"
+
+
+def newest_checkpoint(policy: str = "last") -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
-    candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_best*.pt"))
+    policy = normalize_checkpoint_policy(policy)
+    pattern = "checkpoint_best*.pt" if policy == "best" else "checkpoint_last.pt"
+    candidates = list(DEFAULT_RUNS_DIR.glob(f"*/checkpoints/{pattern}"))
     if not candidates:
-        candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/checkpoint_last.pt"))
+        fallback_pattern = "checkpoint_last.pt" if policy == "best" else "checkpoint_best*.pt"
+        candidates = list(DEFAULT_RUNS_DIR.glob(f"*/checkpoints/{fallback_pattern}"))
+    if not candidates:
+        candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/*.pt"))
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -1067,7 +1087,7 @@ class ModelViewerApp(tk.Tk):
         self.shadow_lists: dict[int, tuple[int, int, int]] = {}
         self.shadow_generation = 0
         self.animation_browser_paths: list[Path] = []
-        self.animation_browser_paths_by_tab: dict[str, list[Path]] = {"anim1": [], "anim2": []}
+        self.animation_browser_paths_by_tab: dict[str, list[Path]] = {"anim1": [], "anim2": [], "anim3": []}
         self.animation_listboxes: dict[str, tk.Listbox] = {}
         self.animation_folder_vars: dict[str, tk.StringVar] = {}
         self.fps_last_time = time.perf_counter()
@@ -1085,6 +1105,14 @@ class ModelViewerApp(tk.Tk):
         self.contact_overlay_texture_text = ""
         self.contact_overlay_texture_size = (0, 0)
         self.contact_overlay_texture_uv = (1.0, 1.0)
+        self.ae_overlay_texture_id = 0
+        self.ae_overlay_texture_text = ""
+        self.ae_overlay_texture_size = (0, 0)
+        self.ae_overlay_texture_uv = (1.0, 1.0)
+        self.ae_prior_info: dict[str, object] | None = None
+        self.ae_prior_load_attempted = False
+        self.ae_prior_error = ""
+        self.ae_value_cache: dict[str, object] = {}
         self.xinput = load_xinput()
         self.controller_sample = ControllerSample()
         self.synthetic_controller_phase = 0.0
@@ -1147,6 +1175,9 @@ class ModelViewerApp(tk.Tk):
             latest_npz = newest_npz()
             startup_npz = str(latest_npz) if latest_npz is not None else ""
         self.startup_npz_path_var = tk.StringVar(value=startup_npz)
+        self.startup_checkpoint_policy_var = tk.StringVar(
+            value=checkpoint_policy_label(startup_settings.get("checkpoint_policy", "last"))
+        )
         animation_settings = (
             self.app_settings.get("animation_browser", {})
             if isinstance(self.app_settings.get("animation_browser", {}), dict)
@@ -1160,9 +1191,14 @@ class ModelViewerApp(tk.Tk):
         if not animation_folder_2:
             animation_folder_2 = str(DEFAULT_ANIMATION_LIBRARY_DIR_2)
         self.animation_folder_var_2 = tk.StringVar(value=animation_folder_2)
+        animation_folder_3 = str(animation_settings.get("folder_path_3", "")).strip()
+        if not animation_folder_3:
+            animation_folder_3 = str(DEFAULT_ANIMATION_LIBRARY_DIR_3)
+        self.animation_folder_var_3 = tk.StringVar(value=animation_folder_3)
         self.animation_folder_vars = {
             "anim1": self.animation_folder_var,
             "anim2": self.animation_folder_var_2,
+            "anim3": self.animation_folder_var_3,
         }
         random_settings = (
             self.app_settings.get("random_initialization", {})
@@ -1381,6 +1417,7 @@ class ModelViewerApp(tk.Tk):
         for tab_key, tab_label, folder_var in (
             ("anim1", "Animation 1", self.animation_folder_var),
             ("anim2", "Animation 2", self.animation_folder_var_2),
+            ("anim3", "Animation 3", self.animation_folder_var_3),
         ):
             tab = ttk.Frame(self.animation_tabs)
             self.animation_tabs.add(tab, text=tab_label)
@@ -1590,6 +1627,14 @@ class ModelViewerApp(tk.Tk):
         startup_form.pack(fill=tk.X, pady=(8, 6))
         ttk.Label(startup_form, text="NPZ Path", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=3)
         ttk.Entry(startup_form, textvariable=self.startup_npz_path_var).grid(row=0, column=1, sticky=tk.EW, pady=3)
+        ttk.Label(startup_form, text="Checkpoint", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Combobox(
+            startup_form,
+            values=("Last saved", "Best"),
+            textvariable=self.startup_checkpoint_policy_var,
+            width=12,
+            state="readonly",
+        ).grid(row=1, column=1, sticky=tk.EW, pady=3)
         startup_form.columnconfigure(1, weight=1)
         startup_buttons = ttk.Frame(content)
         startup_buttons.pack(fill=tk.X, pady=(0, 4))
@@ -1707,14 +1752,24 @@ class ModelViewerApp(tk.Tk):
             startup_path = self.startup_npz_path_var.get().strip()
             if startup_path:
                 startup_path = str(resolve_path(startup_path))
-            startup = {"source_npz_path": startup_path}
+            startup = {
+                "source_npz_path": startup_path,
+                "checkpoint_policy": normalize_checkpoint_policy(self.startup_checkpoint_policy_var.get()),
+            }
             animation_folder = self.animation_folder_var.get().strip()
             if animation_folder:
                 animation_folder = str(resolve_path(animation_folder))
             animation_folder_2 = self.animation_folder_var_2.get().strip()
             if animation_folder_2:
                 animation_folder_2 = str(resolve_path(animation_folder_2))
-            animation_browser = {"folder_path": animation_folder, "folder_path_2": animation_folder_2}
+            animation_folder_3 = self.animation_folder_var_3.get().strip()
+            if animation_folder_3:
+                animation_folder_3 = str(resolve_path(animation_folder_3))
+            animation_browser = {
+                "folder_path": animation_folder,
+                "folder_path_2": animation_folder_2,
+                "folder_path_3": animation_folder_3,
+            }
             random_initialization = {"enabled": bool(self.random_initialization_var.get())}
             controller = {
                 "max_speed_mps": max(0.05, float(self.controller_max_speed_var.get())),
@@ -1778,7 +1833,11 @@ class ModelViewerApp(tk.Tk):
         folder_var = self.animation_folder_vars.get(tab_key, self.animation_folder_var)
         path_text = folder_var.get().strip()
         if not path_text:
-            return DEFAULT_ANIMATION_LIBRARY_DIR_2 if tab_key == "anim2" else DEFAULT_ANIMATION_LIBRARY_DIR
+            if tab_key == "anim2":
+                return DEFAULT_ANIMATION_LIBRARY_DIR_2
+            if tab_key == "anim3":
+                return DEFAULT_ANIMATION_LIBRARY_DIR_3
+            return DEFAULT_ANIMATION_LIBRARY_DIR
         return resolve_path(path_text)
 
     def active_animation_tab_key(self) -> str:
@@ -1788,7 +1847,10 @@ class ModelViewerApp(tk.Tk):
             selected = self.animation_tabs.index(self.animation_tabs.select())
         except tk.TclError:
             return "anim1"
-        return "anim2" if selected == 1 else "anim1"
+        tab_keys = ("anim1", "anim2", "anim3")
+        if 0 <= selected < len(tab_keys):
+            return tab_keys[selected]
+        return "anim1"
 
     def refresh_animation_browser(self) -> None:
         if not hasattr(self, "animation_listboxes"):
@@ -2033,7 +2095,7 @@ class ModelViewerApp(tk.Tk):
     def auto_load_latest(self) -> None:
         if self.actors:
             return
-        checkpoint = newest_checkpoint()
+        checkpoint = newest_checkpoint(normalize_checkpoint_policy(self.startup_checkpoint_policy_var.get()))
         source = self.startup_source_npz()
         if checkpoint is None or source is None:
             return
@@ -2943,7 +3005,7 @@ class ModelViewerApp(tk.Tk):
         pos_a, rot_a = pose_a
         pos_b, rot_b = pose_b
         positions = (pos_a * (1.0 - t) + pos_b * t).astype(np.float32)
-        rotations = rot_b if t >= 0.5 else rot_a
+        rotations = self.blend_rotation_matrices(rot_a, rot_b, float(t))
         return self.apply_actor_world_transform(actor, positions, rotations)
 
     def actor_root_world(self, actor: Actor) -> np.ndarray | None:
@@ -4098,6 +4160,357 @@ class ModelViewerApp(tk.Tk):
         ) = self.make_overlay_texture(text, self.contact_overlay_texture_id, 14)
         self.contact_overlay_texture_text = text
 
+    def upload_ae_overlay_texture(self, text: str) -> None:
+        if text == self.ae_overlay_texture_text and self.ae_overlay_texture_id:
+            return
+        (
+            self.ae_overlay_texture_id,
+            self.ae_overlay_texture_size,
+            self.ae_overlay_texture_uv,
+        ) = self.make_overlay_texture(text, self.ae_overlay_texture_id, 14)
+        self.ae_overlay_texture_text = text
+
+    def latest_ae_prior(self) -> dict[str, object] | None:
+        if self.ae_prior_info is not None:
+            return self.ae_prior_info
+        if self.ae_prior_load_attempted:
+            return None
+        self.ae_prior_load_attempted = True
+        self.ae_prior_error = ""
+        try:
+            candidates = sorted(
+                (path for path in DEFAULT_RUNS_DIR.rglob("*.pt") if "cache" not in path.parts),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError as exc:
+            self.ae_prior_error = str(exc)
+            return None
+
+        for path in candidates[:300]:
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                continue
+            schema = ckpt.get("schema") if isinstance(ckpt, dict) else None
+            if not (
+                isinstance(schema, dict)
+                and "total_dim" in schema
+                and "mean" in ckpt
+                and "std" in ckpt
+                and "model" in ckpt
+                and "config" in ckpt
+            ):
+                continue
+            try:
+                ae_cfg = tae.AEConfig(**ckpt["config"])
+                model = tae.TransitionAutoencoder(int(schema["total_dim"]), ae_cfg, schema)
+                model.load_state_dict(ckpt["model"])
+                model.eval()
+                for param in model.parameters():
+                    param.requires_grad_(False)
+                loco_cfg = tl.TrainConfig()
+                apply_config_dict(loco_cfg, ckpt.get("locomotion_config", {}))
+                loco_cfg.use_torch_compile = False
+                self.ae_prior_info = {
+                    "path": path,
+                    "model": model,
+                    "mean": ckpt["mean"].detach().cpu().float(),
+                    "std": ckpt["std"].detach().cpu().float(),
+                    "schema": schema,
+                    "locomotion_config": loco_cfg,
+                    "compatibility_weight": float(ckpt.get("config", {}).get("compatibility_weight", 0.0) or 0.0),
+                }
+                return self.ae_prior_info
+            except Exception as exc:
+                self.ae_prior_error = f"{path.name}: {exc}"
+                continue
+        if not self.ae_prior_error:
+            self.ae_prior_error = "no AE checkpoint"
+        return None
+
+    def ae_overlay_actor(self, actor_poses: list[tuple[Actor, np.ndarray, np.ndarray]]) -> Actor | None:
+        selected_id = self.selected_actor_id
+        for actor, _positions, _rotations in actor_poses:
+            if actor.actor_id == selected_id and actor.visible and actor.clip is not None:
+                return actor
+        for actor, _positions, _rotations in actor_poses:
+            if actor.visible and actor.clip is not None:
+                return actor
+        return None
+
+    def ae_transition_frame(self, actor: Actor) -> int | None:
+        if actor.clip is None or actor.frame_count < 3:
+            return None
+        frame = max(1, int(math.floor(float(self.frame))))
+        if actor.kind == "model":
+            extend_live = self.extend_playback_active(actor)
+            if not self.playing:
+                target = frame + 1 if (actor.controller_active or extend_live) else min(frame + 1, actor.clip.T - 1)
+                actor.generate_to(target, extend_authored=extend_live)
+            generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
+            if generated_count < 3:
+                return None
+            max_cur = generated_count - 2
+            if not (actor.controller_active or extend_live):
+                max_cur = min(max_cur, actor.clip.T - 2)
+            if max_cur < 1:
+                return None
+            return max(1, min(frame, max_cur))
+        max_cur = actor.clip.T - 2
+        if max_cur < 1:
+            return None
+        return max(1, min(frame, max_cur))
+
+    def ae_pose_from_generated_frame(
+        self,
+        actor: Actor,
+        frame: int,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor] | None:
+        if actor.clip is None:
+            return None
+        generated_count = min(len(actor.generated_pos), len(actor.generated_rot))
+        if frame < 0 or frame >= generated_count:
+            return None
+        positions = torch.as_tensor(actor.generated_pos[frame], dtype=torch.float32, device=device).unsqueeze(0)
+        rotations = torch.as_tensor(actor.generated_rot[frame], dtype=torch.float32, device=device).unsqueeze(0)
+        idx_value = min(frame, actor.clip.T - 1)
+        idx = torch.tensor([idx_value], dtype=torch.long, device=device)
+        root_pos, root_rot, root_yaw, heading = tl.root_state(actor.clip, idx, cfg, device)
+
+        local_rotations = torch.empty_like(rotations)
+        root_inv = root_rot.transpose(-1, -2)
+        for joint, parent in enumerate(actor.clip.parents_body_list):
+            if parent < 0:
+                local_rotations[:, joint] = rotations[:, joint] @ root_inv
+            else:
+                parent_inv = rotations[:, parent].transpose(-1, -2)
+                local_rotations[:, joint] = rotations[:, joint] @ parent_inv
+
+        pelvis = int(actor.clip.pelvis)
+        pelvis_pos = torch.matmul((positions[:, pelvis] - root_pos).unsqueeze(1), root_inv).squeeze(1)
+        canon_pos = torch.einsum("bjc,bcd->bjd", positions - root_pos[:, None, :], heading)
+        non_pelvis_idx = torch.tensor(actor.clip.non_pelvis, dtype=torch.long, device=device)
+        contacts_np = np.zeros(2, dtype=np.float32)
+        if frame < len(actor.generated_contacts):
+            contacts_np[: min(2, len(actor.generated_contacts[frame]))] = actor.generated_contacts[frame][:2]
+        contacts = torch.as_tensor(contacts_np, dtype=torch.float32, device=device).view(1, 2)
+        return {
+            "pelvis_pos": pelvis_pos,
+            "pelvis_rot6": tl.rotmat_to_6d(local_rotations[:, pelvis]),
+            "nonpelvis_rot6": tl.rotmat_to_6d(local_rotations.index_select(1, non_pelvis_idx)),
+            "canon_pos": canon_pos,
+            "contacts": contacts,
+        }
+
+    def ae_pose_for_actor_frame(
+        self,
+        actor: Actor,
+        frame: int,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor] | None:
+        if actor.clip is None:
+            return None
+        if actor.kind == "npz":
+            idx = torch.tensor([frame], dtype=torch.long, device=device)
+            return tl.get_pose_from_clip(actor.clip, idx, device)
+        if actor.kind == "model":
+            return self.ae_pose_from_generated_frame(actor, frame, cfg, device)
+        return None
+
+    def ae_score_for_actor(self, actor: Actor) -> float | None:
+        if actor.clip is None:
+            return None
+        prior = self.latest_ae_prior()
+        if prior is None:
+            return None
+        cur = self.ae_transition_frame(actor)
+        if cur is None:
+            return None
+        prior_path = str(prior.get("path", ""))
+        generated_revision = 0
+        if actor.kind == "model" and cur + 1 < len(actor.generated_pos):
+            generated_revision = id(actor.generated_pos[cur + 1])
+        cache_key = (prior_path, actor.actor_id, actor.kind, cur, generated_revision, len(actor.generated_pos))
+        if self.ae_value_cache.get("key") == cache_key:
+            cached = self.ae_value_cache.get("value")
+            return float(cached) if cached is not None else None
+
+        cfg = prior["locomotion_config"]
+        if not isinstance(cfg, tl.TrainConfig):
+            return None
+        device = torch.device("cpu")
+        prev = cur - 1
+        nxt = cur + 1
+        prev_pose = self.ae_pose_for_actor_frame(actor, prev, cfg, device)
+        cur_pose = self.ae_pose_for_actor_frame(actor, cur, cfg, device)
+        next_pose = self.ae_pose_for_actor_frame(actor, nxt, cfg, device)
+        if prev_pose is None or cur_pose is None or next_pose is None:
+            self.ae_value_cache = {"key": cache_key, "value": None}
+            return None
+        prev_idx = torch.tensor([prev], dtype=torch.long, device=device)
+        cur_idx = torch.tensor([cur], dtype=torch.long, device=device)
+        try:
+            with torch.no_grad():
+                features = tae.transition_feature_from_next_pose(
+                    actor.clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
+                )
+                total_dim = int(prior["schema"]["total_dim"]) if isinstance(prior.get("schema"), dict) else 0
+                if total_dim > 0 and int(features.shape[-1]) != total_dim:
+                    self.ae_value_cache = {"key": cache_key, "value": None}
+                    return None
+                mean = prior["mean"]
+                std = prior["std"]
+                model = prior["model"]
+                x = (features - mean) / std
+                recon = model(x)
+                score = torch.mean((recon - x).square(), dim=-1)
+                compat_weight = float(prior.get("compatibility_weight", 0.0) or 0.0)
+                if compat_weight > 0.0 and hasattr(model, "has_compatibility_head") and model.has_compatibility_head():
+                    score = score + compat_weight * F.softplus(-model.compatibility_logits(x))
+                value = float(score.mean().detach().cpu())
+        except Exception:
+            value = None
+        self.ae_value_cache = {"key": cache_key, "value": value}
+        return value
+
+    def contact_geometry_config(self) -> cp.ContactGeometryConfig:
+        visual = self.foot_contact_config()
+        return replace(
+            cp.DEFAULT_GEOMETRY,
+            foot_length=float(visual.foot_length),
+            foot_width=float(visual.foot_width),
+            foot_height=float(visual.foot_height),
+            toe_length=float(visual.toe_length),
+            toe_width=float(visual.toe_width),
+            toe_height=float(visual.toe_height),
+            sole_vertical_offset=float(visual.sole_vertical_offset),
+            ground_y=float(visual.ground_y),
+            height_threshold_m=float(visual.height_threshold_m),
+            speed_threshold_mps=float(visual.horizontal_speed_threshold_mps),
+        )
+
+    def actor_metric_pose_for_frame(
+        self, actor: Actor, frame: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        pose = actor.pose_for_frame(frame, generate=False, extend_authored=self.extend_playback_active(actor))
+        if pose is None:
+            return None
+        return self.apply_actor_world_transform(actor, pose[0], pose[1])
+
+    def foot_loss_config_for_actor(self, actor: Actor) -> tl.TrainConfig:
+        if actor.kind == "model" and actor.cfg is not None:
+            return actor.cfg
+        actor_path = actor.npz_path or actor.source_npz_path
+        if actor_path is not None:
+            actor_path = actor_path.resolve()
+            for other in self.actors:
+                other_path = other.source_npz_path or other.npz_path
+                if other.kind == "model" and other.cfg is not None and other_path is not None:
+                    if other_path.resolve() == actor_path:
+                        return other.cfg
+        selected = self.selected_actor()
+        if selected is not None and selected.kind == "model" and selected.cfg is not None:
+            return selected.cfg
+        for other in self.actors:
+            if other.kind == "model" and other.cfg is not None:
+                return other.cfg
+        return actor.cfg or tl.TrainConfig()
+
+    def training_foot_metrics(
+        self,
+        actor: Actor,
+        frame: int,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+    ) -> dict[str, object] | None:
+        if actor.clip is None:
+            return None
+        name_to_index = {name: i for i, name in enumerate(actor.bone_names)}
+        sides = self.foot_contact_sides(name_to_index)
+        if len(sides) != 2:
+            return None
+        geom = self.contact_geometry_config()
+        frame = max(0, min(actor.frame_count - 1, int(frame)))
+        prev_frame = 0 if frame <= 0 else frame - 1
+        cur_frame = 1 if frame <= 0 and actor.frame_count > 1 else frame
+        prev_pose = self.actor_metric_pose_for_frame(actor, prev_frame)
+        cur_pose = self.actor_metric_pose_for_frame(actor, cur_frame)
+        if prev_pose is None or cur_pose is None:
+            prev_positions = positions
+            prev_rotations = rotations
+            cur_positions = positions
+            cur_rotations = rotations
+        else:
+            prev_positions, prev_rotations = prev_pose
+            cur_positions, cur_rotations = cur_pose
+
+        foot_indices = tuple(int(side[2]) for side in sides)
+        toe_indices = tuple(int(side[3]) for side in sides)
+        cur_pos_t = torch.tensor(positions[None, :, :], dtype=torch.float32)
+        cur_rot_t = torch.tensor(rotations[None, :, :, :], dtype=torch.float32)
+        prev_pos_t = torch.tensor(prev_positions[None, :, :], dtype=torch.float32)
+        prev_rot_t = torch.tensor(prev_rotations[None, :, :, :], dtype=torch.float32)
+        speed_pos_t = torch.tensor(cur_positions[None, :, :], dtype=torch.float32)
+        speed_rot_t = torch.tensor(cur_rotations[None, :, :, :], dtype=torch.float32)
+        with torch.no_grad():
+            heights_t, points_t = cp.foot_lowest_heights_and_points(cur_pos_t, cur_rot_t, foot_indices, toe_indices, geom)
+            contact_speeds_t = cp.foot_contact_point_speeds(
+                prev_pos_t, prev_rot_t, speed_pos_t, speed_rot_t, foot_indices, toe_indices, actor.clip.fps, geom
+            )
+            slide_speeds_t = cp.foot_slide_speeds(
+                prev_pos_t, prev_rot_t, speed_pos_t, speed_rot_t, foot_indices, toe_indices, actor.clip.fps, geom
+            )
+            yaw_speeds_t = cp.foot_vertical_yaw_speeds(
+                prev_pos_t, prev_rot_t, speed_pos_t, speed_rot_t, foot_indices, toe_indices, actor.clip.fps, geom
+            )
+        heights = heights_t[0].detach().cpu().numpy().astype(np.float32)
+        points = points_t[0].detach().cpu().numpy().astype(np.float32)
+        contact_speeds = contact_speeds_t[0].detach().cpu().numpy().astype(np.float32)
+        slide_speeds = slide_speeds_t[0].detach().cpu().numpy().astype(np.float32)
+        yaw_speeds = yaw_speeds_t[0].detach().cpu().numpy().astype(np.float32)
+        idle = "idle" in (actor.npz_path or actor.source_npz_path or Path(actor.name)).stem.lower()
+        support_slide = float(slide_speeds.mean() if idle else slide_speeds.min())
+        cfg = self.foot_loss_config_for_actor(actor)
+        slide_threshold = max(0.0, float(getattr(cfg, "simple_footslide_threshold_mps", 0.0)))
+        yaw_speed = float(yaw_speeds.max())
+        yaw_scale = max(1e-6, float(getattr(cfg, "foot_yaw_loss_scale_radps", 1.0) or 1.0))
+        if idle:
+            support_mask = np.ones_like(slide_speeds, dtype=np.bool_)
+        else:
+            support_mask = np.zeros_like(slide_speeds, dtype=np.bool_)
+            if slide_speeds.size:
+                support_mask[int(np.argmin(slide_speeds))] = True
+        side_metrics = []
+        for i, (side_index, contact_name, foot_index, toe_index) in enumerate(sides):
+            side_metrics.append(
+                {
+                    "side_index": side_index,
+                    "contact_name": contact_name,
+                    "foot_index": foot_index,
+                    "toe_index": toe_index,
+                    "height": float(heights[i]),
+                    "point": points[i],
+                    "contact_speed": float(contact_speeds[i]),
+                    "slide_speed": float(slide_speeds[i]),
+                    "yaw_speed": float(yaw_speeds[i]),
+                    "slide_loss": max(0.0, float(slide_speeds[i]) - slide_threshold),
+                    "yaw_loss": max(0.0, float(yaw_speeds[i])) / yaw_scale,
+                    "computed_contact": bool(support_mask[i]),
+                }
+            )
+        return {
+            "config": geom,
+            "sides": side_metrics,
+            "support_slide": support_slide,
+            "slide_threshold": slide_threshold,
+            "yaw_speed": yaw_speed,
+            "yaw_scale": yaw_scale,
+        }
+
     def gl_draw_text_overlay(
         self,
         texture_id: int,
@@ -4191,29 +4604,37 @@ class ModelViewerApp(tk.Tk):
         if chosen is None:
             return ""
         actor, positions, rotations = chosen
-        name_to_index = {name: i for i, name in enumerate(actor.bone_names)}
-        sides = self.foot_contact_sides(name_to_index)
-        if not sides:
+        metrics = self.training_foot_metrics(actor, max(0, int(round(float(self.frame)))), positions, rotations)
+        if metrics is None:
             return ""
-        config = self.foot_contact_config()
+        config = metrics["config"]
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         source_mode = bool(self.foot_contact_from_source_var.get())
-        lines = [f"{actor.name} contact {'source' if source_mode else 'computed'}"]
-        for side_index, contact_name, foot_index, toe_index in sides:
-            height, point, _part = foot_lowest_ground_height(
-                positions, rotations, foot_index, toe_index, config
-            )
-            speed = self.foot_contact_speed_mps(actor, frame, foot_index, toe_index, point)
+        lines = [f"{actor.name} contact {'source' if source_mode else 'support'}"]
+        loss_by_side: dict[str, tuple[float, float]] = {}
+        for side_metric in metrics["sides"]:
+            side_index = int(side_metric["side_index"])
+            contact_name = str(side_metric["contact_name"])
+            height = float(side_metric["height"])
+            speed = float(side_metric["contact_speed"])
             if source_mode:
                 contact = self.actor_source_contact(actor, frame, side_index)
             else:
-                contact = bool(is_foot_contact(height, speed, config))
+                contact = bool(side_metric["computed_contact"])
             side = "L" if contact_name.endswith("L") else "R"
             mark = "on " if contact else "off"
+            slide_loss = float(side_metric["slide_loss"]) if contact else 0.0
+            yaw_loss = float(side_metric["yaw_loss"]) if contact else 0.0
+            loss_by_side[side] = (slide_loss, yaw_loss)
             lines.append(
                 f"{side} {mark}  h {height:+.3f} / {config.height_threshold_m:.3f}  "
-                f"v {speed:.3f} / {config.horizontal_speed_threshold_mps:.3f}"
+                f"v {speed:.3f} / {config.speed_threshold_mps:.3f}"
             )
+        if self.show_foot_contact_var.get():
+            r_slide, r_yaw = loss_by_side.get("R", (0.0, 0.0))
+            l_slide, l_yaw = loss_by_side.get("L", (0.0, 0.0))
+            lines.append(f"slide loss   R {r_slide:.4f}   L {l_slide:.4f}")
+            lines.append(f"foot yaw loss R {r_yaw:.4f}   L {l_yaw:.4f}")
         return "\n".join(lines)
 
     def gl_draw_contact_metrics_overlay(
@@ -4223,14 +4644,47 @@ class ModelViewerApp(tk.Tk):
         if not text:
             return
         self.upload_contact_overlay_texture(text)
-        text_w, _text_h = self.contact_overlay_texture_size
-        x0 = max(12.0, float(width - text_w - 116))
+        text_w, text_h = self.contact_overlay_texture_size
+        x0 = max(12.0, float(width - text_w - 14))
+        y0 = max(12.0, float(height - text_h - 14))
         self.gl_draw_text_overlay(
             self.contact_overlay_texture_id,
             self.contact_overlay_texture_size,
             self.contact_overlay_texture_uv,
             x0,
-            34.0,
+            y0,
+            width,
+            height,
+        )
+
+    def ae_value_text(self, actor_poses: list[tuple[Actor, np.ndarray, np.ndarray]]) -> str:
+        actor = self.ae_overlay_actor(actor_poses)
+        if actor is None:
+            return ""
+        value = self.ae_score_for_actor(actor)
+        name = actor.name
+        if len(name) > 32:
+            name = name[:29] + "..."
+        if value is None:
+            return f"ae value n/a\n{name}"
+        return f"ae value {value:.5f}\n{name}"
+
+    def gl_draw_ae_value_overlay(
+        self, width: int, height: int, actor_poses: list[tuple[Actor, np.ndarray, np.ndarray]]
+    ) -> None:
+        text = self.ae_value_text(actor_poses)
+        if not text:
+            return
+        self.upload_ae_overlay_texture(text)
+        text_w, _text_h = self.ae_overlay_texture_size
+        x0 = max(12.0, float(width - max(text_w, 86) - 14))
+        y0 = 110.0
+        self.gl_draw_text_overlay(
+            self.ae_overlay_texture_id,
+            self.ae_overlay_texture_size,
+            self.ae_overlay_texture_uv,
+            x0,
+            y0,
             width,
             height,
         )
@@ -4432,6 +4886,7 @@ class ModelViewerApp(tk.Tk):
             self.gl_draw_controller_trajectory()
         self.gl_draw_gizmo_overlay(width, height)
         self.gl_draw_contact_metrics_overlay(width, height, actor_poses)
+        self.gl_draw_ae_value_overlay(width, height, actor_poses)
         self.gl_draw_camera_overlay(width, height)
         self.gl_draw_root_motion_overlay(width, height)
         GL.glFlush()
@@ -5179,7 +5634,11 @@ class ModelViewerApp(tk.Tk):
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         draw_height = bool(self.show_foot_height_var.get())
         draw_contact = bool(self.show_foot_contact_var.get())
-        config = self.foot_contact_config()
+        metrics = self.training_foot_metrics(actor, frame, positions, rotations)
+        if metrics is None:
+            return
+        config = metrics["config"]
+        visual_config = self.foot_contact_config()
         GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT | GL.GL_LINE_BIT | GL.GL_POINT_BIT)
         GL.glDisable(GL.GL_LIGHTING)
         GL.glDisable(GL.GL_TEXTURE_2D)
@@ -5190,24 +5649,25 @@ class ModelViewerApp(tk.Tk):
         GL.glEnable(GL.GL_LINE_SMOOTH)
         try:
             from_source = bool(self.foot_contact_from_source_var.get())
-            for side_index, _contact_name, foot_index, toe_index in sides:
-                height, point, _part = foot_lowest_ground_height(
-                    positions, rotations, foot_index, toe_index, config
-                )
-                speed = self.foot_contact_speed_mps(actor, frame, foot_index, toe_index, point)
+            for side_metric in metrics["sides"]:
+                side_index = int(side_metric["side_index"])
+                foot_index = int(side_metric["foot_index"])
+                toe_index = int(side_metric["toe_index"])
+                height = float(side_metric["height"])
+                point = np.asarray(side_metric["point"], dtype=np.float32)
                 if from_source:
                     contact = self.actor_source_contact(actor, frame, side_index)
                 else:
-                    contact = bool(is_foot_contact(height, speed, config))
+                    contact = bool(side_metric["computed_contact"])
                 color = (0.28, 1.0, 0.46, 0.98) if contact else (1.0, 0.16, 0.18, 0.98)
                 if draw_contact:
                     GL.glLineWidth(3.0)
                     GL.glColor4f(*color)
                     for part, center, axis_x, axis_y, axis_z, dims in foot_toe_box_specs(
-                        positions, rotations, foot_index, toe_index, config
+                        positions, rotations, foot_index, toe_index, visual_config
                     ):
                         _lowest_point, _signed_height = box_lowest_point_signed_height(
-                            center, axis_x, axis_y, axis_z, dims, config.ground_y
+                            center, axis_x, axis_y, axis_z, dims, visual_config.ground_y
                         )
                         self.gl_draw_wire_box(center, axis_x, axis_y, axis_z, dims)
                 if draw_height:

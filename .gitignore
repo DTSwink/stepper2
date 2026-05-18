@@ -42,6 +42,7 @@ _tmp/
 # Generated Kaggle payload/probe folders. Keep the reusable scripts tracked.
 training/kaggle_*_fork/
 training/kaggle_*_probe/
+training/kaggle_outputs/
 
 # Abandoned adversarial experiments kept locally for reference
 training/train_locomotion_amp.py

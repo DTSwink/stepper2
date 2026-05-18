@@ -118,26 +118,26 @@ http://127.0.0.1:8017/model_comparison.html
 The HTML is regenerated only when the browser requests or refreshes that URL,
 so training no longer pays the cost of repeatedly rendering the viewer.
 
-Asynchronous visual checkpoint reports:
+Retired visual checkpoint reports:
 
 ```powershell
 .\.tools\python310\python.exe .\training\visual_reporter.py --run-dir .\training\runs\YOUR_RUN_NAME --checkpoint-name checkpoint_last.pt
 ```
 
-The supervised and AE-prior trainers launch this sidecar by default. It watches
-`checkpoint_last.pt`, rolls out the newest checkpoint in a separate process, and
-writes five static overlay snapshots at `0%`, `25%`, `50%`, `75%`, and `100%`
-to:
+The supervised and AE-prior trainers no longer launch this sidecar. Use the
+standalone model viewer for visual inspection instead. The old
+`--visual-reporter` flags are accepted for compatibility but intentionally do
+not start a reporter process. The standalone reporter script is left in the repo
+only for manual/debug use; it watches `checkpoint_last.pt`, rolls out the newest
+checkpoint in a separate process, and writes five static overlay snapshots at
+`0%`, `25%`, `50%`, `75%`, and `100%` to:
 
 ```text
 training/runs/YOUR_RUN_NAME/visual_reports/latest/index.html
 ```
 
-This is diagnostic only. The trainer never waits for the sidecar; if rendering
-falls behind, the sidecar skips stale checkpoints and catches the newest saved
-state. Use `--no-visual-reporter` to disable it entirely, or
-`--visual-report-interval-seconds`, `--visual-report-device`, and
-`--visual-report-max-frames` to tune cost.
+This is diagnostic only and should be launched manually if needed. Normal
+training should rely on checkpoints plus the standalone viewer.
 
 Standalone side viewer:
 

@@ -100,6 +100,16 @@ def main() -> None:
             / "checkpoint_best.pt"
         ),
     )
+    extra_prior_checkpoints = [
+        item.strip()
+        for item in os.environ.get("STEPPER_EXTRA_PRIOR_CHECKPOINTS", "").split(";")
+        if item.strip()
+    ]
+    extra_prior_weights = [
+        item.strip()
+        for item in os.environ.get("STEPPER_EXTRA_PRIOR_WEIGHTS", "").split(";")
+        if item.strip()
+    ]
     resume_checkpoint = os.environ.get(
         "STEPPER_RESUME_CHECKPOINT",
         str(
@@ -111,16 +121,22 @@ def main() -> None:
             / "checkpoint_best_k64.pt"
         ),
     )
+    periodic_folder = os.environ.get(
+        "STEPPER_PERIODIC_FOLDER_PATH",
+        str(PROJECT_ROOT / "ue5" / "animations_omni_only_full"),
+    )
+    nonperiodic_folder = os.environ.get(
+        "STEPPER_NONPERIODIC_FOLDER_PATH",
+        str(PROJECT_ROOT / "ue5" / "animations_transitions_only_full_trimmed"),
+    )
 
     cmd = [
         sys.executable,
         str(PROJECT_ROOT / "training" / "train_locomotion_ae_prior.py"),
-        "--periodic-folder-path",
-        str(PROJECT_ROOT / "ue5" / "animations_omni_only_full"),
-        "--nonperiodic-folder-path",
-        str(PROJECT_ROOT / "ue5" / "animations_transitions_only_full_trimmed"),
         "--prior-checkpoint",
         prior_checkpoint,
+        "--prior-weight",
+        os.environ.get("STEPPER_PRIOR_WEIGHT", "1.0"),
         "--resume-checkpoint",
         resume_checkpoint,
         "--run-name",
@@ -188,6 +204,18 @@ def main() -> None:
         "--no-live-viewer",
         "--no-visual-reporter",
     ]
+    for extra_prior in extra_prior_checkpoints:
+        cmd.extend(["--extra-prior-checkpoint", extra_prior])
+    for extra_weight in extra_prior_weights:
+        cmd.extend(["--extra-prior-weight", extra_weight])
+    if periodic_folder.strip().lower() not in {"", "none", "null", "__empty__"}:
+        cmd.extend(["--periodic-folder-path", periodic_folder])
+    if nonperiodic_folder.strip().lower() not in {"", "none", "null", "__empty__"}:
+        cmd.extend(["--nonperiodic-folder-path", nonperiodic_folder])
+    if env_flag("STEPPER_SUPPORT_ENVELOPE", False):
+        cmd.append("--support-envelope")
+    else:
+        cmd.append("--no-support-envelope")
 
     if env_flag("STEPPER_FINAL_STAGE_RANDOM_ROLLOUT", True):
         cmd.append("--final-stage-random-rollout")

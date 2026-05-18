@@ -65,7 +65,7 @@ def collect_generated_features(
 ) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
     for clip in clips:
-        if cfg.cyclic_animation:
+        if clip.cyclic_animation:
             max_start = max(1, clip.cyclic_period - 1)
             steps = rollout_steps if rollout_steps > 0 else max_start
         else:
@@ -180,9 +180,22 @@ def train(args: argparse.Namespace) -> None:
     locomotion_cfg.device = str(device)
     locomotion_cfg.cyclic_animation = args.cyclic_animation
     locomotion_cfg.use_torch_compile = False
+    init_prior_path = tl.resolve_path(args.init_prior_checkpoint) if args.init_prior_checkpoint else None
+    init_ckpt = None
+    if init_prior_path is not None:
+        init_ckpt = torch.load(init_prior_path, map_location="cpu", weights_only=False)
+        apply_config_dict(locomotion_cfg, init_ckpt.get("locomotion_config", {}))
     tl.apply_cuda_performance_settings(locomotion_cfg, device)
 
-    clips = tl.load_clips(folder, locomotion_cfg)
+    if args.periodic_folder_path or args.nonperiodic_folder_path:
+        clip_specs = tl.clip_specs_from_folders(
+            args.folder_path,
+            args.periodic_folder_path or None,
+            args.nonperiodic_folder_path or None,
+        )
+        clips = tl.load_clips_from_specs(clip_specs, locomotion_cfg)
+    else:
+        clips = tl.load_clips(folder, locomotion_cfg)
     controller = load_controller(controller_checkpoint, clips, locomotion_cfg, device)
     real_features, _clip_ids, _cur_idx = tae.collect_clean_feature_rows(clips, locomotion_cfg, device)
     fake_features = collect_generated_features(
@@ -194,9 +207,8 @@ def train(args: argparse.Namespace) -> None:
         args.fake_rollout_steps,
     )
 
-    init_prior_path = tl.resolve_path(args.init_prior_checkpoint) if args.init_prior_checkpoint else None
     if init_prior_path is not None:
-        init_ckpt = torch.load(init_prior_path, map_location="cpu", weights_only=False)
+        assert init_ckpt is not None
         ae_cfg = tae.AEConfig(**init_ckpt["config"])
     else:
         ae_cfg = tae.AEConfig(
@@ -228,7 +240,7 @@ def train(args: argparse.Namespace) -> None:
     ae_cfg.cyclic_animation = args.cyclic_animation
     ae_cfg.input_noise_std = args.input_noise_std
     ae_cfg.std_floor = args.std_floor
-    ae_cfg.compatibility_weight = 0.0
+    ae_cfg.compatibility_weight = 1.0 if args.compatibility_fake_weight > 0.0 else 0.0
 
     schema = tae.transition_schema(clips[0], locomotion_cfg)
     if real_features.shape[1] != schema["total_dim"] or fake_features.shape[1] != schema["total_dim"]:
@@ -243,7 +255,7 @@ def train(args: argparse.Namespace) -> None:
     mean = mean.to(device)
     std = std.to(device)
 
-    model = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg).to(device)
+    model = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
     if init_prior_path is not None:
         init_ckpt = torch.load(init_prior_path, map_location=device, weights_only=False)
         missing, unexpected = model.load_state_dict(init_ckpt["model"], strict=False)
@@ -263,6 +275,8 @@ def train(args: argparse.Namespace) -> None:
         "fake_margin": args.fake_margin,
         "fake_weight": args.fake_weight,
         "real_weight": args.real_weight,
+        "compatibility_real_weight": args.compatibility_real_weight,
+        "compatibility_fake_weight": args.compatibility_fake_weight,
     }
     (run_dir / "config.json").write_text(
         json.dumps({"ae_config": asdict(ae_cfg), "metadata": metadata}, indent=2),
@@ -289,6 +303,8 @@ def train(args: argparse.Namespace) -> None:
         real_sum = torch.zeros((), device=device)
         fake_sum = torch.zeros((), device=device)
         fake_energy_sum = torch.zeros((), device=device)
+        compat_real_sum = torch.zeros((), device=device)
+        compat_fake_sum = torch.zeros((), device=device)
         count = 0
         for start in range(0, perm.numel(), args.batch_size):
             real_idx = perm[start : start + args.batch_size]
@@ -303,7 +319,19 @@ def train(args: argparse.Namespace) -> None:
             real_loss = F.huber_loss(real_recon, real_batch)
             fake_err = F.mse_loss(fake_recon, fake_batch, reduction="none").mean(dim=-1)
             fake_loss = F.relu(args.fake_margin - fake_err).mean()
-            loss = args.real_weight * real_loss + args.fake_weight * fake_loss
+            compat_real_loss = torch.zeros((), device=device)
+            compat_fake_loss = torch.zeros((), device=device)
+            if model.has_compatibility_head() and args.compatibility_fake_weight > 0.0:
+                real_logits = model.compatibility_logits(real_batch)
+                fake_logits = model.compatibility_logits(fake_batch)
+                compat_real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+                compat_fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+            loss = (
+                args.real_weight * real_loss
+                + args.fake_weight * fake_loss
+                + args.compatibility_real_weight * compat_real_loss
+                + args.compatibility_fake_weight * compat_fake_loss
+            )
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -312,12 +340,16 @@ def train(args: argparse.Namespace) -> None:
             real_sum = real_sum + real_loss.detach()
             fake_sum = fake_sum + fake_loss.detach()
             fake_energy_sum = fake_energy_sum + fake_err.mean().detach()
+            compat_real_sum = compat_real_sum + compat_real_loss.detach()
+            compat_fake_sum = compat_fake_sum + compat_fake_loss.detach()
             count += 1
 
         train_loss = float((loss_sum / max(1, count)).cpu())
         train_real = float((real_sum / max(1, count)).cpu())
         train_fake = float((fake_sum / max(1, count)).cpu())
         train_fake_energy = float((fake_energy_sum / max(1, count)).cpu())
+        train_compat_real = float((compat_real_sum / max(1, count)).cpu())
+        train_compat_fake = float((compat_fake_sum / max(1, count)).cpu())
         improved = train_loss < best - args.min_delta
         stalls = 0 if improved else stalls + 1
         if train_loss < best:
@@ -338,6 +370,15 @@ def train(args: argparse.Namespace) -> None:
         if epoch == 1 or epoch % args.eval_every_epochs == 0:
             real_e = energy(model, real_norm)
             fake_e = energy(model, fake_norm)
+            if model.has_compatibility_head():
+                real_logits = model.compatibility_logits(real_norm)
+                fake_logits = model.compatibility_logits(fake_norm)
+                real_compat_acc = float((real_logits > 0.0).float().mean().cpu())
+                fake_compat_acc = float((fake_logits < 0.0).float().mean().cpu())
+                real_compat_penalty = float(F.softplus(-real_logits).mean().cpu())
+                fake_compat_penalty = float(F.softplus(-fake_logits).mean().cpu())
+            else:
+                real_compat_acc = fake_compat_acc = real_compat_penalty = fake_compat_penalty = 0.0
             row = {
                 "epoch": float(epoch),
                 "loss": train_loss,
@@ -349,6 +390,10 @@ def train(args: argparse.Namespace) -> None:
                 "fake_energy_p05": float(torch.quantile(fake_e, 0.05).cpu()),
                 "fake_margin_success": float((fake_e > args.fake_margin).float().mean().cpu()),
                 "gap": float((fake_e.mean() - real_e.mean()).cpu()),
+                "compat_real_acc": real_compat_acc,
+                "compat_fake_acc": fake_compat_acc,
+                "compat_real_penalty": real_compat_penalty,
+                "compat_fake_penalty": fake_compat_penalty,
             }
             rows.append(row)
             write_rows(run_dir / "model_aware_ae_report.csv", rows)
@@ -356,18 +401,22 @@ def train(args: argparse.Namespace) -> None:
                 f"epoch={epoch:04d} loss={train_loss:.6g} real={train_real:.6g} "
                 f"fake_hinge={train_fake:.6g} real_e={row['real_energy_mean']:.6g} "
                 f"fake_e={row['fake_energy_mean']:.6g} fake_ok={row['fake_margin_success']:.3f} "
+                f"compat_real={real_compat_acc:.3f} compat_fake={fake_compat_acc:.3f} "
                 f"stalls={stalls} elapsed_s={time.perf_counter() - start_time:.1f}",
                 flush=True,
             )
         elif epoch % 10 == 0:
             print(
                 f"epoch={epoch:04d} loss={train_loss:.6g} real={train_real:.6g} "
-                f"fake_hinge={train_fake:.6g} fake_batch_e={train_fake_energy:.6g} stalls={stalls}",
+                f"fake_hinge={train_fake:.6g} fake_batch_e={train_fake_energy:.6g} "
+                f"compat_real={train_compat_real:.6g} compat_fake={train_compat_fake:.6g} stalls={stalls}",
                 flush=True,
             )
         writer.add_scalar("loss/train_total", train_loss, epoch)
         writer.add_scalar("loss/real_reconstruction", train_real, epoch)
         writer.add_scalar("loss/fake_hinge", train_fake, epoch)
+        writer.add_scalar("loss/compat_real", train_compat_real, epoch)
+        writer.add_scalar("loss/compat_fake", train_compat_fake, epoch)
         writer.add_scalar("energy/fake_batch_mean", train_fake_energy, epoch)
         writer.add_scalar("loss/best", best, epoch)
         if args.stall_patience_epochs > 0 and stalls >= args.stall_patience_epochs:
@@ -393,6 +442,8 @@ def train(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a transition AE against real transitions and model-generated fakes.")
     parser.add_argument("--folder-path", required=True)
+    parser.add_argument("--periodic-folder-path", default="")
+    parser.add_argument("--nonperiodic-folder-path", default="")
     parser.add_argument("--model-checkpoint", required=True)
     parser.add_argument("--init-prior-checkpoint", default="")
     parser.add_argument("--run-name", default="model_aware_transition_ae")
@@ -412,6 +463,8 @@ def main() -> None:
     parser.add_argument("--fake-margin", type=float, default=0.02)
     parser.add_argument("--fake-weight", type=float, default=1.0)
     parser.add_argument("--real-weight", type=float, default=1.0)
+    parser.add_argument("--compatibility-real-weight", type=float, default=1.0)
+    parser.add_argument("--compatibility-fake-weight", type=float, default=0.0)
     parser.add_argument("--fake-starts-per-clip", type=int, default=16)
     parser.add_argument("--fake-rollout-steps", type=int, default=0)
     parser.add_argument("--eval-every-epochs", type=int, default=10)

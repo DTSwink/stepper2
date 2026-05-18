@@ -446,6 +446,14 @@ keep producing a plausible walk.
 An optional low-learning-rate polish pass was started afterward, but the
 completed `K=119` result above is the accepted conclusion for this experiment.
 
+## 2026-05-17 - Visual Reporter Retired
+
+The automatic `training/visual_reporter.py` sidecar is disabled in both
+`train_locomotion.py` and `train_locomotion_ae_prior.py`. The old
+`--visual-reporter` flag is still accepted so older launch commands do not
+break, but it now prints a message and does not spawn a process. Visual
+inspection should use the standalone model viewer instead.
+
 ## 2026-05-13 - Visual Checkpoint Reports
 
 Naive frame distance to ground truth is no longer the main success criterion for
@@ -1255,3 +1263,330 @@ Hybrid periodic + transition dataset rollout rule:
   frozen AE transition score, generated support-foot slide loss, and their
   weighted total. Ground-truth RMSE may still be logged as a debug diagnostic,
   but it should not decide whether an AE-prior model is improving.
+
+### 2026-05-16 - Synthetic Root Boundary Agents
+
+- Added synthetic root-motion clips as a controller-only stress source. These
+  clips live under
+  `ue5/animations_synthetic/npz_final` and are deliberately not visually valid
+  human motion, so they must not be fed into AE prior training.
+- Implementation rule:
+  - `transition_autoencoder.py` remains unchanged and still trains only from
+    `folder_path` / periodic / non-periodic real motion folders.
+  - `train_locomotion_ae_prior.py` accepts `--synthetic-folder-path` and
+    `--synthetic-agent-fraction`; those clips are appended only for controller
+    rollout root trajectories.
+  - Checkpoint metadata keeps real `npz_folders` separate from
+    `synthetic_npz_folders`, so future AE retraining helpers do not inherit the
+    synthetic stress clips by accident.
+  - Random pose initialization samples only from real clips. Synthetic rows keep
+    synthetic roots but borrow a real pose when
+    `--init-pose-sampling random_dataset` is enabled.
+  - During non-periodic reset, synthetic rows reset back into the synthetic pool
+    and real rows reset back into the real pool, preserving the fixed agent
+    fraction throughout long K rollouts.
+- Smoke test:
+  `synthetic_sampler_smoke_delete` used a 16-agent CPU batch with 25% synthetic
+  rows and verified `real_per_batch=12`, `synthetic_per_batch=4`, real metadata
+  paths did not include synthetic clips, and `synthetic_clip_count=9`.
+  The throwaway run was deleted after verification.
+- Current live experiment:
+  `training/runs/20260516_161746_hybrid_synthetic20_k50_w050_from_localbestk32`.
+  It resumes the local pushed best K32 checkpoint
+  `20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`,
+  uses `K=50`, `--init-pose-sampling random_dataset`, simple footslide weight
+  `0.50`, and synthetic fraction `0.20`. With batch size 256, this is the fixed
+  count `51/256 = 19.9219%` synthetic rows per update.
+- First visual report screenshot saved at
+  `training/runs/20260516_161746_hybrid_synthetic20_k50_w050_from_localbestk32/visual_reports/latest/browser_screenshot.png`.
+
+## 2026-05-16 - Root-Conditioned Foot Support Envelopes
+
+- Added `training/support_envelope.py` for cached root-conditioned zero-loss bounds used by geometry losses.
+- The envelope conditions on two horizontal root-motion features:
+  - root yaw delta from `t-1` to the future-window end;
+  - signed horizontal bend angle between the current root step and the current-to-window-end root displacement.
+- Real clips define the envelope; synthetic clips get cached per-frame features and queried bounds, but synthetic values do not expand the bounds.
+- Real ground-truth transitions are explicitly guarded with their own measured value times the margin, so real dataset transitions have zero excess for both support slide and vertical foot/toe yaw.
+- `train_locomotion_ae_prior.py` now uses the packed-frame envelope for `simple_footslide_loss_weight` when the packed random-agent path is active. The old scalar threshold remains only as fallback for non-packed runs.
+- Added vertical foot-yaw loss: measure world foot/toe angular velocity, project onto global vertical Y, take the max over foot/toe and both feet, and apply linear excess above the cached bound.
+- Added auto foot-yaw scaling: with `--foot-yaw-loss-scale-radps <= 0`, the trainer rolls the current resumed checkpoint on the forward-walk clip and sets the scale so that checkpoint's maximum forward-walk yaw excess equals loss `1` before the user weight is applied.
+- Smoke checks on the full hybrid set: 226 real clips + 9 synthetic clips, 10,687 real transitions defining the envelope, 13,315 cached target transitions. Real GT slide excess max = 0 and real GT vertical-yaw excess max = 0.
+
+## 2026-05-16 - K32 Support-Envelope Relaunch
+
+- Requested run launched from the latest accepted local K32 baseline:
+  `training/runs/20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`.
+- AE prior:
+  `training/runs/20260516_022731_ae_poseaware_hybrid_canonbasis_refresh/checkpoints/checkpoint_best.pt`.
+- New live run:
+  `training/runs/20260516_191627_hybrid_supportenv_k32_synth20_w002_from_k32`.
+- Setup: fixed `K=32`, same-clip initialization, `20%` synthetic root clips, support-envelope simple footslide weight `0.02`, support-envelope vertical foot-yaw weight `0.02`.
+- A first attempted launch exposed NaNs from the differentiable SO(3) log/acos vertical-yaw path near sharp foot rotations. The metric was changed to a stable vertical-axis `atan2` extraction in `contact_physics.foot_vertical_yaw_speeds`, preserving pure-yaw detection and keeping pitch at zero in the sanity check. Support-envelope cache version was bumped so yaw bounds rebuild with the same metric used in training.
+- Ground-truth support-envelope verification after the fix: real slide excess max `0`, real vertical foot-yaw excess max `0`; synthetics are cached but do not affect the bounds.
+- Frozen baseline AE scores for turn-in-place clips are recorded in the console output from this run handoff; the largest mean score was on `M_Neutral_Stand_Turn_180_L` at about `0.00514`.
+
+## 2026-05-17 - Window Transition AE Side Probe
+
+- Added `training/window_transition_autoencoder.py` as a contained side experiment. It does not replace the production 1-frame transition AE.
+- The script reuses the current foot-motion-aware transition feature schema from
+  `training/runs/20260516_200756_ae_poseaware_hybrid_footmotion/checkpoints/checkpoint_best.pt`.
+  Each per-frame transition feature is normalized by that AE's stored mean/std, then flattened into W-frame windows.
+- Trained W=`8`, `16`, and `32` variants in
+  `training/runs/20260517_041727_windowae_w8_w16_w32_vs_transitionae_neutral90`.
+- Comparison target: best checkpoint from
+  `training/runs/20260517_031133_hybrid_footmotionae_k220_only_synth050_slide0_yaw0_firstframe_from_k32/checkpoints/checkpoint_best.pt`,
+  evaluated on `M_Neutral_Stand_Turn_090_L/R`.
+- Mean generated scores over the two neutral 90 turn clips:
+  - current 1-frame AE: `0.02717` (GT mean `0.00320`);
+  - W8 AE: `0.05808` (GT mean `0.01171`);
+  - W16 AE: `0.11813` (GT mean `0.02389`);
+  - W32 AE: `0.19232` (GT mean `0.01645`).
+- CSV details are saved at
+  `training/runs/20260517_041727_windowae_w8_w16_w32_vs_transitionae_neutral90/neutral_stand_90_window_compare.csv`.
+
+## 2026-05-17 - Root-Conditioned Window AE Probe
+
+- Vanilla window AEs failed an important sanity check: a visually bad
+  idle/ghost turn rollout could score lower than real GT on some turn clips.
+- Minimal change tested: keep the same normalized transition feature window,
+  but train a conditional window predictor with only the root-motion slice as
+  input and all non-root transition channels as target. No model-specific hard
+  negatives were used.
+- Baseline no-foot-motion AE schema:
+  `training/runs/20260516_022731_ae_poseaware_hybrid_canonbasis_refresh/checkpoints/checkpoint_best.pt`.
+- Bad rollout checkpoint used only for evaluation:
+  `training/runs/20260517_050255_hybrid_windowae16_turninplace_real_pureae_k32_randomframe_sameclip_from_k32/checkpoints/checkpoint_best.pt`.
+- Conditional W16:
+  `training/runs/20260517_053600_conditional_root_windowae_w16_vs_ghostturn`.
+  It caught most 90/135/180 failures but still had 45-degree loopholes
+  (`generated_mean < gt_mean` on both 45-degree clips).
+- Conditional W8/W32:
+  `training/runs/20260517_053938_conditional_root_windowae_w8_w32_vs_ghostturn`.
+  W8 still had the 45-degree loophole; W32 scored generated worse than GT on
+  all 8 turn-in-place clips. Mean over all 8 clips:
+  - W32 GT mean: `0.15772`;
+  - W32 generated mean: `0.39891`;
+  - W32 generated p95: `0.78631`.
+- Trainer smoke test with conditional W32 prior succeeded:
+  `training/runs/smoke_conditional_windowae_w32_k32_delete`.
+  This confirms `train_locomotion_ae_prior.py` can use conditional window
+  checkpoints through the packed K rollout path.
+
+## 2026-05-17 - Cheap Denoising 1-Frame Transition AE Probe
+
+- Tested a cheaper alternative to W8/W16/W32 priors: keep the original
+  1-frame transition AE shape, keep root/future-root channels clean, and add
+  Gaussian noise only to non-root/body transition channels during AE training.
+  This keeps inference as a single transition AE call rather than a windowed
+  prior.
+- Added `input_noise_mask` to `training/transition_autoencoder.py`.
+  The useful setting here is `--input-noise-mask nonroot`, with
+  `--input-noise-std 0.05`.
+- Best practical checkpoint from this probe:
+  `training/runs/20260517_153309_denoise_nonroot_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`.
+- Tier report for that checkpoint:
+  clean GT mean `0.01272`, clean GT p95 `0.02591`, slight-noise mean
+  `0.01517`, bad-perturbation mean `0.3235`, random-noise mean `1.4321`.
+- Ghost-turn comparison used the bad rollout checkpoint
+  `training/runs/20260517_031133_hybrid_footmotionae_k220_only_synth050_slide0_yaw0_firstframe_from_k32/checkpoints/checkpoint_best.pt`
+  on all neutral stand turn-in-place clips. Mean over clips:
+  GT `0.00961`, generated ghost rollout `0.09350`, generated p95 `0.26613`.
+  Per-clip generated scores are worse than GT on every 45/90/135/180 turn.
+- A latent-16 denoising AE was stricter on ghost turns, but raised the real GT
+  floor too much. Latent-32 is the better default candidate unless we want a
+  deliberately harsher critic.
+
+## 2026-05-17 - No-Slide W16 Continuation From Promising Checkpoint
+
+- User visual pick / current best visual seed:
+  `training/runs/20260517_194453_structured_w16_curriculum_walkF45_to_k32_from_baseline/checkpoints/checkpoint_best_k08.pt`.
+- This checkpoint used the structured denoise/root-lookahead W16-style transition
+  AE:
+  `training/runs/20260517_190041_structured_denoise_rootlook16_fullae_lat32_damped035_w1_n0p05_e300/checkpoints/checkpoint_best.pt`.
+- Important constraint from the user: do not add slide loss here. These runs are
+  trying to solve the turn/ghost/skate issue from AE priors and conditioning, not
+  by final-stage footslide penalties.
+- Diagnostic tool used only for monitoring:
+  `training/visualize_rollout_foot_skating.py`. It reports support-foot and
+  source-contact sole sliding over autoregressive rollouts; it is not part of
+  training loss.
+- Baseline K32 on `M_Neutral_Stand_Turn_045_R/L`:
+  - R45 source-contact p95 pred `0.2340`, GT `0.0463`;
+  - L45 source-contact p95 pred `0.3913`, GT `0.1109`.
+- Promising structured W16 K8 checkpoint:
+  - R45 support p95 pred `0.1312`, source-contact p95 pred `0.2624`;
+  - L45 support p95 pred `0.1113`, source-contact p95 pred `0.2800`.
+  This matches the user's visual read: not solved, but better than several later
+  branches.
+- Continuing that checkpoint with only the structured W16 AE to K16/K32 lowered
+  AE loss but worsened skating:
+  `training/runs/20260517_210754_structured_w16_resume_from_k08_to_k32_noslide_freshadam`.
+  K32 R45 source-contact p95 pred `0.4277`, L45 `0.3440`.
+- Adding the old pose-aware AE as a second prior did not help:
+  `training/runs/20260517_212243_dualprior_oldw1_structw16_from_promising_k08_noslide`.
+  K16 R45 source-contact p95 pred `0.3552`, L45 `0.2738`.
+- Adding the 1-frame denoising/rootlook AE as a second prior also did not beat
+  the user's selected W16 K8 checkpoint in the early K8 stage:
+  `training/runs/20260517_213255_dualprior_denoisew1_structw16_from_promising_k08_noslide`.
+- Working conclusion: the W16 K8 checkpoint is currently the best visual seed
+  among these no-slide branches. Longer AE-only rollout optimization can game
+  the priors by skating, so future no-slide work should improve the prior itself
+  or the conditioning/negative-space tests before trusting lower AE loss.
+
+## 2026-05-17 - Corrected No-Slide Best Checkpoint
+
+- User visual inspection found that this checkpoint was much better than my
+  foot-skating monitor suggested:
+  `training/runs/20260517_221536_official1f_plus_compatfixed_k32_strongercompat_noslide/checkpoints/checkpoint_best_k32.pt`.
+- Treat this as the current best no-slide mini-dataset checkpoint unless later
+  visual inspection disproves it. It uses:
+  - primary 1-frame denoising/root-lookahead prior:
+    `training/runs/20260517_161820_denoise_rootlook1_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`,
+    weight `1.0`;
+  - corrected rootlook16 compatibility prior:
+    `training/runs/20260517_215153_denoise_rootlook16_compatfixed_mini_e240/checkpoints/checkpoint_best.pt`,
+    weight `0.3`;
+  - compatibility head penalty weight `0.10`;
+  - no supervised, contact, simple footslide, foot-yaw, or motion-floor loss.
+- Important lesson: `visualize_rollout_foot_skating.py` is useful for spotting
+  likely skating, but it over-penalized this checkpoint relative to the actual
+  visual rollout. Do not reject a visually good no-slide checkpoint only because
+  the source-contact skating metric is high.
+- Direct K32 fork from the accepted local K32 baseline:
+  `training/runs/20260517_223536_directk32_official1f_plus_compatfixed_from_baseline_noslide`.
+  It resumed
+  `training/runs/20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`
+  and started immediately at K=32 with the same prior pair. Best AE score after
+  120 epochs was `0.011312724`, worse than the visually accepted checkpoint's
+  `0.008649662`. This suggests the previous continuation/curriculum path did
+  help reach a better basin, even though the final accepted run itself was
+  K32-only.
+- Control experiment for "is the second AE necessary?":
+  `training/runs/20260517_225556_curriculum_single1f_denoise_from_baseline_noslide`.
+  Same baseline and K8->K16->K32 curriculum, but only the 1-frame denoising
+  prior at weight `1.0`; no rootlook16 compatibility prior. It reached very low
+  single-prior AE loss (`checkpoint_best_k32.pt`, epoch `201`, best
+  `0.003438556`), which is lower than the double-AE run only because it is an
+  easier objective.
+- Short GT-initialized viewer diagnostics still favor the double-AE checkpoint:
+  - R45 autoregressive mean joint error over 50 frames:
+    single-prior curriculum `0.019192`, double-AE accepted `0.008783`;
+  - L45 autoregressive mean joint error over 50 frames:
+    single-prior curriculum `0.015630`, double-AE accepted `0.009067`.
+  This supports the current hypothesis: curriculum helps, but the corrected
+  rootlook16 compatibility prior is doing real work that the 1-frame denoising
+  prior cannot do by itself.
+
+## 2026-05-17 - Mini Coefficient Sweep For Dual No-Slide AE
+
+- Goal: tune the two non-primary coefficients in the accepted no-slide setup
+  without silently damaging the normal forward gait.
+- Fixed ingredients:
+  - baseline model:
+    `training/runs/20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`;
+  - 1-frame denoising/root-lookahead prior:
+    `training/runs/20260517_161820_denoise_rootlook1_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`,
+    weight kept at `1.0`;
+  - corrected rootlook16 compatibility prior:
+    `training/runs/20260517_215153_denoise_rootlook16_compatfixed_mini_e240/checkpoints/checkpoint_best.pt`;
+  - no supervised, contact, footslide, foot-yaw, or motion-floor losses.
+- Sweep script:
+  `training/run_mini_coeff_sweep.py`.
+  It trains K8->K16->K32 curriculum runs on the mini `WalkF + StandTurn45`
+  dataset and evaluates direct GT-initialized autoregressive joint error with
+  `training/visualize_model.py`.
+- Overhead smoke:
+  - single 1-frame AE, K32 35 epochs:
+    `training/runs/20260517_230944_bench_overhead_single1f_k32_e35`,
+    about `28.7s` at epoch 35;
+  - dual AE, K32 35 epochs:
+    `training/runs/20260517_230944_bench_overhead_doubleae_k32_e35`,
+    about `36.0s` at epoch 35.
+  The second AE costs roughly `25%` in this small benchmark, which is noticeable
+  but not the dominant problem compared with failed training branches.
+- Critical evaluation rule: include `M_Neutral_Walk_Loop_F` in the score. A
+  coefficient set that improves turns but damages WalkF is rejected. The summary
+  with WalkF is:
+  `training/runs/coeff_sweeps/20260517_231222_mini_doubleae/summary_with_walkf.csv`.
+- Results, direct autoregressive mean joint error (`R45`, `L45`, `WalkF`,
+  combined average):
+  - extra `0.30`, compatibility `0.05`:
+    `0.008949`, `0.008793`, `0.018080`, combined `0.011941`;
+  - extra `0.30`, compatibility `0.10`:
+    `0.009783`, `0.010500`, `0.018082`, combined `0.012788`;
+  - extra `0.15`, compatibility `0.05`:
+    `0.013684`, `0.009077`, `0.016881`, combined `0.013214`;
+  - extra `0.30`, compatibility `0.20`:
+    `0.010674`, `0.010846`, `0.018144`, combined `0.013221`;
+  - extra `0.60`, compatibility `0.10`:
+    `0.032467`, `0.009026`, `0.019131`, combined `0.020208`;
+  - extra `1.00`, compatibility `0.10`:
+    `0.035091`, `0.011797`, `0.018104`, combined `0.021664`.
+- Accepted checkpoint reference:
+  `training/runs/20260517_221536_official1f_plus_compatfixed_k32_strongercompat_noslide/checkpoints/checkpoint_best_k32.pt`
+  scored `R45=0.008964`, `L45=0.009251`, `WalkF=0.018140`, combined
+  `0.012118` with the same direct comparison method.
+- Current coefficient recommendation for this mini setup:
+  keep primary 1-frame prior weight `1.0`, use rootlook16 extra prior weight
+  `0.30`, and reduce compatibility-score weight from `0.10` to `0.05`.
+  The gain is modest, but it is the fastest/cleanest setting found here and it
+  preserved WalkF.
+- Follow-up overhead pass:
+  - Tried sharing a single superset transition feature tensor across the
+    1-frame and rootlook16 priors, slicing it for the shorter prior. Tensor
+    values were identical (`feature max_abs=0`, score diff `0`, gradient diff
+    about `1e-9`), but the real training smoke got slower. This was reverted.
+    Likely reason: the shared autograd graph made backward scheduling worse
+    even though forward feature work was reduced.
+  - `torch.compile` on the frozen priors was also slower in the local
+    microbenchmark, so it was not kept.
+  - Kept two strictly equivalent cleanups:
+    no-foot-loss packed rollouts no longer compute the current-pose FK that was
+    only needed by footslide/foot-yaw losses, and monitor-only RMS values detach
+    their inputs before doing logging math. These do not change the loss,
+    gradients, model weights, or generated motion.
+  - No-checkpoint microbenchmark after cleanup on the mini K32 path:
+    single prior `~0.86s`/forward+backward batch, dual prior `~1.79s`.
+    Full smoke runs are noisier because best-checkpoint disk writes and laptop
+    thermal state dominate short 35-epoch timings.
+
+## 2026-05-18 - Mixed Rollout Cohorts
+
+- Added `--mixed-rollout-cohorts` to `training/train_locomotion_ae_prior.py`.
+  Instead of sampling one random K for the whole agent batch, it can split rows
+  into fixed K cohorts, for example `--mixed-rollout-cohort-schedule 2,4,8,16,32`.
+- Implementation detail: the outer GPU loop still runs at the current scheduled
+  K, but rows whose cohort length is shorter reset inside that loop. With
+  power-of-two cohorts, all rows end on the same outer K boundary. Starts are
+  sampled using each row's own cohort K, so short non-periodic clips are not
+  excluded just because the outer loop is K32/K64.
+- Sanity check on the mini `WalkF + StandTurn45` setup:
+  cohort row counts for batch 64 were `K2=13`, `K4=13`, `K8=13`, `K16=13`,
+  `K32=12`, with zero start-range violations. Expected per-outer-K32 resets:
+  `K2=15`, `K4=7`, `K8=3`, `K16=1`, `K32=0`.
+- Timing on the current double-AE mini K32 path, forward+backward only:
+  fixed K32 `0.847s`/batch, mixed `2,4,8,16,32` cohorts `0.886s`/batch.
+  This is about `4.5%` overhead in the measured path, so the idea is viable
+  enough to try in an actual experiment.
+- Random same-animation frame initialization was checked with cohorts
+  `5,10,15,20,50`: `init_pose_sampling=same_clip`,
+  `agent_fixed_start_frame=0`, varied start frames inside each cohort, zero
+  start-range violations.
+- Live mini run launched from the old K32 baseline:
+  `training/runs/20260518_003040_mixedcohort_5_10_15_20_50_minidoubleae_from_oldk32`.
+  Setup: mini `WalkF + StandTurn45`, outer K50, cohort distribution
+  `5/10/15/20/50`, primary 1-frame prior weight `1.0`, rootlook16 prior weight
+  `0.30`, compatibility weight `0.05`, no foot/contact/motion-floor losses.
+- Mixed cohorts now also accept normalized weights via
+  `--mixed-rollout-cohort-weights`. The sampler uses each row's own cohort K
+  for start sampling and, in mixed-cohort mode, requires sampled clips to support
+  that full cohort K. This prevents long-K rows from silently choosing short
+  transition clips and immediately resetting.
+- Replaced the uniform K50 test with weighted cohorts
+  `K=2,4,8,16,32,64` and weights `5,10,15,20,25,35` in
+  `training/runs/20260518_005420_mixedcohort_pct_2_4_8_16_32_64_minidoubleae_from_oldk32`.
+  The weights are normalized; for batch size 64 this gives counts
+  `3/6/9/12/14/20`, mean effective K `31.6`. On the mini dataset, K64 rows can
+  only sample the periodic walk loop, while the 45-degree spin clips remain
+  eligible for K2-K32.

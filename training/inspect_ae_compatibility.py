@@ -23,6 +23,13 @@ def short_name(path: str | Path) -> str:
     )
 
 
+def apply_config_dict(cfg: tl.TrainConfig, values: dict) -> None:
+    valid = set(tl.TrainConfig.__dataclass_fields__.keys())
+    for key, value in values.items():
+        if key in valid:
+            setattr(cfg, key, value)
+
+
 @torch.no_grad()
 def transition_scores(
     model: tae.TransitionAutoencoder,
@@ -38,7 +45,7 @@ def transition_scores(
 def load_prior(path: Path, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = tae.AEConfig(**ckpt["config"])
-    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg).to(device)
+    model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt
@@ -77,13 +84,18 @@ def main() -> None:
     device = torch.device(args.device)
     cfg = tl.TrainConfig()
     cfg.cyclic_animation = args.cyclic_animation
-    clips = tl.load_clips(tl.resolve_path(args.folder_path), cfg)
     model, ckpt = load_prior(tl.resolve_path(args.prior_checkpoint), device)
+    apply_config_dict(cfg, ckpt.get("locomotion_config", {}))
+    cfg.cyclic_animation = args.cyclic_animation
+    clips = tl.load_clips(tl.resolve_path(args.folder_path), cfg)
     mean = ckpt["mean"].to(device)
     std = ckpt["std"].to(device)
     schema = ckpt["schema"]
     root_start = schema["input_root_start"]
     root_end = schema["input_root_end"]
+    root_lookahead_dim = int(schema.get("root_lookahead_dim", 0))
+    root_lookahead_start = int(schema.get("root_lookahead_start", root_end))
+    root_lookahead_end = root_lookahead_start + root_lookahead_dim
 
     names, raw_features = build_clip_features(clips, cfg, device)
     xs = [(feat - mean) / std for feat in raw_features]
@@ -98,6 +110,10 @@ def main() -> None:
             for j, body_x in enumerate(xs):
                 paired = body_x[:common].clone()
                 paired[:, root_start:root_end] = root_slice
+                if root_lookahead_dim > 0:
+                    paired[:, root_lookahead_start:root_lookahead_end] = root_x[
+                        :common, root_lookahead_start:root_lookahead_end
+                    ]
                 recon = F.mse_loss(model(paired), paired, reduction="none").mean(dim=-1)
                 if model.has_compatibility_head():
                     compat = F.softplus(-model.compatibility_logits(paired))

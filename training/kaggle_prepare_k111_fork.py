@@ -69,6 +69,27 @@ def kaggle_payload_path(src: Path) -> str:
     return str(PurePosixPath("/kaggle/working/stepper", *rel.parts))
 
 
+def checkpoint_referenced_base_prior(path: Path) -> Path | None:
+    try:
+        import torch
+
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    base = ckpt.get("base_prior_checkpoint")
+    if not base:
+        return None
+    base_path = Path(str(base))
+    if not base_path.exists():
+        text = str(base).replace("\\", "/")
+        for marker in ("/stepper/", "stepper/"):
+            if marker in text:
+                candidate = PROJECT_ROOT / text.split(marker, 1)[1]
+                if candidate.exists():
+                    return candidate.resolve()
+    return base_path.resolve()
+
+
 def write_notebook(
     path: Path,
     dataset_slug: str,
@@ -246,6 +267,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--extra-prior-checkpoint-path",
+        action="append",
+        default=[],
+        help="Additional AE prior checkpoint to copy into the Kaggle payload and pass to training.",
+    )
+    parser.add_argument(
+        "--extra-prior-weight",
+        action="append",
+        default=[],
+        help="Weight for each --extra-prior-checkpoint-path, in the same order.",
+    )
+    parser.add_argument(
         "--resume-checkpoint-path",
         default=str(
             PROJECT_ROOT
@@ -257,8 +290,11 @@ def main() -> None:
         ),
     )
     parser.add_argument("--footslide-weight", default="0.10")
+    parser.add_argument("--footslide-threshold-mps", default=None)
     parser.add_argument("--learning-rate", default="1e-6")
     parser.add_argument("--resume-optimizer", action="store_true")
+    parser.add_argument("--kaggle-periodic-folder-path", default=None)
+    parser.add_argument("--kaggle-nonperiodic-folder-path", default=None)
     args = parser.parse_args()
 
     username = args.kaggle_username or read_kaggle_username()
@@ -288,6 +324,7 @@ def main() -> None:
     for rel_dir in [
         Path("ue5") / "animations_omni_only_full" / "npz_final",
         Path("ue5") / "animations_transitions_only_full_trimmed" / "npz_final",
+        Path("ue5") / "animations_transitions_only_full_trimmed_turn_in_place" / "npz_final",
     ]:
         src = PROJECT_ROOT / rel_dir
         if not src.exists():
@@ -296,7 +333,17 @@ def main() -> None:
 
     prior_checkpoint = Path(args.prior_checkpoint_path).resolve()
     resume_checkpoint = Path(args.resume_checkpoint_path).resolve()
-    required_files = [prior_checkpoint, resume_checkpoint]
+    extra_prior_checkpoints = [Path(path).resolve() for path in args.extra_prior_checkpoint_path]
+    if args.extra_prior_weight and len(args.extra_prior_weight) > len(extra_prior_checkpoints):
+        raise ValueError("--extra-prior-weight was provided more times than --extra-prior-checkpoint-path")
+    required_files = [prior_checkpoint, resume_checkpoint, *extra_prior_checkpoints]
+    base_prior = checkpoint_referenced_base_prior(prior_checkpoint)
+    if base_prior is not None:
+        required_files.append(base_prior)
+    for extra_prior in extra_prior_checkpoints:
+        base_prior = checkpoint_referenced_base_prior(extra_prior)
+        if base_prior is not None:
+            required_files.append(base_prior)
     for src in required_files:
         if not src.exists():
             raise FileNotFoundError(src)
@@ -313,6 +360,25 @@ def main() -> None:
     (dataset_dir / "datasets-metadata.json").write_text(json.dumps(dataset_meta, indent=2), encoding="utf-8")
 
     notebook_path = kernel_dir / "stepper_k111_fork.ipynb"
+    env_vars = {
+        "STEPPER_FOOTSLIDE_WEIGHT": str(args.footslide_weight),
+        "STEPPER_LEARNING_RATE": str(args.learning_rate),
+        "STEPPER_PRIOR_CHECKPOINT": kaggle_payload_path(prior_checkpoint),
+        "STEPPER_RESUME_CHECKPOINT": kaggle_payload_path(resume_checkpoint),
+        "STEPPER_RESUME_OPTIMIZER": "1" if args.resume_optimizer else "0",
+    }
+    if args.footslide_threshold_mps is not None:
+        env_vars["STEPPER_FOOTSLIDE_THRESHOLD_MPS"] = str(args.footslide_threshold_mps)
+    if extra_prior_checkpoints:
+        env_vars["STEPPER_EXTRA_PRIOR_CHECKPOINTS"] = ";".join(
+            kaggle_payload_path(path) for path in extra_prior_checkpoints
+        )
+        env_vars["STEPPER_EXTRA_PRIOR_WEIGHTS"] = ";".join(str(weight) for weight in args.extra_prior_weight)
+    if args.kaggle_periodic_folder_path is not None:
+        env_vars["STEPPER_PERIODIC_FOLDER_PATH"] = str(args.kaggle_periodic_folder_path)
+    if args.kaggle_nonperiodic_folder_path is not None:
+        env_vars["STEPPER_NONPERIODIC_FOLDER_PATH"] = str(args.kaggle_nonperiodic_folder_path)
+
     write_notebook(
         notebook_path,
         dataset_slug,
@@ -321,13 +387,7 @@ def main() -> None:
         args.initial_rollout_k,
         not args.no_final_stage_random_rollout,
         not args.no_tensorboard_tunnel,
-        {
-            "STEPPER_FOOTSLIDE_WEIGHT": str(args.footslide_weight),
-            "STEPPER_LEARNING_RATE": str(args.learning_rate),
-            "STEPPER_PRIOR_CHECKPOINT": kaggle_payload_path(prior_checkpoint),
-            "STEPPER_RESUME_CHECKPOINT": kaggle_payload_path(resume_checkpoint),
-            "STEPPER_RESUME_OPTIMIZER": "1" if args.resume_optimizer else "0",
-        },
+        env_vars,
     )
     kernel_meta = {
         "id": kernel_id,
