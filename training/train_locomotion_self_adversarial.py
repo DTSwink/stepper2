@@ -198,6 +198,8 @@ def train_model_aware_prior(
         str(args.fake_buffer_max_rows),
         "--hard-negative-keep-fraction",
         str(args.hard_negative_keep_fraction),
+        "--hard-negative-mode",
+        args.hard_negative_mode,
         "--eval-every-epochs",
         str(args.ae_eval_every_epochs),
         "--stall-patience-epochs",
@@ -344,6 +346,11 @@ def main() -> None:
     parser.add_argument("--fake-rollout-steps", type=int, default=32)
     parser.add_argument("--fake-buffer-max-rows", type=int, default=200000)
     parser.add_argument("--hard-negative-keep-fraction", type=float, default=0.65)
+    parser.add_argument(
+        "--hard-negative-mode",
+        choices=("low_energy", "low_energy_high_footslide", "low_energy_high_gtdiff"),
+        default="low_energy",
+    )
     parser.add_argument("--controller-epochs-per-cycle", type=int, default=420)
     parser.add_argument("--controller-learning-rate", type=float, default=5e-5)
     parser.add_argument("--controller-batch-size", type=int, default=64)

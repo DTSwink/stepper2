@@ -6,7 +6,7 @@ import json
 import math
 import random
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+import contact_physics as cp
 import train_locomotion as tl
 import transition_autoencoder as tae
 
@@ -54,36 +55,101 @@ def evenly_spaced_starts(max_start: int, count: int) -> list[int]:
     return sorted(set(int(x) for x in values.tolist()))
 
 
+@dataclass
+class GeneratedFeatureBatch:
+    features: torch.Tensor
+    rollout_ids: torch.Tensor
+    fake_slide_distance_sum_m: torch.Tensor
+    gt_slide_distance_sum_m: torch.Tensor
+    gt_difference_sum_m: torch.Tensor
+
+
+def support_slide_distance_step(
+    prev_pos: torch.Tensor,
+    prev_rot: torch.Tensor,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    clip: tl.MotionClip,
+) -> torch.Tensor:
+    foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
+    toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
+    speeds = cp.foot_slide_speeds(
+        prev_pos,
+        prev_rot,
+        cur_pos,
+        cur_rot,
+        foot_indices,
+        toe_indices,
+        clip.fps,
+    )
+    support_speed = speeds.mean(dim=-1) if "idle" in clip.path.stem.lower() else speeds.amin(dim=-1)
+    return support_speed / float(clip.fps)
+
+
 @torch.no_grad()
-def collect_generated_features(
+def collect_generated_feature_batch(
     model: torch.nn.Module,
     clips: list[tl.MotionClip],
     cfg: tl.TrainConfig,
     device: torch.device,
     starts_per_clip: int,
     rollout_steps: int,
-) -> torch.Tensor:
+) -> GeneratedFeatureBatch:
     chunks: list[torch.Tensor] = []
+    rollout_id_chunks: list[torch.Tensor] = []
+    fake_slide_sums: list[torch.Tensor] = []
+    gt_slide_sums: list[torch.Tensor] = []
+    gt_difference_sums: list[torch.Tensor] = []
+    next_rollout_id = 0
     for clip in clips:
         if clip.cyclic_animation:
             max_start = max(1, clip.cyclic_period - 1)
             steps = rollout_steps if rollout_steps > 0 else max_start
         else:
-            steps = rollout_steps if rollout_steps > 0 else max(1, clip.T - 2)
-            max_start = max(1, clip.T - steps - 1)
+            steps = rollout_steps if rollout_steps > 0 else max(1, clip.T - cfg.future_window - 1)
+            # Match the controller sampler: a generated fake rollout must leave room for
+            # the same future-root conditioning window that the controller sees in training.
+            max_start = max(1, tl.clip_rollout_max_start(clip, steps, cfg))
         starts = evenly_spaced_starts(max_start, starts_per_clip)
         prev_idx = torch.tensor(starts, dtype=torch.long, device=device) - 1
         cur_idx = torch.tensor(starts, dtype=torch.long, device=device)
         prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
         cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
         prev_pose, cur_pose = tl.maybe_apply_initial_offsets(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
+        batch_count = cur_idx.shape[0]
+        rollout_ids = torch.arange(next_rollout_id, next_rollout_id + batch_count, dtype=torch.long, device=device)
+        next_rollout_id += batch_count
+        fake_slide_sum = torch.zeros((batch_count,), dtype=torch.float32, device=device)
+        gt_slide_sum = torch.zeros((batch_count,), dtype=torch.float32, device=device)
+        gt_difference_sum = torch.zeros((batch_count,), dtype=torch.float32, device=device)
         for _step in range(steps):
             inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
             raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
             pred_pose, _raw_pose = tl.output_to_pose(raw_out, clip)
             target_idx = cur_idx + 1
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+            cur_global_pos, cur_global_rot, _cur_canon = tl.fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
             root_pos, root_rot, _yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
-            _global_pos, _global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
+            pred_global_pos, pred_global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
+            gt_cur_pos, gt_cur_rot = tl.global_from_clip(clip, cur_idx, cfg, device)
+            gt_next_pos, gt_next_rot = tl.global_from_clip(clip, target_idx, cfg, device)
+            fake_slide_sum = fake_slide_sum + support_slide_distance_step(
+                cur_global_pos,
+                cur_global_rot,
+                pred_global_pos,
+                pred_global_rot,
+                clip,
+            )
+            gt_slide_sum = gt_slide_sum + support_slide_distance_step(
+                gt_cur_pos,
+                gt_cur_rot,
+                gt_next_pos,
+                gt_next_rot,
+                clip,
+            )
+            gt_difference_sum = gt_difference_sum + (
+                (pred_global_pos - gt_next_pos).square().sum(dim=-1).mean(dim=-1).sqrt()
+            )
             next_pose = {
                 "pelvis_pos": pred_pose["pelvis_pos"],
                 "pelvis_rot6": pred_pose["pelvis_rot6"],
@@ -102,11 +168,33 @@ def collect_generated_features(
                 device,
             )
             chunks.append(features.detach().cpu())
+            rollout_id_chunks.append(rollout_ids.detach().cpu())
             prev_pose = cur_pose
             cur_pose = next_pose
             prev_idx = cur_idx
             cur_idx = target_idx
-    return torch.cat(chunks, dim=0)
+        fake_slide_sums.append(fake_slide_sum.detach().cpu())
+        gt_slide_sums.append(gt_slide_sum.detach().cpu())
+        gt_difference_sums.append(gt_difference_sum.detach().cpu())
+    return GeneratedFeatureBatch(
+        features=torch.cat(chunks, dim=0),
+        rollout_ids=torch.cat(rollout_id_chunks, dim=0),
+        fake_slide_distance_sum_m=torch.cat(fake_slide_sums, dim=0),
+        gt_slide_distance_sum_m=torch.cat(gt_slide_sums, dim=0),
+        gt_difference_sum_m=torch.cat(gt_difference_sums, dim=0),
+    )
+
+
+@torch.no_grad()
+def collect_generated_features(
+    model: torch.nn.Module,
+    clips: list[tl.MotionClip],
+    cfg: tl.TrainConfig,
+    device: torch.device,
+    starts_per_clip: int,
+    rollout_steps: int,
+) -> torch.Tensor:
+    return collect_generated_feature_batch(model, clips, cfg, device, starts_per_clip, rollout_steps).features
 
 
 @torch.no_grad()
@@ -140,6 +228,20 @@ def sample_feature_rows(features: torch.Tensor, max_rows: int, seed: int) -> tor
     return features.index_select(0, indices)
 
 
+def sample_feature_rows_with_weights(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    max_rows: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if max_rows <= 0 or features.shape[0] <= max_rows:
+        return features, weights
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    indices = torch.randperm(features.shape[0], generator=gen)[:max_rows]
+    return features.index_select(0, indices), weights.index_select(0, indices)
+
+
 @torch.no_grad()
 def keep_low_energy_fakes(
     fake_features: torch.Tensor,
@@ -164,6 +266,156 @@ def keep_low_energy_fakes(
     keep = max(1, int(math.ceil(fake_features.shape[0] * keep_fraction)))
     indices = torch.argsort(scores)[:keep]
     return fake_features.index_select(0, indices)
+
+
+@torch.no_grad()
+def filter_hard_negative_fakes(
+    generated: GeneratedFeatureBatch,
+    init_ckpt: dict | None,
+    schema: dict[str, int],
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    keep_fraction: float,
+    mode: str,
+    weight_reference_m: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+    fake_features = generated.features
+    keep_fraction = float(keep_fraction)
+    metadata: dict[str, object] = {
+        "hard_negative_mode": mode,
+        "fresh_fake_count": int(fake_features.shape[0]),
+        "fresh_fake_rollout_count": int(generated.fake_slide_distance_sum_m.shape[0]),
+    }
+    slide_excess = torch.relu(generated.fake_slide_distance_sum_m - generated.gt_slide_distance_sum_m)
+    if mode == "low_energy_high_gtdiff":
+        severity = generated.gt_difference_sum_m.clamp_min(0.0)
+        severity_name = "gt_difference"
+    else:
+        severity = slide_excess
+        severity_name = "slide_excess"
+    row_severity = severity.index_select(0, generated.rollout_ids.long())
+    metadata.update(
+        {
+            "fresh_fake_slide_sum_mean_m": float(generated.fake_slide_distance_sum_m.mean().item()),
+            "fresh_gt_slide_sum_mean_m": float(generated.gt_slide_distance_sum_m.mean().item()),
+            "fresh_slide_excess_mean_m": float(slide_excess.mean().item()),
+            "fresh_slide_excess_max_m": float(slide_excess.max().item()),
+            "fresh_gt_difference_mean_m": float(generated.gt_difference_sum_m.mean().item()),
+            "fresh_gt_difference_max_m": float(generated.gt_difference_sum_m.max().item()),
+            "severity_name": severity_name,
+            "fresh_severity_mean": float(severity.mean().item()),
+            "fresh_severity_max": float(severity.max().item()),
+        }
+    )
+    if init_ckpt is None or keep_fraction <= 0.0 or keep_fraction >= 1.0 or fake_features.shape[0] <= 1:
+        metadata["selected_by_filter"] = False
+        if mode in ("low_energy_high_footslide", "low_energy_high_gtdiff"):
+            ref = float(weight_reference_m)
+            if ref <= 0.0:
+                positive = row_severity[row_severity > 1e-8]
+                ref = float(positive.mean().item()) if positive.numel() else 1.0
+            weights = row_severity / max(ref, 1e-8)
+            metadata["severity_weight_reference"] = ref
+            metadata["slide_excess_weight_reference_m"] = ref
+            metadata["selected_fake_weight_mean"] = float(weights.mean().item())
+            return fake_features, weights.float(), metadata
+        weights = torch.ones((fake_features.shape[0],), dtype=torch.float32)
+        metadata["slide_excess_weight_reference_m"] = 0.0
+        metadata["selected_fake_weight_mean"] = 1.0
+        return fake_features, weights, metadata
+
+    ae_cfg = tae.AEConfig(**init_ckpt["config"])
+    prior = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
+    missing, unexpected = prior.load_state_dict(init_ckpt["model"], strict=False)
+    if missing or unexpected:
+        print(f"hard-negative score prior partial load missing={missing} unexpected={unexpected}", flush=True)
+    prior.eval()
+    fake_norm = tae.normalise(fake_features, mean.cpu(), std.cpu()).to(device)
+    row_scores = energy(prior, fake_norm).detach().cpu()
+
+    if mode == "low_energy":
+        keep = max(1, int(math.ceil(fake_features.shape[0] * keep_fraction)))
+        indices = torch.argsort(row_scores)[:keep]
+        selected = fake_features.index_select(0, indices)
+        weights = torch.ones((selected.shape[0],), dtype=torch.float32)
+        metadata.update(
+            {
+                "selected_by_filter": True,
+                "kept_fake_count": int(selected.shape[0]),
+                "kept_fake_energy_mean": float(row_scores.index_select(0, indices).mean().item()),
+                "slide_excess_weight_reference_m": 0.0,
+                "selected_fake_weight_mean": 1.0,
+            }
+        )
+        return selected, weights, metadata
+
+    if mode not in ("low_energy_high_footslide", "low_energy_high_gtdiff"):
+        raise ValueError(f"unknown hard-negative mode: {mode}")
+
+    rollout_ids = generated.rollout_ids.long()
+    rollout_count = int(generated.fake_slide_distance_sum_m.shape[0])
+    counts = torch.zeros((rollout_count,), dtype=torch.float32)
+    score_sums = torch.zeros((rollout_count,), dtype=torch.float32)
+    counts.scatter_add_(0, rollout_ids, torch.ones_like(row_scores, dtype=torch.float32))
+    score_sums.scatter_add_(0, rollout_ids, row_scores.float())
+    rollout_energy = score_sums / counts.clamp_min(1.0)
+
+    def rank_percentile(values: torch.Tensor, descending: bool) -> torch.Tensor:
+        n = values.numel()
+        if n <= 1:
+            return torch.zeros_like(values, dtype=torch.float32)
+        order = torch.argsort(values, descending=descending)
+        ranks = torch.empty((n,), dtype=torch.float32)
+        ranks[order] = torch.arange(n, dtype=torch.float32) / float(n - 1)
+        return ranks
+
+    energy_rank = rank_percentile(rollout_energy, descending=False)
+    severity_rank = rank_percentile(severity, descending=True)
+    selection_score = energy_rank + severity_rank
+    positive = severity > 1e-8
+    if positive.any():
+        candidate_rollouts = torch.nonzero(positive, as_tuple=False).flatten()
+    else:
+        candidate_rollouts = torch.arange(rollout_count, dtype=torch.long)
+    target_rows = max(1, int(math.ceil(fake_features.shape[0] * keep_fraction)))
+    steps_per_rollout = max(1, int(round(fake_features.shape[0] / max(1, rollout_count))))
+    target_rollouts = max(1, int(math.ceil(target_rows / steps_per_rollout)))
+    target_rollouts = min(target_rollouts, int(candidate_rollouts.numel()))
+    candidate_scores = selection_score.index_select(0, candidate_rollouts)
+    selected_rollouts = candidate_rollouts.index_select(0, torch.argsort(candidate_scores)[:target_rollouts])
+    selected_mask = (rollout_ids[:, None] == selected_rollouts[None, :]).any(dim=1)
+    indices = torch.nonzero(selected_mask, as_tuple=False).flatten()
+    selected = fake_features.index_select(0, indices)
+    selected_severity = severity.index_select(0, selected_rollouts)
+    selected_energy = rollout_energy.index_select(0, selected_rollouts)
+    ref = float(weight_reference_m)
+    if ref <= 0.0:
+        positive_selected = selected_severity[selected_severity > 1e-8]
+        ref = float(positive_selected.mean().item()) if positive_selected.numel() else 1.0
+    selected_row_severity = row_severity.index_select(0, indices)
+    weights = selected_row_severity / max(ref, 1e-8)
+    metadata.update(
+        {
+            "selected_by_filter": True,
+            "kept_fake_count": int(selected.shape[0]),
+            "kept_fake_rollout_count": int(selected_rollouts.numel()),
+            "positive_severity_rollout_count": int(positive.sum().item()),
+            "positive_slide_excess_rollout_count": int((slide_excess > 1e-8).sum().item()),
+            "kept_rollout_energy_mean": float(selected_energy.mean().item()),
+            "kept_severity_mean": float(selected_severity.mean().item()),
+            "kept_severity_max": float(selected_severity.max().item()),
+            "kept_slide_excess_mean_m": float(slide_excess.index_select(0, selected_rollouts).mean().item()),
+            "kept_slide_excess_max_m": float(slide_excess.index_select(0, selected_rollouts).max().item()),
+            "kept_gt_difference_mean_m": float(generated.gt_difference_sum_m.index_select(0, selected_rollouts).mean().item()),
+            "kept_gt_difference_max_m": float(generated.gt_difference_sum_m.index_select(0, selected_rollouts).max().item()),
+            "severity_weight_reference": ref,
+            "slide_excess_weight_reference_m": ref,
+            "selected_fake_weight_mean": float(weights.mean().item()),
+            "selected_fake_weight_max": float(weights.max().item()) if weights.numel() else 0.0,
+        }
+    )
+    return selected, weights.float(), metadata
 
 
 def save_checkpoint(
@@ -234,7 +486,7 @@ def train(args: argparse.Namespace) -> None:
         clips = tl.load_clips(folder, locomotion_cfg)
     controller = load_controller(controller_checkpoint, clips, locomotion_cfg, device)
     real_features, _clip_ids, _cur_idx = tae.collect_clean_feature_rows(clips, locomotion_cfg, device)
-    fake_features = collect_generated_features(
+    generated_fakes = collect_generated_feature_batch(
         controller,
         clips,
         locomotion_cfg,
@@ -242,6 +494,7 @@ def train(args: argparse.Namespace) -> None:
         args.fake_starts_per_clip,
         args.fake_rollout_steps,
     )
+    fake_features = generated_fakes.features
 
     if init_prior_path is not None:
         assert init_ckpt is not None
@@ -286,21 +539,34 @@ def train(args: argparse.Namespace) -> None:
 
     mean = real_features.mean(dim=0)
     std = real_features.std(dim=0).clamp_min(ae_cfg.std_floor)
+    fake_buffer_path = tl.resolve_path(args.fake_buffer_path) if args.fake_buffer_path else None
+    existing_buffer_payload = None
+    weight_reference_m = 0.0
+    if fake_buffer_path is not None and fake_buffer_path.exists():
+        existing_buffer_payload = torch.load(fake_buffer_path, map_location="cpu", weights_only=False)
+        if isinstance(existing_buffer_payload, dict):
+            buffer_meta = existing_buffer_payload.get("hard_negative_metadata", {})
+            if isinstance(buffer_meta, dict):
+                weight_reference_m = float(buffer_meta.get("slide_excess_weight_reference_m", 0.0) or 0.0)
+            weight_reference_m = float(
+                existing_buffer_payload.get("slide_excess_weight_reference_m", weight_reference_m) or weight_reference_m
+            )
     raw_fake_count = int(fake_features.shape[0])
-    fake_features = keep_low_energy_fakes(
-        fake_features,
+    fake_features, fake_weights, hard_negative_metadata = filter_hard_negative_fakes(
+        generated_fakes,
         init_ckpt,
         schema,
         mean,
         std,
         device,
         args.hard_negative_keep_fraction,
+        args.hard_negative_mode,
+        weight_reference_m,
     )
     kept_fake_count = int(fake_features.shape[0])
     buffer_loaded_count = 0
-    fake_buffer_path = tl.resolve_path(args.fake_buffer_path) if args.fake_buffer_path else None
-    if fake_buffer_path is not None and fake_buffer_path.exists():
-        payload = torch.load(fake_buffer_path, map_location="cpu", weights_only=False)
+    if existing_buffer_payload is not None:
+        payload = existing_buffer_payload
         buffered = payload["features"] if isinstance(payload, dict) and "features" in payload else payload
         if not isinstance(buffered, torch.Tensor):
             raise TypeError(f"fake buffer did not contain a tensor: {fake_buffer_path}")
@@ -309,29 +575,48 @@ def train(args: argparse.Namespace) -> None:
                 f"fake buffer dim mismatch {tuple(buffered.shape)} expected (*,{schema['total_dim']}) at {fake_buffer_path}"
             )
         buffer_loaded_count = int(buffered.shape[0])
+        if isinstance(payload, dict) and "weights" in payload and isinstance(payload["weights"], torch.Tensor):
+            buffered_weights = payload["weights"].float().reshape(-1)
+            if buffered_weights.shape[0] != buffered.shape[0]:
+                raise RuntimeError(
+                    f"fake buffer weights shape mismatch {tuple(buffered_weights.shape)} for features {tuple(buffered.shape)}"
+                )
+        else:
+            buffered_weights = torch.ones((buffered.shape[0],), dtype=torch.float32)
         fake_features = torch.cat((buffered.float(), fake_features.cpu().float()), dim=0)
+        fake_weights = torch.cat((buffered_weights.cpu().float(), fake_weights.cpu().float()), dim=0)
     if fake_buffer_path is not None:
-        fake_features = sample_feature_rows(fake_features.cpu().float(), args.fake_buffer_max_rows, args.seed + 1009)
+        fake_features, fake_weights = sample_feature_rows_with_weights(
+            fake_features.cpu().float(),
+            fake_weights.cpu().float(),
+            args.fake_buffer_max_rows,
+            args.seed + 1009,
+        )
         fake_buffer_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "features": fake_features,
+                "weights": fake_weights,
                 "schema": schema,
                 "updated_at": time.time(),
                 "source_controller_checkpoint": str(controller_checkpoint),
                 "raw_fake_count": raw_fake_count,
                 "kept_fake_count": kept_fake_count,
                 "buffer_loaded_count": buffer_loaded_count,
+                "hard_negative_metadata": hard_negative_metadata,
+                "slide_excess_weight_reference_m": hard_negative_metadata.get("slide_excess_weight_reference_m", 0.0),
             },
             fake_buffer_path,
         )
         print(
             f"fake buffer {fake_buffer_path} loaded={buffer_loaded_count} raw={raw_fake_count} "
-            f"kept={kept_fake_count} total={fake_features.shape[0]}",
+            f"kept={kept_fake_count} total={fake_features.shape[0]} "
+            f"weight_mean={float(fake_weights.mean().item()):.4g}",
             flush=True,
         )
     real_norm = tae.normalise(real_features, mean, std).to(device)
     fake_norm = tae.normalise(fake_features, mean, std).to(device)
+    fake_weights = fake_weights.to(device).float()
     mean = mean.to(device)
     std = std.to(device)
 
@@ -360,9 +645,13 @@ def train(args: argparse.Namespace) -> None:
         "fake_buffer_path": str(fake_buffer_path) if fake_buffer_path is not None else "",
         "fake_buffer_max_rows": args.fake_buffer_max_rows,
         "hard_negative_keep_fraction": args.hard_negative_keep_fraction,
+        "hard_negative_mode": args.hard_negative_mode,
         "raw_fake_count": raw_fake_count,
         "kept_fake_count": kept_fake_count,
         "buffer_loaded_count": buffer_loaded_count,
+        "fake_weight_mean": float(fake_weights.mean().detach().cpu()),
+        "fake_weight_max": float(fake_weights.max().detach().cpu()) if fake_weights.numel() else 0.0,
+        **hard_negative_metadata,
     }
     (run_dir / "config.json").write_text(
         json.dumps({"ae_config": asdict(ae_cfg), "metadata": metadata}, indent=2),
@@ -397,6 +686,7 @@ def train(args: argparse.Namespace) -> None:
             real_batch = real_norm.index_select(0, real_idx)
             fake_idx = fake_indices[torch.randint(0, fake_indices.numel(), real_idx.shape, device=device)]
             fake_batch = fake_norm.index_select(0, fake_idx)
+            fake_weight_batch = fake_weights.index_select(0, fake_idx)
             noisy_real = real_batch
             if args.input_noise_std > 0.0:
                 noisy_real = real_batch + args.input_noise_std * torch.randn_like(real_batch)
@@ -404,14 +694,19 @@ def train(args: argparse.Namespace) -> None:
             fake_recon = model(fake_batch)
             real_loss = tae.reconstruction_loss(model, real_recon, model.target(real_batch), loss_type="huber")
             fake_err = tae.reconstruction_loss_rows(model, fake_recon, model.target(fake_batch), loss_type="mse")
-            fake_loss = F.relu(args.fake_margin - fake_err).mean()
+            fake_loss = (F.relu(args.fake_margin - fake_err) * fake_weight_batch).mean()
             compat_real_loss = torch.zeros((), device=device)
             compat_fake_loss = torch.zeros((), device=device)
             if model.has_compatibility_head() and args.compatibility_fake_weight > 0.0:
                 real_logits = model.compatibility_logits(real_batch)
                 fake_logits = model.compatibility_logits(fake_batch)
                 compat_real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-                compat_fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+                compat_fake_rows = F.binary_cross_entropy_with_logits(
+                    fake_logits,
+                    torch.zeros_like(fake_logits),
+                    reduction="none",
+                )
+                compat_fake_loss = (compat_fake_rows * fake_weight_batch).mean()
             loss = (
                 args.real_weight * real_loss
                 + args.fake_weight * fake_loss
@@ -461,8 +756,8 @@ def train(args: argparse.Namespace) -> None:
                 fake_logits = model.compatibility_logits(fake_norm)
                 real_compat_acc = float((real_logits > 0.0).float().mean().cpu())
                 fake_compat_acc = float((fake_logits < 0.0).float().mean().cpu())
-                real_compat_penalty = float(F.softplus(-real_logits).mean().cpu())
-                fake_compat_penalty = float(F.softplus(-fake_logits).mean().cpu())
+                real_compat_penalty = float(F.softplus(-real_logits.detach()).mean().cpu())
+                fake_compat_penalty = float(F.softplus(-fake_logits.detach()).mean().cpu())
             else:
                 real_compat_acc = fake_compat_acc = real_compat_penalty = fake_compat_penalty = 0.0
             row = {
@@ -567,6 +862,16 @@ def main() -> None:
         type=float,
         default=1.0,
         help="If an init prior is present, keep only this lowest-energy fraction of fresh generated fakes.",
+    )
+    parser.add_argument(
+        "--hard-negative-mode",
+        choices=("low_energy", "low_energy_high_footslide", "low_energy_high_gtdiff"),
+        default="low_energy",
+        help=(
+            "Fresh fake selector. 'low_energy_high_footslide' keeps rollout windows that the init AE scores "
+            "as easy while their 32-frame support-slide distance exceeds matching GT. "
+            "'low_energy_high_gtdiff' uses 32-frame global joint-position RMS versus GT as the severity."
+        ),
     )
     parser.add_argument("--eval-every-epochs", type=int, default=10)
     parser.add_argument("--stall-patience-epochs", type=int, default=50)

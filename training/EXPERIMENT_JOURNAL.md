@@ -2160,3 +2160,57 @@ Hybrid periodic + transition dataset rollout rule:
   matched every main artifact bit-exactly:
   AE cycle 1, controller cycle 1, AE cycle 2, and controller cycle 2 all had
   `max_abs_diff = 0.0` against the original saved run.
+
+## 2026-05-20 - GT-Diff Cycles Converge When Kept Reconstruction-Only
+
+- Problem:
+  the GT-difference hard-negative cycle had a promising cycle-2 checkpoint, but
+  replay-buffer cycle 3 diverged visually and numerically.
+- Structural fix:
+  `train_model_aware_transition_ae.py` fake rollout collection now uses the
+  same non-cyclic start support as controller training. Generated fakes must
+  leave room for the controller's future-root lookahead, instead of sampling
+  tail starts that the controller cannot legally train through at the same K.
+- Negative result:
+  the support fix alone stabilized sampling but did not solve convergence.
+  Keeping the compatibility/BCE head still failed to beat cycle 2 reliably.
+- Clean positive result:
+  remove the compatibility classifier from model-aware AE cycles and keep only:
+  real reconstruction + fake reconstruction hinge, with `low_energy_high_gtdiff`
+  hard-negative selection. No footslide loss was used in the controller.
+- Recipe:
+  start from the promising GT-diff cycle-2 controller/prior, then for each
+  cycle train:
+  - AE: `compatibility_real_weight=0`,
+    `compatibility_fake_weight=0`, `fake_margin=0.04`,
+    `real_weight=1.25`, `fake_weight=1.0`,
+    `hard_negative_mode=low_energy_high_gtdiff`,
+    `hard_negative_keep_fraction=0.7`,
+    `fake_rollout_steps=32`, `fake_starts_per_clip=10`.
+  - Controller: pure AE prior, `compatibility_score_weight=0`,
+    no contact/footslide physics losses, K schedule `2,4,8,16,32` with mixed
+    cohorts `5,15,20,30,40`.
+- Monitor result on the mini set
+  `idle + walk forward + circle L/R + stand turn 45 L/R`:
+  - Old recipe:
+    mean support p95 `0.179434`, mean source-excess p95 `0.305586`,
+    max source-excess p95 `0.867848`.
+  - GT-diff cycle 2:
+    mean support p95 `0.178629`, mean source-excess p95 `0.303543`,
+    max source-excess p95 `0.837216`.
+  - Reconstruction-only GT-diff cycle 3:
+    mean support p95 `0.143514`, mean source-excess p95 `0.215739`,
+    max source-excess p95 `0.548820`.
+  - Reconstruction-only GT-diff cycle 4:
+    mean support p95 `0.136991`, mean source-excess p95 `0.206674`,
+    max source-excess p95 `0.365415`.
+  - Reconstruction-only GT-diff cycle 5:
+    mean support p95 `0.135287`, mean source-excess p95 `0.168158`,
+    max source-excess p95 `0.339076`.
+- Current best checkpoint from this lab:
+  `training/runs/20260520_gtdiff_convergence_lab/controller_cycle05_recononly_supportfix_fresh/checkpoints/checkpoint_best_k32.pt`.
+- Interpretation:
+  the divergence was not inherent to GT-diff hard negatives. The unstable part
+  was the separate compatibility classifier/reward channel interacting with
+  repeated cycles. Reconstruction-only fake hinge gives a smoother energy
+  landscape and the cycle improved monotonically over three measured cycles.
