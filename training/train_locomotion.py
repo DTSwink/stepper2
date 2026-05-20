@@ -135,6 +135,8 @@ class TrainConfig:
     freefall_initial_contacts_off: bool = True
     enable_freefall_termination: bool = False
     ae_loss_weight: float = 1.0
+    ae_row_top_fraction: float = 0.0
+    ae_row_top_weight: float = 0.0
     simple_footslide_loss_weight: float = 0.0
     simple_footslide_threshold_mps: float = 0.0
     simple_footslide_gt_margin: float = 1.05

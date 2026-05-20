@@ -142,6 +142,19 @@ def summarize(label: str, pred_slide: torch.Tensor, gt_slide: torch.Tensor, cont
     }
 
 
+def transition_feature_horizon(cfg: tl.TrainConfig) -> int:
+    root_lookahead_steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+    return max(int(cfg.future_window), root_lookahead_steps + 1)
+
+
+def trainable_frame_count(clip: tl.MotionClip, cfgs: list[tl.TrainConfig], frame_count: int) -> int:
+    if clip.cyclic_animation:
+        return frame_count
+    horizon = max((transition_feature_horizon(cfg) for cfg in cfgs), default=1)
+    # Last trainable input is current=T-horizon-1, which predicts target=T-horizon.
+    return max(3, min(frame_count, int(clip.T) - horizon + 1))
+
+
 def svg_polyline(values: list[float], min_v: float, max_v: float, x0: int, y0: int, w: int, h: int) -> str:
     if len(values) <= 1:
         return ""
@@ -253,12 +266,19 @@ def main() -> None:
 
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     npz_path = resolve_path(args.npz_path)
+    checkpoint_cfgs: list[tl.TrainConfig] = []
+    for checkpoint_text in args.checkpoint_path:
+        checkpoint = torch.load(resolve_path(checkpoint_text), map_location="cpu", weights_only=False)
+        cfg = tl.TrainConfig()
+        apply_config_dict(cfg, checkpoint.get("config", {}))
+        checkpoint_cfgs.append(cfg)
     first_checkpoint = torch.load(resolve_path(args.checkpoint_path[0]), map_location="cpu", weights_only=False)
     base_cfg = tl.TrainConfig()
     apply_config_dict(base_cfg, first_checkpoint.get("config", {}))
     clip = tl.MotionClip(npz_path, base_cfg)
     frame_count = clip.T if args.max_frames <= 0 else min(clip.T, args.max_frames)
     frame_count = max(3, frame_count)
+    safe_frame_count = trainable_frame_count(clip, checkpoint_cfgs, frame_count)
     gt_slide, gt_height = foot_series(clip.global_pos[:frame_count].to(device), clip.global_rot[:frame_count].to(device), clip)
     source_contacts = clip.contacts[1:frame_count].cpu() > 0.5
 
@@ -274,7 +294,17 @@ def main() -> None:
         model, cfg, _ckpt = load_model(checkpoint_path, clip_for_model, device)
         pred_pos, pred_rot = rollout_autoreg(model, clip_for_model, cfg, device, frame_count)
         pred_slide, pred_height = foot_series(pred_pos, pred_rot, clip_for_model)
-        rows.append(summarize(label, pred_slide, gt_slide, source_contacts))
+        rows.append(summarize(f"{label} [full]", pred_slide, gt_slide, source_contacts))
+        if safe_frame_count < frame_count:
+            safe_slice = slice(0, safe_frame_count - 1)
+            rows.append(
+                summarize(
+                    f"{label} [trainable horizon]",
+                    pred_slide[safe_slice],
+                    gt_slide[safe_slice],
+                    source_contacts[safe_slice],
+                )
+            )
         for side, side_name in enumerate(("Left", "Right")):
             charts.append(
                 chart_svg(

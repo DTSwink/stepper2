@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
+import json
 import math
 import random
 import subprocess
@@ -55,7 +57,10 @@ def load_prior(path: Path, device: torch.device):
         return model, ckpt
     cfg = tae.AEConfig(**ckpt["config"])
     model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
-    model.load_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    allowed_missing = {"reconstruction_weights"}
+    if unexpected or any(key not in allowed_missing for key in missing):
+        raise RuntimeError(f"Could not load AE prior {path}: missing={missing}, unexpected={unexpected}")
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
@@ -143,15 +148,30 @@ def ae_score(
     x = (features - mean) / std
     recon = prior(x)
     target = prior.target(x) if hasattr(prior, "target") else x
-    if loss_type == "huber":
-        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
-    else:
-        error = F.mse_loss(recon, target, reduction="none")
-    score = error.mean(dim=-1)
+    score = tae.reconstruction_loss_rows(prior, recon, target, loss_type, huber_delta)
     if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
         compatibility = F.softplus(-prior.compatibility_logits(x))
         score = score + compatibility_weight * compatibility
     return score.mean()
+
+
+def ae_score_rows(
+    prior,
+    mean,
+    std,
+    features: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    compatibility_weight: float = 0.0,
+) -> torch.Tensor:
+    x = (features - mean) / std
+    recon = prior(x)
+    target = prior.target(x) if hasattr(prior, "target") else x
+    score = tae.reconstruction_loss_rows(prior, recon, target, loss_type, huber_delta)
+    if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
+        compatibility = F.softplus(-prior.compatibility_logits(x))
+        score = score + compatibility_weight * compatibility
+    return score
 
 
 def ae_score_normalized(
@@ -163,15 +183,38 @@ def ae_score_normalized(
 ) -> torch.Tensor:
     recon = prior(x)
     target = prior.target(x) if hasattr(prior, "target") else x
-    if loss_type == "huber":
-        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
-    else:
-        error = F.mse_loss(recon, target, reduction="none")
-    score = error.mean(dim=-1)
+    score = tae.reconstruction_loss_rows(prior, recon, target, loss_type, huber_delta)
     if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
         compatibility = F.softplus(-prior.compatibility_logits(x))
         score = score + compatibility_weight * compatibility
     return score.mean()
+
+
+def ae_score_normalized_rows(
+    prior,
+    x: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    compatibility_weight: float = 0.0,
+) -> torch.Tensor:
+    recon = prior(x)
+    target = prior.target(x) if hasattr(prior, "target") else x
+    score = tae.reconstruction_loss_rows(prior, recon, target, loss_type, huber_delta)
+    if compatibility_weight > 0.0 and hasattr(prior, "has_compatibility_head") and prior.has_compatibility_head():
+        compatibility = F.softplus(-prior.compatibility_logits(x))
+        score = score + compatibility_weight * compatibility
+    return score
+
+
+def reduce_ae_score_rows(score_rows: torch.Tensor, cfg: tl.TrainConfig) -> torch.Tensor:
+    mean_score = score_rows.mean()
+    top_fraction = float(getattr(cfg, "ae_row_top_fraction", 0.0))
+    top_weight = float(getattr(cfg, "ae_row_top_weight", 0.0))
+    if top_fraction <= 0.0 or top_weight <= 0.0 or score_rows.numel() <= 1:
+        return mean_score
+    k = max(1, min(score_rows.numel(), int(math.ceil(score_rows.numel() * top_fraction))))
+    top_score = torch.topk(score_rows, k=k, largest=True, sorted=False).values.mean()
+    return mean_score + top_weight * top_score
 
 
 def prior_transition_cfg(prior_info: dict[str, object], fallback_cfg: tl.TrainConfig) -> tl.TrainConfig:
@@ -930,6 +973,30 @@ def packed_envelope_footslide_loss(
     fallback_threshold_mps: float,
     special_tolerance_divisor: float = 1.0,
 ) -> torch.Tensor:
+    return packed_envelope_footslide_loss_rows(
+        packed,
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        clip_ids,
+        cur_idx,
+        fallback_threshold_mps,
+        special_tolerance_divisor,
+    ).mean()
+
+
+def packed_envelope_footslide_loss_rows(
+    packed: PackedClips,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    fallback_threshold_mps: float,
+    special_tolerance_divisor: float = 1.0,
+) -> torch.Tensor:
     support_speed = packed_support_footslide_speeds(
         packed,
         cur_pos,
@@ -950,10 +1017,32 @@ def packed_envelope_footslide_loss(
             packed.turn_in_place.index_select(0, rows),
         )
         bounds = torch.where(special, bounds / divisor, bounds)
-    return F.relu(support_speed - bounds).mean()
+    return F.relu(support_speed - bounds)
 
 
 def packed_vertical_foot_yaw_loss(
+    packed: PackedClips,
+    cur_pos: torch.Tensor,
+    cur_rot: torch.Tensor,
+    next_pos: torch.Tensor,
+    next_rot: torch.Tensor,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    scale_radps: float,
+) -> torch.Tensor:
+    return packed_vertical_foot_yaw_loss_rows(
+        packed,
+        cur_pos,
+        cur_rot,
+        next_pos,
+        next_rot,
+        clip_ids,
+        cur_idx,
+        scale_radps,
+    ).mean()
+
+
+def packed_vertical_foot_yaw_loss_rows(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -977,7 +1066,7 @@ def packed_vertical_foot_yaw_loss(
     else:
         bounds = packed.support_foot_yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
     scale = max(float(scale_radps), 1e-6)
-    return (F.relu(speeds - bounds) / scale).mean()
+    return F.relu(speeds - bounds) / scale
 
 
 @torch.no_grad()
@@ -1222,7 +1311,8 @@ def run_batch_ae_truncated(
                 "contacts": pred_pose["contacts"],
             }
             prior_scores = [
-                ae_score(
+                (
+                    ae_score(
                     prior_info["model"],
                     prior_info["mean"],
                     prior_info["std"],
@@ -1239,10 +1329,16 @@ def run_batch_ae_truncated(
                     cfg.ae_score_loss,
                     cfg.ae_huber_delta,
                     compatibility_score_weight,
+                    ),
+                    float(prior_info.get("weight", 1.0)),
                 )
                 for prior_info in priors
             ]
-            score = torch.stack(prior_scores).mean()
+            score = (
+                torch.stack([raw_score * weight for raw_score, weight in prior_scores]).sum()
+                if prior_scores
+                else torch.zeros((), device=device)
+            )
             step_loss = cfg.ae_loss_weight * score
             simple_slide_loss = torch.zeros((), device=device)
             if cfg.simple_footslide_loss_weight > 0.0:
@@ -1667,6 +1763,7 @@ def run_batch_ae_packed(
     compatibility_score_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     clip_ids = batch[0].long().to(device)
+    initial_clip_ids = clip_ids.detach().clone()
     starts = batch[1].long().to(device)
     init_clip_ids = None
     init_starts = None
@@ -1688,6 +1785,7 @@ def run_batch_ae_packed(
         cur_pose = packed.get_pose(init_clip_ids, init_starts)
 
     total_loss = torch.zeros((), device=device)
+    row_loss_accum = torch.zeros_like(clip_ids, dtype=torch.float32, device=device)
     score_values: list[torch.Tensor] = []
     motion_values: list[torch.Tensor] = []
     joint_values: list[torch.Tensor] = []
@@ -1784,7 +1882,7 @@ def run_batch_ae_packed(
         }
         prior_scores: list[tuple[torch.Tensor, float, str]] = []
         for prior_info in transition_priors:
-            raw_score = ae_score(
+            raw_score_rows = ae_score_rows(
                 prior_info["model"],
                 prior_info["mean"],
                 prior_info["std"],
@@ -1804,7 +1902,7 @@ def run_batch_ae_packed(
             )
             prior_scores.append(
                 (
-                    raw_score,
+                    raw_score_rows,
                     float(prior_info.get("weight", 1.0)),
                     str(prior_info.get("label", "transition")),
                 )
@@ -1870,29 +1968,33 @@ def run_batch_ae_packed(
                         window_x = torch.cat(parts, dim=-1)
                     else:
                         window_x = torch.cat([part[ready] for part in window_buffers[prior_i][-window_size:]], dim=-1)
-                    raw_score = ae_score_normalized(
+                    ready_score_rows = ae_score_normalized_rows(
                         prior_info["model"],
                         window_x,
                         cfg.ae_score_loss,
                         cfg.ae_huber_delta,
                         compatibility_score_weight,
                     )
-                    raw_score = raw_score * ready.float().mean()
+                    raw_score_rows = torch.zeros_like(clip_ids, dtype=torch.float32, device=device)
+                    raw_score_rows[ready] = ready_score_rows
                     prior_scores.append(
                         (
-                            raw_score,
+                            raw_score_rows,
                             float(prior_info.get("weight", 1.0)),
                             str(prior_info.get("label", f"window_w{window_size:02d}")),
                         )
                     )
-        score = (
-            torch.stack([raw_score * weight for raw_score, weight, _label in prior_scores]).sum()
+        score_rows = (
+            torch.stack([raw_score_rows * weight for raw_score_rows, weight, _label in prior_scores], dim=0).sum(dim=0)
             if prior_scores
-            else torch.zeros((), device=device)
+            else torch.zeros_like(clip_ids, dtype=torch.float32, device=device)
         )
+        score = reduce_ae_score_rows(score_rows, cfg)
         if prior_scores:
             total_loss = total_loss + cfg.ae_loss_weight * score / ae_denominator
-            for raw_score, weight, label in prior_scores:
+            row_loss_accum = row_loss_accum + (cfg.ae_loss_weight * score_rows / ae_denominator).detach()
+            for raw_score_rows, weight, label in prior_scores:
+                raw_score = raw_score_rows.mean()
                 prior_raw_values.setdefault(label, []).append(raw_score.detach())
                 prior_weighted_values.setdefault(label, []).append((raw_score * weight).detach())
         step_loss = torch.zeros((), device=device)
@@ -1910,7 +2012,7 @@ def run_batch_ae_packed(
             )
         if cfg.simple_footslide_loss_weight > 0.0:
             assert cur_global_pos is not None and cur_global_rot is not None
-            simple_slide_loss = packed_envelope_footslide_loss(
+            simple_slide_rows = packed_envelope_footslide_loss_rows(
                 packed,
                 cur_global_pos,
                 cur_global_rot,
@@ -1921,11 +2023,15 @@ def run_batch_ae_packed(
                 cfg.simple_footslide_threshold_mps,
                 cfg.turn_idle_footslide_tolerance_divisor,
             )
+            simple_slide_loss = simple_slide_rows.mean()
             step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
+            row_loss_accum = row_loss_accum + (
+                cfg.simple_footslide_loss_weight * simple_slide_rows / max(1, int(rollout_k))
+            ).detach()
         foot_yaw_loss = torch.zeros((), device=device)
         if cfg.foot_yaw_loss_weight > 0.0:
             assert cur_global_pos is not None and cur_global_rot is not None
-            foot_yaw_loss = packed_vertical_foot_yaw_loss(
+            foot_yaw_rows = packed_vertical_foot_yaw_loss_rows(
                 packed,
                 cur_global_pos,
                 cur_global_rot,
@@ -1935,7 +2041,11 @@ def run_batch_ae_packed(
                 cur_idx,
                 cfg.foot_yaw_loss_scale_radps,
             )
+            foot_yaw_loss = foot_yaw_rows.mean()
             step_loss = step_loss + cfg.foot_yaw_loss_weight * foot_yaw_loss
+            row_loss_accum = row_loss_accum + (
+                cfg.foot_yaw_loss_weight * foot_yaw_rows / max(1, int(rollout_k))
+            ).detach()
         motion_floor_loss = torch.zeros((), device=device)
         if cfg.motion_floor_loss_weight > 0.0:
             motion_schema = tae.transition_schema(packed.prototype, cfg)
@@ -2037,6 +2147,8 @@ def run_batch_ae_packed(
         "foot_yaw": mean_metric(foot_yaw_values),
         "motion_floor": mean_metric(motion_floor_values),
         "active_fraction": 1.0,
+        "__clip_ids": initial_clip_ids.detach().cpu(),
+        "__row_loss": row_loss_accum.detach().cpu(),
         **{f"ae_raw/{label}": mean_metric(values) for label, values in prior_raw_values.items()},
         **{f"ae_weighted/{label}": mean_metric(values) for label, values in prior_weighted_values.items()},
     }
@@ -2114,7 +2226,7 @@ def train(args: argparse.Namespace) -> None:
     cfg.synthetic_agent_fraction = min(1.0, max(0.0, float(args.synthetic_agent_fraction)))
     cfg.init_pose_sampling = args.init_pose_sampling
     cfg.agent_fixed_start_frame = max(0, int(args.agent_fixed_start_frame))
-    cfg.enable_contact_physics_losses = not args.no_contact_physics_losses
+    cfg.enable_contact_physics_losses = bool(args.contact_physics_losses)
     cfg.enable_early_termination = args.enable_early_termination
     cfg.restart_on_termination = not args.no_restart_on_termination
     cfg.reset_exhausted_agents = bool(args.reset_exhausted_agents)
@@ -2130,6 +2242,8 @@ def train(args: argparse.Namespace) -> None:
     cfg.ae_loss_weight = args.ae_loss_weight
     cfg.ae_score_loss = args.ae_score_loss
     cfg.ae_huber_delta = args.ae_huber_delta
+    cfg.ae_row_top_fraction = min(1.0, max(0.0, float(args.ae_row_top_fraction)))
+    cfg.ae_row_top_weight = max(0.0, float(args.ae_row_top_weight))
     cfg.simple_footslide_loss_weight = args.simple_footslide_loss_weight
     cfg.simple_footslide_threshold_mps = args.simple_footslide_threshold_mps
     cfg.simple_footslide_gt_margin = args.simple_footslide_gt_margin
@@ -2185,6 +2299,11 @@ def train(args: argparse.Namespace) -> None:
         prior_weights.extend(float(weight) for weight in args.extra_prior_weight)
         while len(prior_weights) < len(prior_paths):
             prior_weights.append(1.0)
+        active_prior_pairs = [(path, weight) for path, weight in zip(prior_paths, prior_weights) if abs(float(weight)) > 0.0]
+        if not active_prior_pairs:
+            raise ValueError("At least one AE prior weight must be non-zero")
+        prior_paths = [path for path, _weight in active_prior_pairs]
+        prior_weights = [float(weight) for _path, weight in active_prior_pairs]
         priors = load_prior_bundle(prior_paths, device, prior_weights)
         print(
             "AE priors: "
@@ -2240,6 +2359,8 @@ def train(args: argparse.Namespace) -> None:
     run_dir = tl.resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
     writer = SummaryWriter(run_dir / "tb")
+    print(f"pure_ae run_dir={run_dir}", flush=True)
+    print(f"pure_ae best_checkpoint={ckpt_dir / 'checkpoint_best.pt'}", flush=True)
     schedule = tuple(max(1, int(k)) for k in cfg.rollout_schedule) or (1,)
     if args.visual_reporter:
         print("visual reporter disabled: use the standalone model viewer instead", flush=True)
@@ -2324,6 +2445,13 @@ def train(args: argparse.Namespace) -> None:
             for part in args.mixed_rollout_cohort_weights.replace(";", ",").split(",")
             if part.strip()
         ],
+        "adaptive_clip_sampling": bool(args.adaptive_clip_sampling),
+        "adaptive_clip_score_k": int(args.adaptive_clip_score_k),
+        "adaptive_clip_score_ema": float(args.adaptive_clip_score_ema),
+        "adaptive_clip_score_floor": float(args.adaptive_clip_score_floor),
+        "adaptive_clip_score_batch_size": int(args.adaptive_clip_score_batch_size),
+        "adaptive_clip_leaderboard_top_n": int(args.adaptive_clip_leaderboard_top_n),
+        "adaptive_clip_leaderboard_every_epochs": int(args.adaptive_clip_leaderboard_every_epochs),
         "compile_enabled": compile_enabled,
     }
 
@@ -2367,6 +2495,9 @@ def train(args: argparse.Namespace) -> None:
     stage_clip_weights: list[float] = []
     synthetic_stage_clip_indices: list[int] = []
     synthetic_stage_clip_weights: list[float] = []
+    adaptive_scores = torch.zeros((len(clips),), dtype=torch.float32, device=device)
+    adaptive_seen = torch.zeros((len(clips),), dtype=torch.bool, device=device)
+    adaptive_counts = torch.zeros((len(clips),), dtype=torch.long, device=device)
 
     def make_loader(max_rollout: int) -> tuple[tl.MotionIndexDataset, DataLoader]:
         dataset = AnyStartDataset(clips, cfg, max_rollout)
@@ -2399,7 +2530,7 @@ def train(args: argparse.Namespace) -> None:
             False: cfg.nonperiodic_sampling_weight,
         }
         if cfg.reset_exhausted_agents:
-            stage_clip_weights = [
+            base_stage_clip_weights = [
                 group_weights[clips[ci].cyclic_animation] / group_counts[clips[ci].cyclic_animation]
                 for ci in stage_clip_indices
             ]
@@ -2408,12 +2539,24 @@ def train(args: argparse.Namespace) -> None:
                 expected_active_rollout_steps(clips[ci], cfg, max_rollout, cfg.agent_min_cohort_steps)
                 for ci in stage_clip_indices
             ]
-            stage_clip_weights = [
+            base_stage_clip_weights = [
                 group_weights[clips[ci].cyclic_animation]
                 / group_counts[clips[ci].cyclic_animation]
                 / max(1e-6, steps)
                 for ci, steps in zip(stage_clip_indices, expected_steps)
             ]
+        use_adaptive = False
+        if args.adaptive_clip_sampling:
+            stage_tensor = torch.tensor(stage_clip_indices, dtype=torch.long, device=device)
+            use_adaptive = bool(adaptive_seen.index_select(0, stage_tensor).all().detach().cpu())
+        if use_adaptive:
+            floor = max(0.0, float(args.adaptive_clip_score_floor))
+            stage_clip_weights = [
+                max(floor, float(adaptive_scores[int(ci)].detach().cpu()))
+                for ci in stage_clip_indices
+            ]
+        else:
+            stage_clip_weights = base_stage_clip_weights
         if not any(weight > 0.0 for weight in stage_clip_weights):
             stage_clip_weights = [1.0 for _ in stage_clip_indices]
         synthetic_stage_clip_weights = [1.0 for _ in synthetic_stage_clip_indices]
@@ -2424,6 +2567,201 @@ def train(args: argparse.Namespace) -> None:
                 synthetic_stage_clip_indices,
                 synthetic_stage_clip_weights,
             )
+
+    def adaptive_score_rollout_k(clip_index: int, requested_k: int) -> int:
+        clip = clips[int(clip_index)]
+        requested_k = max(1, int(requested_k))
+        if clip.cyclic_animation:
+            return requested_k
+        return max(1, min(requested_k, int(clip.T) - transition_feature_horizon(cfg) - 1))
+
+    def grade_adaptive_clips(max_rollout: int, picked_clip_ids: list[int]) -> dict[str, float]:
+        if not args.adaptive_clip_sampling:
+            return {}
+        if packed is None:
+            raise ValueError("--adaptive-clip-sampling requires the packed rollout path")
+        if not stage_clip_indices:
+            return {}
+
+        stage_set = set(int(ci) for ci in stage_clip_indices)
+        unseen = [
+            int(ci)
+            for ci in stage_clip_indices
+            if not bool(adaptive_seen[int(ci)].detach().cpu())
+        ]
+        if unseen:
+            candidates = unseen
+        else:
+            candidates = sorted({int(ci) for ci in picked_clip_ids if int(ci) in stage_set})
+        if not candidates:
+            return {}
+
+        requested_k = int(args.adaptive_clip_score_k) if int(args.adaptive_clip_score_k) > 0 else int(max_rollout)
+        batch_size = max(1, int(args.adaptive_clip_score_batch_size))
+        was_training = model.training
+        observed: dict[int, list[float]] = {}
+        model.eval()
+        with torch.no_grad():
+            by_k: dict[int, list[int]] = {}
+            for ci in candidates:
+                k_eff = adaptive_score_rollout_k(ci, requested_k)
+                by_k.setdefault(k_eff, []).append(ci)
+            for k_eff, group in sorted(by_k.items()):
+                for start_i in range(0, len(group), batch_size):
+                    chunk = group[start_i : start_i + batch_size]
+                    starts = []
+                    for ci in chunk:
+                        max_start = clip_sample_start_max(clips[ci], cfg, k_eff, cfg.agent_min_cohort_steps)
+                        if cfg.agent_fixed_start_frame > 0:
+                            starts.append(min(int(cfg.agent_fixed_start_frame), max_start))
+                        else:
+                            starts.append(agent_rng.randint(1, max_start))
+                    score_batch = [
+                        torch.tensor(chunk, dtype=torch.long),
+                        torch.tensor(starts, dtype=torch.long),
+                    ]
+                    _loss, scalars = run_batch_ae_packed(
+                        model,
+                        priors,
+                        packed,
+                        score_batch,
+                        cfg,
+                        k_eff,
+                        device,
+                        compute_diagnostics=False,
+                        compatibility_score_weight=args.compatibility_score_weight,
+                    )
+                    row_clip_ids = scalars.get("__clip_ids")
+                    row_losses = scalars.get("__row_loss")
+                    if not isinstance(row_clip_ids, torch.Tensor) or not isinstance(row_losses, torch.Tensor):
+                        raise RuntimeError("adaptive scoring expected row-wise clip ids and losses")
+                    for row_ci, row_loss in zip(row_clip_ids.tolist(), row_losses.tolist()):
+                        observed.setdefault(int(row_ci), []).append(float(row_loss))
+        if was_training:
+            model.train()
+
+        ema = min(1.0, max(0.0, float(args.adaptive_clip_score_ema)))
+        for ci, values in observed.items():
+            value = float(sum(values) / max(1, len(values)))
+            if bool(adaptive_seen[ci].detach().cpu()):
+                adaptive_scores[ci] = (1.0 - ema) * adaptive_scores[ci] + ema * value
+            else:
+                adaptive_scores[ci] = value
+                adaptive_seen[ci] = True
+            adaptive_counts[ci] += 1
+
+        refresh_stage_sampling(max_rollout)
+        stage_tensor = torch.tensor(stage_clip_indices, dtype=torch.long, device=device)
+        stage_seen = adaptive_seen.index_select(0, stage_tensor)
+        seen_fraction = float(stage_seen.float().mean().detach().cpu())
+        seen_scores = adaptive_scores.index_select(0, stage_tensor)[stage_seen]
+        score_mean = float(seen_scores.mean().detach().cpu()) if seen_scores.numel() else 0.0
+        score_max = float(seen_scores.max().detach().cpu()) if seen_scores.numel() else 0.0
+        score_min = float(seen_scores.min().detach().cpu()) if seen_scores.numel() else 0.0
+        if observed:
+            print(
+                f"adaptive_clip_sampling graded={len(observed)} seen={seen_fraction:.3f} "
+                f"active={1 if seen_fraction >= 1.0 else 0} score_mean={score_mean:.6g} "
+                f"score_min={score_min:.6g} score_max={score_max:.6g}",
+                flush=True,
+            )
+        return {
+            "graded": float(len(observed)),
+            "seen_fraction": seen_fraction,
+            "active": 1.0 if seen_fraction >= 1.0 else 0.0,
+            "score_mean": score_mean,
+            "score_min": score_min,
+            "score_max": score_max,
+        }
+
+    def adaptive_clip_leaderboard_rows() -> list[dict[str, object]]:
+        if not args.adaptive_clip_sampling or not stage_clip_indices:
+            return []
+        weights = [max(0.0, float(w)) for w in stage_clip_weights]
+        weight_sum = sum(weights)
+        rows: list[dict[str, object]] = []
+        for ci, weight in zip(stage_clip_indices, weights):
+            score = float(adaptive_scores[int(ci)].detach().cpu())
+            seen = bool(adaptive_seen[int(ci)].detach().cpu())
+            rows.append(
+                {
+                    "rank": 0,
+                    "clip_index": int(ci),
+                    "clip_name": Path(clips[int(ci)].path).stem,
+                    "clip_path": str(clips[int(ci)].path),
+                    "score": score,
+                    "sample_probability": (weight / weight_sum) if weight_sum > 0.0 else 0.0,
+                    "grade_count": int(adaptive_counts[int(ci)].detach().cpu()),
+                    "seen": int(seen),
+                    "cyclic": int(bool(clips[int(ci)].cyclic_animation)),
+                    "frames": int(clips[int(ci)].T),
+                }
+            )
+        rows.sort(key=lambda row: (float(row["score"]), float(row["sample_probability"])), reverse=True)
+        for rank, row in enumerate(rows, start=1):
+            row["rank"] = rank
+        return rows
+
+    def write_adaptive_clip_leaderboard(epoch: int) -> None:
+        if not args.adaptive_clip_sampling:
+            return
+        every = max(1, int(args.adaptive_clip_leaderboard_every_epochs))
+        if epoch % every != 0:
+            return
+        rows = adaptive_clip_leaderboard_rows()
+        if not rows:
+            return
+        board_dir = run_dir / "adaptive_clip_leaderboard"
+        board_dir.mkdir(parents=True, exist_ok=True)
+        latest_csv = board_dir / "latest.csv"
+        latest_json = board_dir / "latest_top.json"
+        fields = [
+            "rank",
+            "clip_index",
+            "clip_name",
+            "score",
+            "sample_probability",
+            "grade_count",
+            "seen",
+            "cyclic",
+            "frames",
+            "clip_path",
+        ]
+        with latest_csv.open("w", newline="", encoding="utf-8") as f:
+            writer_csv = csv.DictWriter(f, fieldnames=fields)
+            writer_csv.writeheader()
+            writer_csv.writerows(rows)
+        top_n = max(1, int(args.adaptive_clip_leaderboard_top_n))
+        top_rows = rows[:top_n]
+        latest_json.write_text(
+            json.dumps({"epoch": int(epoch), "top": top_rows}, indent=2),
+            encoding="utf-8",
+        )
+        history_csv = board_dir / "history_top.csv"
+        write_header = not history_csv.exists()
+        with history_csv.open("a", newline="", encoding="utf-8") as f:
+            writer_csv = csv.DictWriter(f, fieldnames=["epoch", *fields])
+            if write_header:
+                writer_csv.writeheader()
+            for row in top_rows:
+                writer_csv.writerow({"epoch": int(epoch), **row})
+        writer.add_text(
+            "adaptive/leaderboard_top",
+            "\n".join(
+                f"{int(row['rank']):02d}. {row['clip_name']} "
+                f"score={float(row['score']):.6g} "
+                f"p={float(row['sample_probability']):.3f} "
+                f"n={int(row['grade_count'])}"
+                for row in top_rows[: min(10, top_n)]
+            ),
+            epoch,
+        )
+        top_line = "; ".join(
+            f"{row['clip_name']}={float(row['score']):.4g}/p{float(row['sample_probability']):.2f}"
+            for row in top_rows[: min(5, top_n)]
+        )
+        if top_line:
+            print(f"adaptive_clip_leaderboard epoch={epoch} top: {top_line}", flush=True)
 
     def reset_agent_coverage_order(dataset: tl.MotionIndexDataset) -> None:
         nonlocal agent_coverage_order, agent_coverage_cursor
@@ -2706,6 +3044,13 @@ def train(args: argparse.Namespace) -> None:
             train_iter = list(loader)
             rollout_iter = [int(rollout_k) for _ in train_iter]
             rollout_report_iter = [float(rollout_k) for _ in train_iter]
+        picked_clip_ids = sorted(
+            {
+                int(ci)
+                for batch in train_iter
+                for ci in batch[0].detach().cpu().tolist()
+            }
+        )
         stage_batches += len(train_iter)
         for accum_start in range(0, len(train_iter), cfg.gradient_accumulation_batches):
             accum_batches = train_iter[accum_start : accum_start + cfg.gradient_accumulation_batches]
@@ -2734,6 +3079,7 @@ def train(args: argparse.Namespace) -> None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             with profiler.section("train/optimizer_step"):
                 opt.step()
+        adaptive_stats = grade_adaptive_clips(int(rollout_k), picked_clip_ids)
         train_total = float(np.mean([p["total"] for p in parts]))
         train_score = float(np.mean([p["ae_score"] for p in parts]))
         motion_rms = float(np.mean([p["canon_step_rms"] for p in parts]))
@@ -2829,6 +3175,14 @@ def train(args: argparse.Namespace) -> None:
         writer.add_scalar("curriculum/real_eligible_clips", real_eligible_clip_count, epoch)
         writer.add_scalar("curriculum/synthetic_eligible_clips", synthetic_eligible_clip_count, epoch)
         writer.add_scalar("curriculum/synthetic_agent_fraction", cfg.synthetic_agent_fraction, epoch)
+        if adaptive_stats:
+            writer.add_scalar("adaptive/graded_clips", adaptive_stats["graded"], epoch)
+            writer.add_scalar("adaptive/seen_fraction", adaptive_stats["seen_fraction"], epoch)
+            writer.add_scalar("adaptive/active", adaptive_stats["active"], epoch)
+            writer.add_scalar("adaptive/score_mean", adaptive_stats["score_mean"], epoch)
+            writer.add_scalar("adaptive/score_min", adaptive_stats["score_min"], epoch)
+            writer.add_scalar("adaptive/score_max", adaptive_stats["score_max"], epoch)
+            write_adaptive_clip_leaderboard(epoch)
         if min_stage_batches > 0:
             writer.add_scalar("curriculum/min_stage_batches", min_stage_batches, epoch)
         improved = selection_metric < best - cfg.curriculum_min_delta
@@ -2880,6 +3234,8 @@ def train(args: argparse.Namespace) -> None:
             f"active={active_fraction:.3f} stalls={stalls} stage_batches={stage_batches}/{min_stage_batches} "
             f"eligible_clips={eligible_clip_count} real_clips={real_eligible_clip_count} "
             f"synthetic_clips={synthetic_eligible_clip_count} synthetic_frac={cfg.synthetic_agent_fraction:.3f} "
+            f"adaptive_seen={adaptive_stats.get('seen_fraction', 0.0) if adaptive_stats else 0.0:.3f} "
+            f"adaptive_active={adaptive_stats.get('active', 0.0) if adaptive_stats else 0.0:.0f} "
             f"effective_k={effective_rollout_mean:.1f} "
             f"elapsed_s={time.perf_counter() - start_time:.1f}",
             flush=True,
@@ -3076,6 +3432,51 @@ def main() -> None:
             "They are normalized, so 5,10,15 and 1,2,3 are equivalent."
         ),
     )
+    parser.add_argument(
+        "--adaptive-clip-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "After every real clip has been graded once, sample real clips in proportion to their "
+            "latest rollout loss estimate so hard motions are replayed more often."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-clip-score-k",
+        type=int,
+        default=0,
+        help="Rollout K used for clip grading. 0 means the current scheduled K.",
+    )
+    parser.add_argument(
+        "--adaptive-clip-score-ema",
+        type=float,
+        default=0.35,
+        help="EMA update rate for clip difficulty scores after the initial grade.",
+    )
+    parser.add_argument(
+        "--adaptive-clip-score-floor",
+        type=float,
+        default=1e-6,
+        help="Minimum positive sampling weight for already-graded clips.",
+    )
+    parser.add_argument(
+        "--adaptive-clip-score-batch-size",
+        type=int,
+        default=64,
+        help="No-grad microbatch size for adaptive clip grading.",
+    )
+    parser.add_argument(
+        "--adaptive-clip-leaderboard-top-n",
+        type=int,
+        default=25,
+        help="Number of hardest clips to keep in the adaptive leaderboard JSON/history and TensorBoard text.",
+    )
+    parser.add_argument(
+        "--adaptive-clip-leaderboard-every-epochs",
+        type=int,
+        default=1,
+        help="Write the adaptive clip leaderboard every N epochs.",
+    )
     parser.add_argument("--stop-on-final-stall", action="store_true")
     parser.add_argument("--max-train-seconds", type=float, default=0.0)
     parser.add_argument("--timed-checkpoint-interval-minutes", type=float, default=30.0)
@@ -3093,6 +3494,18 @@ def main() -> None:
     )
     parser.add_argument("--ae-score-loss", choices=("mse", "huber"), default="mse")
     parser.add_argument("--ae-huber-delta", type=float, default=1.0)
+    parser.add_argument(
+        "--ae-row-top-fraction",
+        type=float,
+        default=0.0,
+        help="Optional fraction of worst AE-scored rows to add to the mean AE loss. 0 keeps the old pure mean.",
+    )
+    parser.add_argument(
+        "--ae-row-top-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the worst-row AE term used with --ae-row-top-fraction.",
+    )
     parser.add_argument("--save-live-every-epochs", type=int, default=20)
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--live-npz-path", default="data/npz_final/testcasc.npz")
@@ -3110,7 +3523,19 @@ def main() -> None:
     )
     parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--no-contact-physics-losses", action="store_true")
+    parser.add_argument(
+        "--contact-physics-losses",
+        dest="contact_physics_losses",
+        action="store_true",
+        default=False,
+        help="Opt into the older differentiable contact-physics auxiliary losses. Pure AE runs leave this off.",
+    )
+    parser.add_argument(
+        "--no-contact-physics-losses",
+        dest="contact_physics_losses",
+        action="store_false",
+        help="Explicitly keep contact-physics auxiliary losses disabled.",
+    )
     parser.add_argument("--enable-early-termination", action="store_true")
     parser.add_argument("--no-restart-on-termination", action="store_true")
     parser.add_argument(

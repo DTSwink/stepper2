@@ -116,7 +116,8 @@ def energy(model: torch.nn.Module, x: torch.Tensor, batch_size: int = 4096) -> t
     for start in range(0, x.shape[0], batch_size):
         batch = x[start : start + batch_size]
         recon = model(batch)
-        values.append(F.mse_loss(recon, batch, reduction="none").mean(dim=-1))
+        target = model.target(batch) if hasattr(model, "target") else batch
+        values.append(tae.reconstruction_loss_rows(model, recon, target, loss_type="mse"))
     return torch.cat(values, dim=0)
 
 
@@ -128,6 +129,41 @@ def write_rows(path: Path, rows: list[dict[str, float]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def sample_feature_rows(features: torch.Tensor, max_rows: int, seed: int) -> torch.Tensor:
+    if max_rows <= 0 or features.shape[0] <= max_rows:
+        return features
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    indices = torch.randperm(features.shape[0], generator=gen)[:max_rows]
+    return features.index_select(0, indices)
+
+
+@torch.no_grad()
+def keep_low_energy_fakes(
+    fake_features: torch.Tensor,
+    init_ckpt: dict | None,
+    schema: dict[str, int],
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    device: torch.device,
+    keep_fraction: float,
+) -> torch.Tensor:
+    keep_fraction = float(keep_fraction)
+    if init_ckpt is None or keep_fraction <= 0.0 or keep_fraction >= 1.0 or fake_features.shape[0] <= 1:
+        return fake_features
+    ae_cfg = tae.AEConfig(**init_ckpt["config"])
+    prior = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
+    missing, unexpected = prior.load_state_dict(init_ckpt["model"], strict=False)
+    if missing or unexpected:
+        print(f"hard-negative score prior partial load missing={missing} unexpected={unexpected}", flush=True)
+    prior.eval()
+    fake_norm = tae.normalise(fake_features, mean.cpu(), std.cpu()).to(device)
+    scores = energy(prior, fake_norm).detach().cpu()
+    keep = max(1, int(math.ceil(fake_features.shape[0] * keep_fraction)))
+    indices = torch.argsort(scores)[:keep]
+    return fake_features.index_select(0, indices)
 
 
 def save_checkpoint(
@@ -250,6 +286,50 @@ def train(args: argparse.Namespace) -> None:
 
     mean = real_features.mean(dim=0)
     std = real_features.std(dim=0).clamp_min(ae_cfg.std_floor)
+    raw_fake_count = int(fake_features.shape[0])
+    fake_features = keep_low_energy_fakes(
+        fake_features,
+        init_ckpt,
+        schema,
+        mean,
+        std,
+        device,
+        args.hard_negative_keep_fraction,
+    )
+    kept_fake_count = int(fake_features.shape[0])
+    buffer_loaded_count = 0
+    fake_buffer_path = tl.resolve_path(args.fake_buffer_path) if args.fake_buffer_path else None
+    if fake_buffer_path is not None and fake_buffer_path.exists():
+        payload = torch.load(fake_buffer_path, map_location="cpu", weights_only=False)
+        buffered = payload["features"] if isinstance(payload, dict) and "features" in payload else payload
+        if not isinstance(buffered, torch.Tensor):
+            raise TypeError(f"fake buffer did not contain a tensor: {fake_buffer_path}")
+        if buffered.ndim != 2 or buffered.shape[1] != schema["total_dim"]:
+            raise RuntimeError(
+                f"fake buffer dim mismatch {tuple(buffered.shape)} expected (*,{schema['total_dim']}) at {fake_buffer_path}"
+            )
+        buffer_loaded_count = int(buffered.shape[0])
+        fake_features = torch.cat((buffered.float(), fake_features.cpu().float()), dim=0)
+    if fake_buffer_path is not None:
+        fake_features = sample_feature_rows(fake_features.cpu().float(), args.fake_buffer_max_rows, args.seed + 1009)
+        fake_buffer_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "features": fake_features,
+                "schema": schema,
+                "updated_at": time.time(),
+                "source_controller_checkpoint": str(controller_checkpoint),
+                "raw_fake_count": raw_fake_count,
+                "kept_fake_count": kept_fake_count,
+                "buffer_loaded_count": buffer_loaded_count,
+            },
+            fake_buffer_path,
+        )
+        print(
+            f"fake buffer {fake_buffer_path} loaded={buffer_loaded_count} raw={raw_fake_count} "
+            f"kept={kept_fake_count} total={fake_features.shape[0]}",
+            flush=True,
+        )
     real_norm = tae.normalise(real_features, mean, std).to(device)
     fake_norm = tae.normalise(fake_features, mean, std).to(device)
     mean = mean.to(device)
@@ -277,6 +357,12 @@ def train(args: argparse.Namespace) -> None:
         "real_weight": args.real_weight,
         "compatibility_real_weight": args.compatibility_real_weight,
         "compatibility_fake_weight": args.compatibility_fake_weight,
+        "fake_buffer_path": str(fake_buffer_path) if fake_buffer_path is not None else "",
+        "fake_buffer_max_rows": args.fake_buffer_max_rows,
+        "hard_negative_keep_fraction": args.hard_negative_keep_fraction,
+        "raw_fake_count": raw_fake_count,
+        "kept_fake_count": kept_fake_count,
+        "buffer_loaded_count": buffer_loaded_count,
     }
     (run_dir / "config.json").write_text(
         json.dumps({"ae_config": asdict(ae_cfg), "metadata": metadata}, indent=2),
@@ -316,8 +402,8 @@ def train(args: argparse.Namespace) -> None:
                 noisy_real = real_batch + args.input_noise_std * torch.randn_like(real_batch)
             real_recon = model(noisy_real)
             fake_recon = model(fake_batch)
-            real_loss = F.huber_loss(real_recon, real_batch)
-            fake_err = F.mse_loss(fake_recon, fake_batch, reduction="none").mean(dim=-1)
+            real_loss = tae.reconstruction_loss(model, real_recon, model.target(real_batch), loss_type="huber")
+            fake_err = tae.reconstruction_loss_rows(model, fake_recon, model.target(fake_batch), loss_type="mse")
             fake_loss = F.relu(args.fake_margin - fake_err).mean()
             compat_real_loss = torch.zeros((), device=device)
             compat_fake_loss = torch.zeros((), device=device)
@@ -437,6 +523,9 @@ def train(args: argparse.Namespace) -> None:
         metadata,
     )
     writer.close()
+    print(f"model_aware_ae run_dir={run_dir}", flush=True)
+    print(f"model_aware_ae best_checkpoint={ckpt_dir / 'checkpoint_best.pt'}", flush=True)
+    print(f"model_aware_ae last_checkpoint={ckpt_dir / 'checkpoint_last.pt'}", flush=True)
 
 
 def main() -> None:
@@ -467,6 +556,18 @@ def main() -> None:
     parser.add_argument("--compatibility-fake-weight", type=float, default=0.0)
     parser.add_argument("--fake-starts-per-clip", type=int, default=16)
     parser.add_argument("--fake-rollout-steps", type=int, default=0)
+    parser.add_argument(
+        "--fake-buffer-path",
+        default="",
+        help="Optional persistent CPU tensor buffer for model-generated hard negatives.",
+    )
+    parser.add_argument("--fake-buffer-max-rows", type=int, default=200000)
+    parser.add_argument(
+        "--hard-negative-keep-fraction",
+        type=float,
+        default=1.0,
+        help="If an init prior is present, keep only this lowest-energy fraction of fresh generated fakes.",
+    )
     parser.add_argument("--eval-every-epochs", type=int, default=10)
     parser.add_argument("--stall-patience-epochs", type=int, default=50)
     parser.add_argument("--min-delta", type=float, default=1e-6)

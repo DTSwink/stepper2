@@ -26,7 +26,7 @@ $args = @(
     "--num-hidden-layers", "2",
     "--learning-rate", "1e-4",
     "--batch-size", "256",
-    "--max-epochs", "1000",
+    "--max-epochs", "10000000",
     "--rollout-schedule", "2,4,8,16,32,64",
     "--initial-rollout-k", "64",
     "--mixed-rollout-cohorts",

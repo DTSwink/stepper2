@@ -66,6 +66,8 @@ class WindowAEConfig:
     max_epochs: int = 240
     stall_patience_epochs: int = 45
     min_delta: float = 1e-6
+    input_noise_std: float = 0.0
+    input_noise_mask: str = "none"
     seed: int = 1234
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     feature_device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -207,7 +209,10 @@ def load_base_prior(path: Path, device: torch.device) -> tuple[tae.TransitionAut
             setattr(ae_cfg, key, value)
     schema = dict(ckpt["schema"])
     model = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
-    model.load_state_dict(ckpt["model"])
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    allowed_missing = {"reconstruction_weights"}
+    if unexpected or any(key not in allowed_missing for key in missing):
+        raise RuntimeError(f"Could not load base prior {path}: missing={missing}, unexpected={unexpected}")
     model.eval()
 
     locomotion_cfg = tl.TrainConfig()
@@ -653,10 +658,12 @@ def train_window_ae_dataset(
     best = math.inf
     stalls = 0
     start_time = time.perf_counter()
+    per_frame_noise_mask = tae.input_noise_mask(schema, cfg.input_noise_mask, device)
+    noise_mask = per_frame_noise_mask.repeat(int(window_size)).unsqueeze(0)
     print(
         f"window_ae W={window_size} windows={len(dataset)} dim={feature_dim * window_size} "
         f"conditional_root={cfg.conditional_root} anchor_first_root={cfg.anchor_first_root} "
-        f"batch={cfg.batch_size} device={device}",
+        f"noise={cfg.input_noise_std:g}/{cfg.input_noise_mask} batch={cfg.batch_size} device={device}",
         flush=True,
     )
     for epoch in range(1, cfg.max_epochs + 1):
@@ -665,7 +672,10 @@ def train_window_ae_dataset(
         count = 0
         for batch in loader:
             batch = batch.to(device, non_blocking=True)
-            recon = model(batch)
+            noisy = batch
+            if cfg.input_noise_std > 0.0:
+                noisy = batch + float(cfg.input_noise_std) * torch.randn_like(batch) * noise_mask
+            recon = model(noisy)
             loss = F.huber_loss(recon, model_target(model, batch))
             opt.zero_grad(set_to_none=True)
             loss.backward()

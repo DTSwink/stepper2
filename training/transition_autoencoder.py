@@ -40,6 +40,7 @@ class AEConfig:
     max_epochs: int = 2000
     seed: int = 1234
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    sample_mode: str = "rows"
     cyclic_animation: bool = False
     input_noise_std: float = 0.0
     input_noise_mask: str = "all"
@@ -55,6 +56,9 @@ class AEConfig:
     compatibility_statue_weight: float = 0.0
     compatibility_damped_weight: float = 0.0
     compatibility_damped_factor: float = 0.35
+    compatibility_yaw_body_weight: float = 0.0
+    compatibility_yaw_min_degrees: float = 6.0
+    compatibility_yaw_max_degrees: float = 25.0
     structured_denoise_statue_weight: float = 0.0
     structured_denoise_damped_weight: float = 0.0
     structured_denoise_damped_factor: float = 0.35
@@ -65,7 +69,14 @@ class AEConfig:
     include_transition_foot_motion: bool = False
     foot_slide_scale_mps: float = 1.0
     foot_yaw_scale_radps: float = 10.0
+    transition_foot_motion_loss_weight: float = 1.0
     root_lookahead_steps: int = 0
+    pelvis_feature_weight: float = 1.0
+    lower_body_feature_weight: float = 1.0
+    foot_feature_weight: float = 1.0
+    velocity_feature_weight: float = 1.0
+    reconstruction_top_fraction: float = 0.0
+    reconstruction_top_weight: float = 0.0
     conditional_root_window: bool = False
     condition_body_dropout_prob: float = 0.0
 
@@ -101,6 +112,11 @@ class TransitionAutoencoder(nn.Module):
         else:
             net_input_dim = int(dim)
             net_output_dim = int(dim)
+        reconstruction_weights = transition_reconstruction_weights(schema, cfg, net_output_dim, self.conditional_root_window)
+        self.register_buffer("reconstruction_weights", reconstruction_weights)
+        self.has_weighted_reconstruction = bool(torch.any(reconstruction_weights != 1.0).item())
+        self.reconstruction_top_fraction = max(0.0, min(1.0, float(cfg.reconstruction_top_fraction)))
+        self.reconstruction_top_weight = max(0.0, float(cfg.reconstruction_top_weight))
         encoder: list[nn.Module] = []
         in_dim = net_input_dim
         for _ in range(cfg.num_hidden_layers):
@@ -147,6 +163,204 @@ class TransitionAutoencoder(nn.Module):
         return self.compatibility_head(x).squeeze(-1)
 
 
+def transition_reconstruction_weights(
+    schema: dict[str, int] | None,
+    cfg: AEConfig,
+    output_dim: int,
+    conditional_root_window: bool,
+) -> torch.Tensor:
+    weights = torch.ones(int(output_dim), dtype=torch.float32)
+    if schema is None:
+        return weights
+    total_dim = int(schema["total_dim"])
+    full_weights = torch.ones(total_dim, dtype=torch.float32)
+
+    def apply(indices: list[int], value: float) -> None:
+        if value == 1.0 or not indices:
+            return
+        idx = torch.tensor([i for i in indices if 0 <= i < total_dim], dtype=torch.long)
+        if idx.numel() > 0:
+            full_weights[idx] = torch.maximum(full_weights[idx], torch.full_like(full_weights[idx], float(value)))
+
+    def body_sets() -> tuple[set[int], set[int]]:
+        names = [str(name).lower() for name in schema.get("body_names", [])]
+        lower_keywords = ("thigh", "calf", "leg", "knee", "ankle", "foot", "ball", "toe")
+        foot_keywords = ("foot", "ball", "toe")
+        lower = {i for i, name in enumerate(names) if any(key in name for key in lower_keywords)}
+        foot = {i for i, name in enumerate(names) if any(key in name for key in foot_keywords)}
+        foot.update(int(i) for i in schema.get("foot_indices", []))
+        foot.update(int(i) for i in schema.get("toe_indices", []))
+        lower.update(foot)
+        return lower, foot
+
+    lower_body, foot_bodies = body_sets()
+    body_count = int(schema.get("body_count", max(1, int(schema["next_canon_dim"]) // 3)))
+    nonpelvis = [int(i) for i in schema.get("non_pelvis", list(range(1, body_count)))]
+    nonpelvis_slot = {body_i: slot for slot, body_i in enumerate(nonpelvis)}
+    pose_dim = int(schema["pose_dim"])
+    output_dim_full = int(schema["output_dim"])
+    input_dim = int(schema["input_dim"])
+    next_output_start = int(schema["next_output_start"])
+    next_canon_start = int(schema["next_canon_start"])
+    next_velocity_start = int(schema["next_velocity_start"])
+    next_canon_dim = int(schema["next_canon_dim"])
+    next_velocity_dim = int(schema["next_velocity_dim"])
+    velocity_dim = int(schema["velocity_dim"])
+
+    def pose_indices(pose_start: int, include_contact: bool = True) -> tuple[list[int], list[int], list[int]]:
+        pelvis = list(range(pose_start, pose_start + 9))
+        canon_start = pose_start + 9
+        rot_start = canon_start + body_count * 3
+        lower: list[int] = []
+        foot: list[int] = []
+        for body_i in lower_body:
+            lower.extend(range(canon_start + body_i * 3, canon_start + body_i * 3 + 3))
+            slot = nonpelvis_slot.get(body_i)
+            if slot is not None:
+                lower.extend(range(rot_start + slot * 6, rot_start + slot * 6 + 6))
+        for body_i in foot_bodies:
+            foot.extend(range(canon_start + body_i * 3, canon_start + body_i * 3 + 3))
+            slot = nonpelvis_slot.get(body_i)
+            if slot is not None:
+                foot.extend(range(rot_start + slot * 6, rot_start + slot * 6 + 6))
+        return pelvis, lower, foot
+
+    pelvis_weight = float(getattr(cfg, "pelvis_feature_weight", 1.0))
+    lower_weight = float(getattr(cfg, "lower_body_feature_weight", 1.0))
+    foot_weight_cfg = float(getattr(cfg, "foot_feature_weight", 1.0))
+    velocity_weight = float(getattr(cfg, "velocity_feature_weight", 1.0))
+
+    for pose_start in (0, pose_dim):
+        pelvis_idx, lower_idx, foot_idx = pose_indices(pose_start)
+        apply(pelvis_idx, pelvis_weight)
+        apply(lower_idx, lower_weight)
+        apply(foot_idx, foot_weight_cfg)
+
+    # Current pose-delta input velocity: pelvis velocity followed by all canonical joint velocities.
+    input_velocity_start = pose_dim * 2
+    apply(list(range(input_velocity_start, input_velocity_start + velocity_dim)), velocity_weight)
+    joint_vel_start = input_velocity_start + 3
+    lower_vel: list[int] = []
+    foot_vel: list[int] = []
+    for body_i in lower_body:
+        lower_vel.extend(range(joint_vel_start + body_i * 3, joint_vel_start + body_i * 3 + 3))
+    for body_i in foot_bodies:
+        foot_vel.extend(range(joint_vel_start + body_i * 3, joint_vel_start + body_i * 3 + 3))
+    apply(lower_vel, max(lower_weight, velocity_weight))
+    apply(foot_vel, max(foot_weight_cfg, velocity_weight))
+
+    # Next output: pelvis position/rotation and non-pelvis rotations.
+    apply(list(range(next_output_start, next_output_start + 9)), pelvis_weight)
+    next_rot_start = next_output_start + 9
+    lower_rot: list[int] = []
+    foot_rot: list[int] = []
+    for body_i in lower_body:
+        slot = nonpelvis_slot.get(body_i)
+        if slot is not None:
+            lower_rot.extend(range(next_rot_start + slot * 6, next_rot_start + slot * 6 + 6))
+    for body_i in foot_bodies:
+        slot = nonpelvis_slot.get(body_i)
+        if slot is not None:
+            foot_rot.extend(range(next_rot_start + slot * 6, next_rot_start + slot * 6 + 6))
+    apply(lower_rot, lower_weight)
+    apply(foot_rot, foot_weight_cfg)
+
+    # Next canonical positions.
+    lower_canon: list[int] = []
+    foot_canon: list[int] = []
+    for body_i in lower_body:
+        lower_canon.extend(range(next_canon_start + body_i * 3, next_canon_start + body_i * 3 + 3))
+    for body_i in foot_bodies:
+        foot_canon.extend(range(next_canon_start + body_i * 3, next_canon_start + body_i * 3 + 3))
+    apply(lower_canon, lower_weight)
+    apply(foot_canon, foot_weight_cfg)
+
+    # Next pose-delta velocity.
+    apply(list(range(next_velocity_start, next_velocity_start + next_velocity_dim)), velocity_weight)
+    next_joint_vel_start = next_velocity_start + 3
+    lower_next_vel: list[int] = []
+    foot_next_vel: list[int] = []
+    for body_i in lower_body:
+        lower_next_vel.extend(range(next_joint_vel_start + body_i * 3, next_joint_vel_start + body_i * 3 + 3))
+    for body_i in foot_bodies:
+        foot_next_vel.extend(range(next_joint_vel_start + body_i * 3, next_joint_vel_start + body_i * 3 + 3))
+    apply(lower_next_vel, max(lower_weight, velocity_weight))
+    apply(foot_next_vel, max(foot_weight_cfg, velocity_weight))
+
+    foot_dim = int(schema.get("transition_foot_motion_dim", 0))
+    foot_weight = float(getattr(cfg, "transition_foot_motion_loss_weight", 1.0))
+    if foot_dim > 0 and foot_weight != 1.0:
+        foot_start = int(schema["transition_foot_motion_start"])
+        foot_end = foot_start + foot_dim
+        apply(list(range(foot_start, foot_end)), foot_weight)
+
+    if conditional_root_window:
+        _condition, target = conditional_transition_indices(schema)
+        return full_weights.index_select(0, target).contiguous()
+    return full_weights
+
+
+def reduce_reconstruction_error_rows(model: nn.Module, error: torch.Tensor) -> torch.Tensor:
+    mean_error = error.mean(dim=-1)
+    top_fraction = float(getattr(model, "reconstruction_top_fraction", 0.0))
+    top_weight = float(getattr(model, "reconstruction_top_weight", 0.0))
+    if top_fraction <= 0.0 or top_weight <= 0.0 or error.shape[-1] <= 1:
+        return mean_error
+    k = max(1, int(math.ceil(error.shape[-1] * min(1.0, top_fraction))))
+    top_mean = torch.topk(error, k=k, dim=-1, largest=True).values.mean(dim=-1)
+    return mean_error + top_weight * top_mean
+
+
+def reconstruction_loss(
+    model: nn.Module,
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str = "huber",
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    has_top = float(getattr(model, "reconstruction_top_fraction", 0.0)) > 0.0 and float(
+        getattr(model, "reconstruction_top_weight", 0.0)
+    ) > 0.0
+    has_weights = bool(getattr(model, "has_weighted_reconstruction", False))
+    if not has_top and not has_weights:
+        if loss_type == "mse":
+            return F.mse_loss(recon, target)
+        return F.huber_loss(recon, target, delta=huber_delta)
+    if loss_type == "mse":
+        error = F.mse_loss(recon, target, reduction="none")
+    else:
+        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
+    weights = getattr(model, "reconstruction_weights", None)
+    if weights is not None:
+        error = error * weights.to(device=error.device, dtype=error.dtype)
+    return reduce_reconstruction_error_rows(model, error).mean()
+
+
+def reconstruction_loss_rows(
+    model: nn.Module,
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    has_top = float(getattr(model, "reconstruction_top_fraction", 0.0)) > 0.0 and float(
+        getattr(model, "reconstruction_top_weight", 0.0)
+    ) > 0.0
+    has_weights = bool(getattr(model, "has_weighted_reconstruction", False))
+    if not has_top and not has_weights:
+        if loss_type == "huber":
+            return F.huber_loss(recon, target, reduction="none", delta=huber_delta).mean(dim=-1)
+        return F.mse_loss(recon, target, reduction="none").mean(dim=-1)
+    if loss_type == "huber":
+        error = F.huber_loss(recon, target, reduction="none", delta=huber_delta)
+    else:
+        error = F.mse_loss(recon, target, reduction="none")
+    weights = getattr(model, "reconstruction_weights", None)
+    if weights is not None:
+        error = error * weights.to(device=error.device, dtype=error.dtype)
+    return reduce_reconstruction_error_rows(model, error)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -166,6 +380,11 @@ def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int
     base_total_dim = input_dim + output_dim + next_canon_dim + next_velocity_dim
     total_without_root_lookahead = base_total_dim + transition_foot_motion_dim
     return {
+        "body_count": clip.J,
+        "body_names": list(clip.body_names),
+        "non_pelvis": [int(i) for i in clip.non_pelvis],
+        "foot_indices": [int(i) for i in clip.foot_indices],
+        "toe_indices": [int(i) for i in clip.toe_indices],
         "pose_dim": pose_dim,
         "velocity_dim": velocity_dim,
         "input_dim": input_dim,
@@ -319,6 +538,25 @@ def collect_clean_feature_rows(
     return torch.cat(chunks, dim=0), torch.cat(clip_chunks, dim=0), torch.cat(idx_chunks, dim=0)
 
 
+def balanced_clip_epoch_indices(
+    clip_ids: torch.Tensor,
+    total_samples: int,
+    device: torch.device,
+) -> torch.Tensor:
+    unique_clip_ids = torch.unique(clip_ids, sorted=True)
+    per_clip_rows = [torch.nonzero(clip_ids == clip_id, as_tuple=False).flatten() for clip_id in unique_clip_ids]
+    sampled_clip_slots = torch.randint(0, len(per_clip_rows), (total_samples,), device=device)
+    out = torch.empty((total_samples,), dtype=torch.long, device=device)
+    for slot, rows in enumerate(per_clip_rows):
+        mask = sampled_clip_slots == slot
+        count = int(mask.sum().item())
+        if count == 0:
+            continue
+        sampled_rows = rows[torch.randint(0, rows.numel(), (count,), device=device)]
+        out[mask] = sampled_rows
+    return out
+
+
 def collect_clean_features(clips: list[tl.MotionClip], cfg: tl.TrainConfig, device: torch.device) -> torch.Tensor:
     return collect_clean_feature_rows(clips, cfg, device)[0]
 
@@ -439,11 +677,103 @@ def make_damped_transition_tier(x: torch.Tensor, schema: dict[str, int], factor:
     return statue + factor * (x - statue)
 
 
+def rotate_flat_vectors(values: torch.Tensor, start: int, vector_count: int, yaw_rot: torch.Tensor) -> None:
+    if vector_count <= 0:
+        return
+    segment = values[:, start : start + vector_count * 3].reshape(values.shape[0], vector_count, 3)
+    values[:, start : start + vector_count * 3] = torch.matmul(segment, yaw_rot).reshape(values.shape[0], -1)
+
+
+def rotate_pelvis_rot6(values: torch.Tensor, start: int, yaw_rot: torch.Tensor) -> None:
+    pelvis_rot = tl.rotation_6d_to_matrix(values[:, start : start + 6])
+    values[:, start : start + 6] = tl.rotmat_to_6d(pelvis_rot @ yaw_rot)
+
+
+def make_yaw_body_tier(
+    x: torch.Tensor,
+    schema: dict[str, int],
+    yaw_degrees: float | torch.Tensor,
+) -> torch.Tensor:
+    """Rotate the body transition around the root vertical axis while keeping root commands unchanged.
+
+    This creates a focused root/body compatibility negative: the local motion can still look human,
+    but it no longer matches the commanded root heading. That is exactly the family of failures that
+    shows up visually as ice skating on turns/circles.
+    """
+    y = x.clone()
+    pose_dim = int(schema["pose_dim"])
+    velocity_dim = int(schema["velocity_dim"])
+    input_dim = int(schema["input_dim"])
+    output_start = int(schema["next_output_start"])
+    canon_start = int(schema["next_canon_start"])
+    vel_start = int(schema["next_velocity_start"])
+    output_dim = int(schema["output_dim"])
+    canon_dim = int(schema["next_canon_dim"])
+    next_vel_dim = int(schema["next_velocity_dim"])
+    joint_count = int(canon_dim // 3)
+
+    if isinstance(yaw_degrees, torch.Tensor):
+        yaw = torch.deg2rad(yaw_degrees.to(device=x.device, dtype=x.dtype)).reshape(-1)
+    else:
+        yaw = torch.full((x.shape[0],), math.radians(float(yaw_degrees)), dtype=x.dtype, device=x.device)
+    if yaw.numel() == 1 and x.shape[0] != 1:
+        yaw = yaw.expand(x.shape[0])
+    yaw_rot = tl.yaw_to_row_matrix(yaw)
+
+    current_pose = 0
+    previous_pose = pose_dim
+    rotate_flat_vectors(y, current_pose, 1, yaw_rot)
+    rotate_flat_vectors(y, current_pose + 9, joint_count, yaw_rot)
+    rotate_pelvis_rot6(y, current_pose + 3, yaw_rot)
+    rotate_flat_vectors(y, previous_pose, 1, yaw_rot)
+    rotate_flat_vectors(y, previous_pose + 9, joint_count, yaw_rot)
+    rotate_pelvis_rot6(y, previous_pose + 3, yaw_rot)
+
+    current_velocity = pose_dim * 2
+    rotate_flat_vectors(y, current_velocity, 1, yaw_rot)
+    rotate_flat_vectors(y, current_velocity + 3, joint_count, yaw_rot)
+
+    rotate_flat_vectors(y, output_start, 1, yaw_rot)
+    if output_dim >= 9:
+        rotate_pelvis_rot6(y, output_start + 3, yaw_rot)
+    rotate_flat_vectors(y, canon_start, joint_count, yaw_rot)
+    rotate_flat_vectors(y, vel_start, 1, yaw_rot)
+    rotate_flat_vectors(y, vel_start + 3, max(0, (next_vel_dim - 3) // 3), yaw_rot)
+
+    # Keep root features and future-root lookahead untouched on purpose.
+    _ = input_dim
+    return y
+
+
+def sample_yaw_body_negative(
+    clean: torch.Tensor,
+    batch_indices: torch.Tensor,
+    schema: dict[str, int],
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    cfg: AEConfig,
+) -> torch.Tensor:
+    raw = clean.index_select(0, batch_indices)
+    lo = abs(float(cfg.compatibility_yaw_min_degrees))
+    hi = abs(float(cfg.compatibility_yaw_max_degrees))
+    if hi < lo:
+        lo, hi = hi, lo
+    span = max(0.0, hi - lo)
+    angle = lo + span * torch.rand((raw.shape[0],), dtype=raw.dtype, device=raw.device)
+    sign = torch.where(
+        torch.rand((raw.shape[0],), dtype=raw.dtype, device=raw.device) < 0.5,
+        -torch.ones_like(angle),
+        torch.ones_like(angle),
+    )
+    return normalise(make_yaw_body_tier(raw, schema, angle * sign), mean, std)
+
+
 def make_tiers(x_norm: torch.Tensor, schema: dict[str, int]) -> dict[str, torch.Tensor]:
     mask = alteration_mask(schema, x_norm.device).unsqueeze(0)
     tier2 = x_norm + 0.05 * torch.randn_like(x_norm) * mask
     noisy_bad = x_norm + 0.75 * torch.randn_like(x_norm) * mask
     statue = make_statue_tier(x_norm, schema)
+    yaw_body = make_yaw_body_tier(x_norm, schema, 15.0)
     tier3 = torch.where((torch.arange(x_norm.shape[0], device=x_norm.device)[:, None] % 2) == 0, statue, noisy_bad)
     tier4 = torch.randn_like(x_norm)
     tier4[:, schema["input_root_start"] : schema["input_root_end"]] = x_norm[
@@ -453,6 +783,7 @@ def make_tiers(x_norm: torch.Tensor, schema: dict[str, int]) -> dict[str, torch.
         "tier1_clean": x_norm,
         "tier2_slight": tier2,
         "tier3_bad": tier3,
+        "tier3_yaw_body": yaw_body,
         "tier4_noise": tier4,
     }
 
@@ -465,7 +796,7 @@ def reconstruction_errors(model: nn.Module, x_norm: torch.Tensor, batch_size: in
         batch = x_norm[start : start + batch_size]
         recon = model(batch)
         target = model.target(batch) if hasattr(model, "target") else batch
-        values.append(F.mse_loss(recon, target, reduction="none").mean(dim=-1))
+        values.append(reconstruction_loss_rows(model, recon, target, loss_type="mse"))
     return torch.cat(values, dim=0)
 
 
@@ -523,6 +854,7 @@ def compatibility_bce_loss(
     temporal_negative: torch.Tensor | None,
     statue_negative: torch.Tensor | None,
     damped_negative: torch.Tensor | None,
+    yaw_body_negative: torch.Tensor | None,
     cfg: AEConfig,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     zero = positive.new_zeros(())
@@ -533,11 +865,13 @@ def compatibility_bce_loss(
             "compat_temporal_loss": zero,
             "compat_statue_loss": zero,
             "compat_damped_loss": zero,
+            "compat_yaw_body_loss": zero,
             "compat_pos_acc": zero,
             "compat_direction_acc": zero,
             "compat_temporal_acc": zero,
             "compat_statue_acc": zero,
             "compat_damped_acc": zero,
+            "compat_yaw_body_acc": zero,
         }
 
     pos_logits = model.compatibility_logits(positive)
@@ -551,6 +885,8 @@ def compatibility_bce_loss(
     temporal_acc = zero
     statue_acc = zero
     damped_acc = zero
+    yaw_body_loss = zero
+    yaw_body_acc = zero
     if direction_negative is not None and cfg.compatibility_direction_weight > 0.0:
         direction_logits = model.compatibility_logits(direction_negative)
         direction_loss = F.binary_cross_entropy_with_logits(direction_logits, torch.zeros_like(direction_logits))
@@ -571,17 +907,24 @@ def compatibility_bce_loss(
         damped_loss = F.binary_cross_entropy_with_logits(damped_logits, torch.zeros_like(damped_logits))
         total = total + cfg.compatibility_damped_weight * damped_loss
         damped_acc = (damped_logits < 0.0).float().mean()
+    if yaw_body_negative is not None and cfg.compatibility_yaw_body_weight > 0.0:
+        yaw_body_logits = model.compatibility_logits(yaw_body_negative)
+        yaw_body_loss = F.binary_cross_entropy_with_logits(yaw_body_logits, torch.zeros_like(yaw_body_logits))
+        total = total + cfg.compatibility_yaw_body_weight * yaw_body_loss
+        yaw_body_acc = (yaw_body_logits < 0.0).float().mean()
     return total, {
         "compat_pos_loss": pos_loss.detach(),
         "compat_direction_loss": direction_loss.detach(),
         "compat_temporal_loss": temporal_loss.detach(),
         "compat_statue_loss": statue_loss.detach(),
         "compat_damped_loss": damped_loss.detach(),
+        "compat_yaw_body_loss": yaw_body_loss.detach(),
         "compat_pos_acc": (pos_logits > 0.0).float().mean().detach(),
         "compat_direction_acc": direction_acc.detach(),
         "compat_temporal_acc": temporal_acc.detach(),
         "compat_statue_acc": statue_acc.detach(),
         "compat_damped_acc": damped_acc.detach(),
+        "compat_yaw_body_acc": yaw_body_acc.detach(),
     }
 
 
@@ -622,7 +965,11 @@ def train(args: argparse.Namespace) -> None:
     std = clean.std(dim=0).clamp_min(cfg.std_floor)
     schema = transition_schema(clips[0], locomotion_cfg)
     x_norm = normalise(clean, mean, std).to(device)
+    clean_for_yaw_negative = clean.to(device) if cfg.compatibility_yaw_body_weight > 0.0 else clean
     clip_ids = feature_clip_ids.to(device)
+    sample_mode = str(cfg.sample_mode).lower().strip()
+    if sample_mode not in ("rows", "uniform_clip"):
+        raise ValueError("--sample-mode must be 'rows' or 'uniform_clip'")
     skip_norm = normalise(skip_features, mean, std).to(device) if skip_features is not None else None
     statue_norm = None
     if (
@@ -648,12 +995,14 @@ def train(args: argparse.Namespace) -> None:
     run_dir = tl.resolve_path(cfg.output_dir) / cfg.run_name
     ckpt_dir = run_dir / "checkpoints"
     writer = SummaryWriter(run_dir / "tb")
+    print(f"transition_ae run_dir={run_dir}", flush=True)
+    print(f"transition_ae best_checkpoint={ckpt_dir / 'checkpoint_best.pt'}", flush=True)
     model = TransitionAutoencoder(schema["total_dim"], cfg, schema).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
 
     print(
         f"transition_ae samples={x_norm.shape[0]} dim={x_norm.shape[1]} latent={cfg.latent_dim} "
-        f"compat={cfg.compatibility_weight:g} device={device} "
+        f"compat={cfg.compatibility_weight:g} sample_mode={sample_mode} device={device} "
         f"folders={[(str(tl.npz_folder_from_path(path)), cyclic) for path, cyclic in clip_specs]}",
         flush=True,
     )
@@ -668,7 +1017,10 @@ def train(args: argparse.Namespace) -> None:
     next_timed_checkpoint_at = start_time + timed_interval_seconds if timed_interval_seconds > 0.0 else math.inf
     for epoch in range(1, cfg.max_epochs + 1):
         model.train()
-        perm = indices[torch.randperm(indices.numel(), device=device)]
+        if sample_mode == "uniform_clip":
+            perm = balanced_clip_epoch_indices(clip_ids, indices.numel(), device)
+        else:
+            perm = indices[torch.randperm(indices.numel(), device=device)]
         loss_sum = torch.zeros((), device=device)
         recon_sum = torch.zeros((), device=device)
         compat_sum = torch.zeros((), device=device)
@@ -686,15 +1038,25 @@ def train(args: argparse.Namespace) -> None:
                 noisy = apply_condition_body_dropout(noisy, schema, cfg.condition_body_dropout_prob)
             recon = model(noisy)
             clean_target = model.target(batch)
-            recon_loss = F.huber_loss(recon, clean_target)
+            recon_loss = reconstruction_loss(model, recon, clean_target, loss_type="huber")
             structured_statue_loss = torch.zeros((), device=device)
             if statue_norm is not None and cfg.structured_denoise_statue_weight > 0.0:
                 statue_input = statue_norm.index_select(0, batch_indices)
-                structured_statue_loss = F.huber_loss(model(statue_input), clean_target)
+                structured_statue_loss = reconstruction_loss(
+                    model,
+                    model(statue_input),
+                    clean_target,
+                    loss_type="huber",
+                )
             structured_damped_loss = torch.zeros((), device=device)
             if damped_norm is not None and cfg.structured_denoise_damped_weight > 0.0:
                 damped_input = damped_norm.index_select(0, batch_indices)
-                structured_damped_loss = F.huber_loss(model(damped_input), clean_target)
+                structured_damped_loss = reconstruction_loss(
+                    model,
+                    model(damped_input),
+                    clean_target,
+                    loss_type="huber",
+                )
             compat_loss = torch.zeros((), device=device)
             compat_parts: dict[str, torch.Tensor] = {}
             if cfg.compatibility_weight > 0.0:
@@ -709,6 +1071,9 @@ def train(args: argparse.Namespace) -> None:
                 damped_negative = None
                 if damped_norm is not None:
                     damped_negative = damped_norm.index_select(0, batch_indices)
+                yaw_body_negative = None
+                if cfg.compatibility_yaw_body_weight > 0.0:
+                    yaw_body_negative = sample_yaw_body_negative(clean_for_yaw_negative, batch_indices, schema, mean, std, cfg)
                 compat_loss, compat_parts = compatibility_bce_loss(
                     model,
                     batch,
@@ -716,6 +1081,7 @@ def train(args: argparse.Namespace) -> None:
                     temporal_negative,
                     statue_negative,
                     damped_negative,
+                    yaw_body_negative,
                     cfg,
                 )
             loss = (

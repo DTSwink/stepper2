@@ -1590,3 +1590,573 @@ Hybrid periodic + transition dataset rollout rule:
   `3/6/9/12/14/20`, mean effective K `31.6`. On the mini dataset, K64 rows can
   only sample the periodic walk loop, while the 45-degree spin clips remain
   eligible for K2-K32.
+- Important repro caveat: the strong mini result above used the mini-specific
+  secondary AE
+  `training/runs/20260517_215153_denoise_rootlook16_compatfixed_mini_e240/checkpoints/checkpoint_best.pt`.
+  A follow-up run with the exact intended big-training AE stack instead
+  (`20260517_161820` primary + `20260517_184310` secondary) was
+  `training/runs/20260518_222908_repro_bigAE_mixedcohort_pct_2_4_8_16_32_64_from_oldk32`.
+  It reached a lower AE scalar (`best_ae_score ~= 0.00665` by epoch 239) but
+  did not reproduce the visual R45 quality: R45 frame-17 mean joint error was
+  about `0.058 m` versus `0.0048 m` for the mini-specific AE checkpoint. Do not
+  use the mini-specific AE result as evidence that the big AE stack is adequate;
+  the visual/direct-GT check caught a scalar-loss blind spot.
+- General-AE repair test:
+  - The failed big secondary AE
+    `training/runs/20260517_184310_denoise_rootlook16_fullae_lat32_dampedcompat035_n0p05_e300/checkpoints/checkpoint_best.pt`
+    scored the bad R45 rollout slightly *better* than GT on reconstruction
+    (`bad ~= 0.00634`, GT `~= 0.00721`), explaining the ghost-turn loophole.
+  - A clean full-dataset replacement trained with the mini-like damped
+    structured denoise/compat settings
+    `training/runs/20260518_225429_denoise_rootlook16_full_generalcompat_dampedstruct_e240/checkpoints/checkpoint_best.pt`
+    improved bad-vs-GT separation but was still too weak for model training.
+  - The best general replacement so far is the existing conditional full-dataset
+    prior
+    `training/runs/20260517_165428_cond_rootw16_body_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`.
+    It is trained on the big omni+transition dataset, not on the mini set.
+  - Repro run:
+    `training/runs/20260518_231611_repro_condBodyW16_general_mixedcohort_from_oldk32/checkpoints/checkpoint_best_k64.pt`
+    with primary 1-frame AE weight `1.0`, conditional W16 prior weight `0.30`,
+    mixed K cohorts `2,4,8,16,32,64` with weights `5,10,15,20,25,35`.
+  - Direct-GT rollout check:
+    R45 avg `0.00995`, f17 `0.00760`;
+    L45 avg `0.00930`, f17 `0.01220`;
+    WalkF avg `0.01640`.
+    This is much better than the failed broad big-AE repro and preserves WalkF.
+    It is close to, but still not perfectly identical to, the mini-specific AE
+    checkpoint (R45 avg `0.00777`, WalkF avg `0.01507`).
+  - Weight tests: conditional W16 weight `0.45` and `0.60` did not improve the
+    overall mini repro. `0.60` helped WalkF and some isolated phases but hurt
+    R45 average; `0.45` was a middle-ground but not a clear win. Keep `0.30`
+    unless a later visual check says otherwise.
+
+## 2026-05-19 - Big-Dataset AE Versus Mini-AE Repro Gate
+
+- Added `--sample-mode uniform_clip` to `training/transition_autoencoder.py`.
+  Default remains `rows`, so older AE runs are reproducible. Uniform-clip mode
+  samples an animation first, then a transition row inside that animation. This
+  was tested because the mini-specific AE saw the short 45-degree turn clips
+  often, while big-dataset row sampling dilutes those clips among 10k+ rows.
+- The gate for these experiments is direct rollout geometry on the mini repro,
+  not scalar AE loss alone:
+  - `R45`, `L45`, and `WalkF` are all checked.
+  - WalkF must stay good; a turn fix that damages normal gait is rejected.
+- Known reference:
+  `training/runs/20260518_005420_mixedcohort_pct_2_4_8_16_32_64_minidoubleae_from_oldk32/checkpoints/checkpoint_best_k64.pt`
+  used the mini-specific secondary AE and scored:
+  `R45 avg=0.00777 f17=0.00482`,
+  `L45 avg=0.00856 f17=0.00806`,
+  `WalkF avg=0.01693`.
+- Best clean big-dataset/general candidate remains:
+  `training/runs/20260517_165428_cond_rootw16_body_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`
+  as the secondary prior at weight `0.30` with the 1-frame prior at weight
+  `1.0`. Its mini repro checkpoint:
+  `training/runs/20260518_231611_repro_condBodyW16_general_mixedcohort_from_oldk32/checkpoints/checkpoint_best_k64.pt`
+  scored:
+  `R45 avg=0.00995 f17=0.00760`,
+  `L45 avg=0.00930 f17=0.01220`,
+  `WalkF avg=0.01782`.
+  This is close to the mini AE result and preserves WalkF, but is still a bit
+  softer on the 45-degree turns.
+- Rejected attempts:
+  - `20260519_001600_cond_rootw16_body_balancedclip_full_n0p05_e300`:
+    clip-balanced conditional AE sharpened R45 bad-vs-GT scoring but made WalkF
+    GT reconstruction less happy. Controller repro with this prior alone was
+    visually/metric worse (`R45 avg ~= 0.0327`), so clip balancing by itself is
+    not the fix.
+  - `20260519_002900_fullae_rootlook16_balancedclip_minirecipe_e300`:
+    full-transition mini-recipe AE trained on the full dataset scored the bad
+    R45/L45 rollout better than GT under reconstruction. Its compatibility head
+    did separate bad from GT, but using that compatibility score in controller
+    training (`20260519_011000...`) worsened R45 and WalkF, so do not use it as
+    a controller loss in this setup.
+  - `20260519_003500_cond_rootw16_body_dampeddenoise_full_n0p05_e300`:
+    conditional W16 plus damped denoising did not improve the bad-vs-GT
+    separation over the existing row-trained conditional AE.
+  - `20260519_005800_cond_rootw16_body_lat8_full_n0p05_e360`:
+    smaller latent bottleneck over-penalized GT and still did not reliably
+    penalize the ghost turn more than ground truth.
+  - A three-prior ensemble
+    `20260519_004200_repro_general_cond_old_plus_balanced_w030_w010_from_oldk32`
+    reached a decent scalar loss but failed the direct rollout gate
+    (`R45 f17 ~= 0.054 m`), another reminder that scalar AE loss is not enough.
+- Current conclusion:
+  for a clean big-dataset-trained AE, the conditional root-window body AE is the
+  strongest working choice. The mini-specific AE's extra tightness appears to
+  come from its restricted training distribution, not from a recipe that
+  transfers directly to the big dataset. Any future improvement should be judged
+  by the direct R45/L45/WalkF gate before being trusted.
+
+## 2026-05-19 - Strict No-Tradeoff AE Neighborhood Search
+
+- User constraint for this pass: only accept a checkpoint if it is a strict
+  improvement over the current best, not a tradeoff.
+- Current checkpoint to keep:
+  `training/runs/20260518_231611_repro_condBodyW16_general_mixedcohort_from_oldk32/checkpoints/checkpoint_best_k64.pt`.
+- Nearby attempts checked:
+  - `20260519_013000_repro_general_cond_w025_from_oldk32`: rejected. It fell
+    into the bad 45-degree turn basin (`R45 f17 ~= 0.083 m`).
+  - `20260519_013700_repro_general_cond_w030_huber05_from_oldk32`: rejected.
+    Huber AE scoring looked calm but the rollout gate failed
+    (`R45 f17 ~= 0.078 m`).
+  - `20260519_015600_polish_general_cond_w030_lr1e5_from_good`: rejected as a
+    replacement. It improved L45/WalkF a little but worsened R45 frame 25.
+  - `20260519_021100_repro_general_cond_w040_long_from_oldk32`: useful but not
+    a strict replacement. It reduced worst-case/overall average error
+    (`worst ~= 0.02594 m` versus current `0.02913 m`) but worsened early R45
+    and a few L45 values. Under the no-tradeoff rule, keep the current
+    checkpoint.
+- Decision: move on with the current `w030` checkpoint unless the acceptance
+  rule changes from strict per-gate improvement to an aggregate metric.
+
+## 2026-05-19 - Accepted Strict-Win Checkpoint Soup
+
+- Confirmed best general conditional/root-window AE remains:
+  `training/runs/20260517_165428_cond_rootw16_body_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`.
+  The full best controller setup uses it together with the primary 1-frame
+  denoising AE:
+  `training/runs/20260517_161820_denoise_rootlook1_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`.
+- New accepted controller checkpoint:
+  `training/runs/20260519_023300_soup_strictwin_doubleae_general_from_w030/checkpoints/checkpoint_best_k64.pt`.
+- Method: post-hoc checkpoint soup / linear weight interpolation. This has no
+  runtime overhead: the saved result is just a normal controller checkpoint.
+  Base checkpoint was:
+  `training/runs/20260518_231611_repro_condBodyW16_general_mixedcohort_from_oldk32/checkpoints/checkpoint_best_k64.pt`.
+- Soup weights are stored in:
+  `training/runs/20260519_023300_soup_strictwin_doubleae_general_from_w030/SOUP_WEIGHTS.json`.
+- Gate result versus previous best, direct 80-frame rollout:
+  - Previous best:
+    `R45 avg=0.00994950 f17=0.00759503 f25=0.01854316 end=0.01170241 max=0.01868471`;
+    `L45 avg=0.00929694 f17=0.01219531 f25=0.01066126 end=0.01143346 max=0.01468577`;
+    `WalkF avg=0.01782222 f17=0.01838074 f25=0.01739129 end=0.02234678 max=0.02913017`;
+    worst `0.02913017`, mean-all `0.01532125`.
+  - New soup checkpoint:
+    `R45 avg=0.00985577 f17=0.00751158 f25=0.01844196 end=0.01132380 max=0.01856698`;
+    `L45 avg=0.00911379 f17=0.01180393 f25=0.01064015 end=0.01108168 max=0.01428456`;
+    `WalkF avg=0.01765805 f17=0.01827932 f25=0.01725379 end=0.02205193 max=0.02885311`;
+    worst `0.02885311`, mean-all `0.01511469`.
+- Strict acceptance check: all 15 gate metrics improved. The largest delta was
+  still negative (`max_delta=-2.11e-05 m`), so this is not a tradeoff.
+
+## 2026-05-19 - CircleL Isolation Test From K32 Baseline
+
+- User correction: controller training experiments should start from the K32
+  baseline, not from the soup checkpoint, unless explicitly requested.
+- Created contained mini dataset:
+  `training/runs/mini_datasets/circleL_only/nonperiodic/M_Neutral_Walk_Circle_Strafe_L.npz`.
+- Training setup for the quick test:
+  - start checkpoint:
+    `training/runs/20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`
+  - mixed K schedule `2,4,8,16,32` with weights `5,15,20,30,40`
+  - no footslide/contact/motion-floor losses
+  - direct GT rollout used only for evaluation, not training.
+- Results on CircleL:
+  - K32 start: avg `0.101523`, f17 `0.119181`, f25 `0.099672`,
+    end `0.089856`, max `0.158635`.
+  - old 1-frame AE only
+    (`20260519_041000_circleL_only_old1f_from_oldk32_K32mix`):
+    avg `0.082483`, f17 `0.021739`, f25 `0.046899`,
+    end `0.076076`, max `0.192583`.
+  - new conditional/root-window AE only
+    (`20260519_041400_circleL_only_newcond_from_oldk32_K32mix`):
+    avg `0.082686`, f17 `0.012384`, f25 `0.027812`,
+    end `0.060732`, max `0.219316`.
+  - both AEs
+    (`20260519_040000_circleL_only_doubleae_from_oldk32_K32mix`):
+    avg `0.037010`, f17 `0.009648`, f25 `0.011568`,
+    end `0.071382`, max `0.092565`.
+- Interpretation:
+  the new conditional AE does not intrinsically kill CircleL. On the isolated
+  CircleL task, the best result is using both AEs together. The failure in the
+  broader mini dataset is a multi-clip balancing/conflict problem: CircleL can
+  be learned, but single-clip training overfits and damages R45/WalkF, while
+  broad mini training did not allocate or shape enough useful pressure to solve
+  circles and preserve turns simultaneously.
+
+## 2026-05-19 - R45 Missing 0.3 Blend Ablation
+
+- User asked why the `0.3` blend had not been tested on R45. That was a real
+  missing row in the pure-AE ablation.
+- Important correction: several false starts were not comparable:
+  - adding `--compatibility-score-weight` changed the objective and loss scale;
+  - forcing a K32 continuation from the fragile K16 run exposed the long-rollout
+    failure mode but was not the clean curriculum result;
+  - the clean result below uses AE reconstruction priors only, no extra
+    compatibility-head penalty.
+- Final clean R45 `0.3` run:
+  `training/runs/20260519_075640_ablate_R45_blend_w03_stage16_32_from_cleanK8/checkpoints/checkpoint_best_k32.pt`.
+- Setup:
+  - start checkpoint:
+    `training/runs/20260516_044547_hybrid_canonbasis_from_bestk32_constantk32_w010_resumeopt/checkpoints/checkpoint_best_k32.pt`
+  - AE1 old 1-frame denoising prior weight `1.0`:
+    `training/runs/20260517_161820_denoise_rootlook1_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`
+  - AE2 conditional/root-window prior weight `0.3`:
+    `training/runs/20260519_043759_compat_rootw16_yawbody_lat64_e180/checkpoints/checkpoint_best.pt`
+  - mixed rollout cohorts over `2,4,8,16,32` with weights `5,15,20,30,40`.
+- Diagnostic output:
+  `training/runs/diagnostics/ablation_R45_pure_vs_blend_20260519.html`.
+- Trainable-horizon R45 foot-skate metrics:
+  - pure AE1: support p95 `0.246864`, source-contact p95 `0.349284`,
+    excess p95 `0.326238`.
+  - pure AE2: support p95 `0.238798`, source-contact p95 `0.263928`,
+    excess p95 `0.208829`.
+  - equal blend: support p95 `0.248924`, source-contact p95 `0.247546`,
+    excess p95 `0.215955`.
+  - clean `0.3` blend: support p95 `0.105055`, source-contact p95 `0.204683`,
+    excess p95 `0.159388`.
+- Interpretation:
+  on R45, clean `0.3` blend is the best row in this ablation by the foot-skate
+  diagnostics. It also keeps AE1 dominant, matching the earlier observation that
+  AE1 is still useful for gait preservation while AE2 helps root/body
+  compatibility.
+
+## 2026-05-19 - R45 Direct Mixed-K Speed Audit
+
+- User asked whether the R45 `0.3` blend can skip rollout curriculum and train
+  directly with mixed K. The first direct run looked absurdly slow.
+- Root cause:
+  `train_locomotion_ae_prior.py` was still enabling the older
+  contact-physics auxiliary losses by default. For pure AE ablations this is
+  wrong: it both adds non-AE loss terms and disables the packed rollout path.
+- Code change:
+  pure AE prior training now leaves contact-physics auxiliary losses disabled by
+  default. They must be opted into explicitly with `--contact-physics-losses`.
+  `--no-contact-physics-losses` remains accepted and explicit.
+- Timing probes on the single R45 clip, mixed K32, batch 64:
+  - legacy/contact-on path: 3 epochs took about `189s`; `train_total=3.00578`
+    while `ae_score=0.08202`, proving non-AE loss dominated.
+  - packed pure-AE path: 3 epochs took about `54s`; `train_total == ae_score`.
+  - packed pure-AE with one agent batch per epoch: roughly `3.5-4.0s` per
+    optimizer update after setup.
+  - `torch.compile` was not useful for this short ablation because compile
+    setup cost dominated and per-update cost did not improve enough.
+- Fast direct mixed-K run:
+  `training/runs/20260519_092931_ablate_R45_blend_w03_directmixedK32_fastpure_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  It reached best AE `0.010951` in about `176s` wall time for 40 optimizer
+  updates.
+- Diagnostic comparison against the curriculum result:
+  `training/runs/diagnostics/ablation_R45_directmixed_fast_compare_20260519.html`.
+  Trainable-horizon support/source-contact/excess p95:
+  - curriculum `0.3`: `0.1051 / 0.2047 / 0.1594`
+  - direct mixed-K fast `0.3`: `0.2555 / 0.2730 / 0.2689`
+- Interpretation:
+  the speed bug is fixed, but skipping the curriculum did not match the R45
+  curriculum result in this 40-update test. Direct mixed-K is much faster than
+  the broken run, but curriculum still appears to provide useful stabilization
+  for this turn-in-place mini ablation.
+- Follow-up fairer budget test:
+  resumed the direct mixed-K run from its 40-update checkpoint and let it
+  plateau with the same pure-AE objective:
+  `training/runs/20260519_094241_ablate_R45_blend_w03_directmixedK32_longplateau_from_fast40/checkpoints/checkpoint_best_k32.pt`.
+  It stopped at epoch `120`, best AE `0.009223`, in about `7 min`.
+- Diagnostic output:
+  `training/runs/diagnostics/ablation_R45_directmixed_longplateau_compare_20260519.html`.
+- Trainable-horizon foot-skate metrics:
+  - curriculum `0.3`: support p95 `0.1051`, source-contact p95 `0.2047`,
+    excess p95 `0.1594`.
+  - direct mixed-K 40-update: support p95 `0.2555`, source-contact p95
+    `0.2730`, excess p95 `0.2689`.
+  - direct mixed-K plateau: support p95 `0.2563`, source-contact p95
+    `0.3290`, excess p95 `0.2978`.
+- Trainable-horizon GT rollout error:
+  - curriculum `0.3`: mean joint `0.007418 m`, p95 joint `0.011158 m`,
+    mean end-effector `0.010003 m`.
+  - direct mixed-K plateau: mean joint `0.039467 m`, p95 joint `0.086105 m`,
+    mean end-effector `0.029524 m`.
+- Conclusion:
+  the direct mixed-K run optimized the AE scalar slightly better than the
+  curriculum checkpoint, but produced worse GT alignment and worse foot-skate.
+  For this R45 one-clip ablation, the rollout curriculum is doing real
+  stabilization work that is not captured by AE loss alone.
+
+## 2026-05-19 - R45 Fast Pure-AE Curriculum Repro
+
+- Clarification:
+  the successful R45 curriculum run was scheduled up to `K=32`, not `K=64`.
+  The schedule was `2,4,8,16,32`.
+- Fast rerun:
+  `training/runs/20260519_095707_ablate_R45_blend_w03_fastpure_curriculumK32_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  This used the cleaned pure-AE path where contact-physics auxiliary losses are
+  disabled by default and packed rollout is active.
+- Setup:
+  AE1 old 1-frame denoising prior weight `1.0`, AE2 conditional/root-window
+  prior weight `0.3`, old K32 baseline initialization, R45-only mini dataset,
+  curriculum `2,4,8,16,32`, one agent batch per epoch, no diagnostics/live
+  viewer during training.
+- Timing:
+  reached K32 and finished in about `4 min` wall time. Internal timing profile
+  was roughly `61.8%` forward/loss and `32.8%` backward.
+- Best checkpoint:
+  epoch `412`, K32, best AE `0.0085025`.
+- Diagnostic output:
+  `training/runs/diagnostics/ablation_R45_fastpure_curriculum_compare_20260519.html`.
+- Trainable-horizon GT rollout error:
+  - old curriculum `0.3`: mean joint `0.007418 m`, p95 joint `0.011158 m`,
+    mean end-effector `0.010003 m`.
+  - direct mixed-K plateau `0.3`: mean joint `0.039467 m`, p95 joint
+    `0.086105 m`, mean end-effector `0.029524 m`.
+  - fast pure-AE curriculum `0.3`: mean joint `0.009651 m`, p95 joint
+    `0.017854 m`, mean end-effector `0.011572 m`.
+- Trainable-horizon foot-skate metrics:
+  - old curriculum `0.3`: support p95 `0.1051`, source-contact p95 `0.2047`,
+    excess p95 `0.1594`.
+  - direct mixed-K plateau `0.3`: support p95 `0.2563`, source-contact p95
+    `0.3290`, excess p95 `0.2978`.
+  - fast pure-AE curriculum `0.3`: support p95 `0.1011`, source-contact p95
+    `0.2732`, excess p95 `0.1965`.
+- Interpretation:
+  the fast cleaned curriculum reproduces the important part of the old result:
+  it is close to GT and far better than direct mixed-K. It is not bit-for-bit
+  the same result; source-contact slide is worse than the old curriculum, while
+  support-p95 slide is similar and AE scalar is better. For future R45-style
+  ablations, default to curriculum up to K32 first, then only extend beyond K32
+  once the K32 result looks stable.
+
+## 2026-05-19 - Six-Clip AE1/AE2 Blend Sweep
+
+- User requested a 10-point blend sweep from `100% AE1 / 0% AE2` to
+  `0% AE1 / 100% AE2`.
+- Important correction:
+  the mini dataset is exactly `idle + walk forward + circle R/L + turn45 R/L`,
+  staged at `training/runs/mini_datasets/idle_walkF_circle_stand45`.
+  This is not the older `walkF_stand45_circle` set because that one omitted
+  idle.
+- Confirmed priors:
+  both AE checkpoints used here are full-dataset priors, not mini-dataset
+  priors.
+  - AE1:
+    `training/runs/20260517_161820_denoise_rootlook1_lat32_n0p05_e360/checkpoints/checkpoint_best.pt`
+    trained with `periodic_folder_path=ue5/animations_omni_only_full/npz_final`
+    and `nonperiodic_folder_path=ue5/animations_transitions_only_full_trimmed/npz_final`.
+  - AE2:
+    `training/runs/20260519_043759_compat_rootw16_yawbody_lat64_e180/checkpoints/checkpoint_best.pt`
+    trained on the same periodic/nonperiodic full folders.
+- Sweep setup:
+  old K32 baseline initialization, fast packed pure-AE path, curriculum
+  `2,4,8,16,32`, no contact-physics losses, no live viewer, no visual reporter.
+  Blend weights were normalized percentages:
+  `1.000/0.000`, `0.889/0.111`, ..., `0.000/1.000`.
+- Diagnostic output:
+  `training/runs/diagnostics/blend_sweep_idle_walkF_circle_stand45_20260519/summary.csv`
+  and
+  `training/runs/diagnostics/blend_sweep_idle_walkF_circle_stand45_20260519/per_clip.csv`.
+- Aggregate trainable-horizon results:
+  - best GT joint/EE alignment: blend00, AE1 `1.0`, AE2 `0.0`;
+    joint mean `0.01314 m`, EE mean `0.02106 m`,
+    source-contact excess p95 `0.17595`.
+  - best aggregate source-contact excess p95: blend03, AE1 `0.667`,
+    AE2 `0.333`; excess p95 `0.16222`, joint mean `0.01344 m`,
+    EE mean `0.02370 m`.
+  - AE2-heavy blends degraded badly on circles; pure AE2 had joint mean
+    `0.02570 m`, EE mean `0.05235 m`, source-contact excess p95 `0.38069`.
+- Per-clip caveat:
+  blend03 and blend04 improve aggregate source-contact excess, but their
+  Circle_R worst-clip excess is much worse than blend00. Since the practical
+  preference is "all clips decent" rather than "one excellent average with one
+  bad clip", blend00 is the safer winner of this sweep.
+- Conclusion:
+  on this six-clip mini set, adding AE2 does not produce a clean win. AE1-only
+  is currently the best default by conservative rollout metrics. AE2 remains
+  useful as a targeted compatibility idea, but this sweep says it should not be
+  automatically blended into the baseline without a stronger guard against
+  circle/strafe degradation.
+- Follow-up correction:
+  the first sweep endpoint commands still loaded the zero-weight prior, so
+  `AE1=1.0 / AE2=0.0` used only AE1 in the loss but still inherited AE2's
+  `root_lookahead_steps=15` for model input/truncation. AE1 itself is a
+  1-frame transition prior with `root_lookahead_steps=1`. The training harness
+  now filters out zero-weight priors before loading them, so future endpoint
+  sweeps are real endpoints and do not accidentally shorten non-periodic tails
+  or inflate the future-root horizon.
+- Verified rerun:
+  `training/runs/20260519_135347_pure_ae1_verified_idle_walkF_circle_stand45_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  Metadata confirms only AE1 is loaded, `ae_prior_weights=[1.0]`, and
+  `root_lookahead_steps=1`.
+- Verified pure AE1 metrics versus the earlier bugged endpoint:
+  - bugged endpoint with hidden AE2 horizon: joint mean `0.01314 m`, EE mean
+    `0.02106 m`, support p95 `0.13309`, source-contact excess p95 `0.17595`.
+  - verified AE1-only endpoint: joint mean `0.01459 m`, EE mean `0.02373 m`,
+    support p95 `0.17615`, source-contact excess p95 `0.20155`.
+  - conclusion: true AE1-only remains in the same ballpark and uses the correct
+    short AE horizon, but the accidental longer future horizon slightly helped
+    the earlier endpoint. Circle_R is still the worst clip and should be used
+    as the first stress test when changing priors or model capacity.
+
+## 2026-05-19 - Generated-Negative AE Loop, Fresh07-Fresh11
+
+- Evaluation rule update:
+  for long motions, absolute world-space drift is not considered a failure by
+  itself. The primary metrics are local/root-relative motion plausibility and
+  support/foot-skating style metrics. Direct GT world overlap is mainly useful
+  for short clips such as 45-degree turns and circles where phase/trajectory
+  ambiguity is limited.
+- Robust worst-row AE reduction branch:
+  `training/runs/fresh09_robusttop25_controller_full_from_oldk32/checkpoints/checkpoint_best_k32.pt`
+  used `ae_row_top_fraction=0.25` and `ae_row_top_weight=1.0`.
+  It did not help: support metrics worsened on most key clips, so this branch
+  should not be used as a default.
+- Fresh10 loop:
+  AE:
+  `training/runs/fresh10_exact_footmotion_compat_accum_against_fresh09_fakes/checkpoints/checkpoint_best.pt`.
+  Controller:
+  `training/runs/fresh10_exact_controller_full_footmotion_modelaware_recononly_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  Fresh10 AE cleanly separated GT from Fresh09 generated fakes in lab tests,
+  but the Fresh10 controller found a new low-AE skating region. Key trainable
+  support p95 values:
+  - Walk_F `0.1454` vs GT `0.0518`
+  - Circle_L `0.3422` vs GT `0.1280`
+  - Circle_R `0.3763` vs GT `0.0469`
+  - Turn045_R `0.2259` vs GT `0.0012`
+  - Box_L `0.7832` vs GT `0.1404`
+- Fresh11 loop:
+  AE:
+  `training/runs/fresh11_exact_footmotion_compat_accum_against_fresh10_fakes/checkpoints/checkpoint_best.pt`.
+  Controller:
+  `training/runs/fresh11_exact_controller_full_footmotion_modelaware_recononly_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  Fresh11 improved some clips but did not solve the dataset:
+  - Idle support p95 `0.0049` vs GT `0.0031`
+  - Walk_F `0.1029` vs GT `0.0518`
+  - Circle_L `0.3731` vs GT `0.1280`
+  - Circle_R `0.3633` vs GT `0.0469`
+  - Turn045_R `0.1734` vs GT `0.0012`
+  - Box_L `0.5213` vs GT `0.1404`
+- Compatibility-head check:
+  Fresh11's compatibility head is very sensitive in lab tests. With
+  `compatibility_score_weight=1.0`, GT remains near `0.006-0.010`, while
+  Fresh11 rollouts score roughly `5-14` depending on the clip. However,
+  controller training with a small `compatibility_score_weight=0.01` did not
+  improve the support metrics overall; it helped some Box contact excess but
+  worsened several clips. Do not blindly add compatibility loss at this weight.
+- Current interpretation:
+  the generated-negative loop is moving the needle, but reconstruction-only AE
+  loss can still be gamed by skating-compatible poses. The compatibility head
+  has useful information, but its controller weighting needs a more principled
+  schedule or a better calibration before it becomes a default training term.
+
+## 2026-05-19 - Harsh Simple AE1 Test
+
+- Question:
+  can the old simple 1-frame denoising AE be made harsher without changing the
+  framework by weighting important features and penalizing worst reconstruction
+  dimensions?
+- Code branch:
+  `training/transition_autoencoder.py` now supports feature weights for pelvis,
+  lower body, feet/toes, velocity channels, and an optional top-fraction
+  reconstruction penalty. Old checkpoints remain loadable because missing
+  metadata falls back to uniform reconstruction weights.
+- Harsh AE checkpoint:
+  `training/runs/20260519_harsh_ae1_lat16_n0075_top10_foot4_lower2_pelvis2/checkpoints/checkpoint_best.pt`.
+  Settings: latent dim 16, non-root input noise `0.075`, pelvis/lower-body/
+  velocity weighting, foot/toe weighting `4.0`, top 10 percent feature penalty
+  weighted `0.5`.
+- Controller checkpoint:
+  `training/runs/20260519_harsh_ae1_controller_full_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  Trained from the old K32 baseline with only the harsh AE prior.
+- Benchmark folder:
+  `training/runs/diagnostics/harsh_ae1_vs_baseline_keyclips_20260519`.
+- Result:
+  the harsher AE separated synthetic AE training tiers better, but it did not
+  improve the controller. Compared to the old K32 baseline, key-clip support
+  p95 got worse on walk forward, circles, and 45-degree turns. The only notable
+  improvement was source-contact excess on circle clips, but it came with worse
+  support p95 and no meaningful GT improvement.
+- Key numbers, baseline -> harsh:
+  - Idle support p95 `0.0034 -> 0.0032`, joint mean `0.0075 -> 0.0202`.
+  - Walk_F support p95 `0.0741 -> 0.1296`, contact excess p95
+    `0.3188 -> 2.0423`, joint mean `0.0259 -> 0.0472`.
+  - Circle_L support p95 `0.3739 -> 0.7791`, contact excess p95
+    `2.2049 -> 1.1064`, joint mean `0.1010 -> 0.1049`.
+  - Circle_R support p95 `0.4898 -> 0.6931`, contact excess p95
+    `1.2956 -> 0.8968`, joint mean `0.0959 -> 0.0948`.
+  - Turn045_L support p95 `0.1698 -> 0.3255`, joint mean
+    `0.0267 -> 0.0288`.
+  - Turn045_R support p95 `0.1713 -> 0.3546`, joint mean
+    `0.0350 -> 0.0418`.
+- Conclusion:
+  this "harsher AE1" idea is not a default. It makes the AE numerically more
+  sensitive, but the controller still finds bad low-loss skating regions. Keep
+  the branch as a diagnostic option only.
+
+## 2026-05-19 - Longer Baseline-Style AE Windows
+
+- Goal:
+  retry the longer-window idea while keeping the old successful baseline spirit:
+  denoising reconstruction, no compatibility head, no foot-motion extras, no
+  feature weighting, no supervised loss.
+- Compatibility/code note:
+  `window_transition_autoencoder.py` now supports baseline-style denoising via
+  `input_noise_std` and `input_noise_mask`. AE loaders now tolerate old
+  transition-AE checkpoints that lack the newer non-learned
+  `reconstruction_weights` buffer; learned parameters are unchanged.
+- Literal W16 window AE:
+  `training/runs/20260519_w16_like_baseline_denoise_lat512/checkpoints/checkpoint_best_w16.pt`.
+  This reconstructs a 16-transition normalized feature window. Latent was set
+  to 512, matching the old AE's rough per-frame compression ratio
+  (`32 * 16`).
+- Literal W16 controller:
+  `training/runs/20260519_w16_like_baseline_controller_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  It was trained from the old K32 baseline with a K16 -> K32 curriculum because
+  a W16 window prior cannot score rollouts shorter than 16.
+- Literal W16 result:
+  not a win. Compared with the old K32 baseline, support p95 worsened on
+  Walk_F, both circles, and both 45-degree turns. Example baseline -> W16:
+  - Walk_F support p95 `0.0741 -> 0.1041`.
+  - Circle_L `0.3739 -> 2.1224`.
+  - Circle_R `0.4898 -> 1.9143`.
+  - Turn045_R `0.1713 -> 0.5279`.
+- Root-lookahead-16 AE:
+  `training/runs/20260519_ae1_rootlook16_like_baseline_lat32_n0p05/checkpoints/checkpoint_best.pt`.
+  This is the closer analogue to the old AE1 baseline: one transition at a
+  time, latent 32, denoising `0.05` on non-root features, but with 16 future
+  root deltas appended instead of 1.
+- Root-lookahead-16 controller:
+  `training/runs/20260519_ae1_rootlook16_controller_from_oldk32/checkpoints/checkpoint_best_k32.pt`.
+  Trained from old K32 with normal K2/4/8/16/32 mixed-cohort curriculum.
+- Root-lookahead-16 key benchmark:
+  `training/runs/diagnostics/rootlook16_vs_baseline_keyclips_20260519`.
+  Compared to the old K32 baseline, it reduces some source-contact excess but
+  still worsens the main support p95 on walk/circle/45-turn clips:
+  - Idle support p95 `0.0034 -> 0.0017`.
+  - Walk_F support p95 `0.0741 -> 0.1253`, contact excess p95
+    `0.3188 -> 0.1475`.
+  - Circle_L support p95 `0.3739 -> 0.7700`, contact excess p95
+    `2.2049 -> 1.1220`.
+  - Circle_R support p95 `0.4898 -> 0.5416`, contact excess p95
+    `1.2956 -> 1.1179`.
+  - Turn045_L support p95 `0.1698 -> 0.3553`.
+  - Turn045_R support p95 `0.1713 -> 0.3619`.
+- Conclusion:
+  longer root context does carry useful information, since contact-excess
+  improves on several moving clips, but by itself it does not remove skating.
+  The current 1-frame denoising AE remains the better default unless the longer
+  context is paired with another constraint that specifically preserves support
+  quality.
+
+## 2026-05-20 - Self-Adversarial Repro Gap Was A Loss-Helper Drift
+
+- Question:
+  the regenerated mini self-adversarial AE/controller loop was slightly worse
+  than `20260519_152748_selfadv_mini_recipe02_reachK32`. We tested whether this
+  was statistical luck.
+- Fast battery:
+  12 fresh AE-cycle-1 reproductions from the same controller/prior/data all
+  landed exactly at `0.008295293897390366`, while the original AE-cycle-1 score
+  was `0.008291669189929962`. That is deterministic, not a 50/50 stochastic
+  fluke.
+- Cause:
+  the newer generic reconstruction-loss helper always routed through weighted
+  row losses, even when all reconstruction weights were 1 and top-k weighting
+  was disabled. Numerically that was not identical to the older direct
+  `F.huber_loss` / rowwise `F.mse_loss(...).mean(dim=-1)` path used by the
+  original run.
+- Fix:
+  `transition_autoencoder.reconstruction_loss*` now fast-paths the default
+  unweighted/no-top case through the old exact PyTorch loss expressions. The
+  weighted/top-k behavior remains available only when requested.
+- Verification:
+  after the fix, 3 AE-cycle-1 repros matched the original bit-exactly. A full
+  self-adversarial two-cycle repro at
+  `training/runs/20260520_023146_repro_selfadv_after_lossfix_mini_recipe02_reachK32`
+  matched every main artifact bit-exactly:
+  AE cycle 1, controller cycle 1, AE cycle 2, and controller cycle 2 all had
+  `max_abs_diff = 0.0` against the original saved run.

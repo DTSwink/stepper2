@@ -241,20 +241,43 @@ def checkpoint_policy_label(policy: object) -> str:
     return "Best" if normalize_checkpoint_policy(policy) == "best" else "Last saved"
 
 
+def is_locomotion_checkpoint(path: Path) -> bool:
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(ckpt, dict):
+        return False
+    schema = ckpt.get("schema")
+    if isinstance(schema, dict) and "total_dim" in schema:
+        return False
+    return isinstance(ckpt.get("config"), dict) and "model" in ckpt
+
+
+def checkpoint_candidates(pattern: str) -> list[Path]:
+    candidates = list(DEFAULT_RUNS_DIR.glob(f"*/checkpoints/{pattern}"))
+    candidates.extend(DEFAULT_RUNS_DIR.glob(f"*/{pattern}"))
+    unique: dict[str, Path] = {}
+    for path in candidates:
+        if path.is_file():
+            unique[str(path.resolve()).lower()] = path
+    return list(unique.values())
+
+
 def newest_checkpoint(policy: str = "last") -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
     policy = normalize_checkpoint_policy(policy)
-    pattern = "checkpoint_best*.pt" if policy == "best" else "checkpoint_last.pt"
-    candidates = list(DEFAULT_RUNS_DIR.glob(f"*/checkpoints/{pattern}"))
-    if not candidates:
-        fallback_pattern = "checkpoint_last.pt" if policy == "best" else "checkpoint_best*.pt"
-        candidates = list(DEFAULT_RUNS_DIR.glob(f"*/checkpoints/{fallback_pattern}"))
-    if not candidates:
-        candidates = list(DEFAULT_RUNS_DIR.glob("*/checkpoints/*.pt"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    patterns = ["checkpoint_best*.pt"] if policy == "best" else ["checkpoint*.pt"]
+    fallback_patterns = ["checkpoint*.pt"] if policy == "best" else []
+    candidates: list[Path] = []
+    for pattern in patterns + fallback_patterns:
+        candidates.extend(checkpoint_candidates(pattern))
+    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in candidates:
+        if is_locomotion_checkpoint(path):
+            return path
+    return None
 
 
 def newest_npz() -> Path | None:
@@ -350,6 +373,7 @@ class Actor:
     source_contacts: np.ndarray | None = None
     initial_pelvis_offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     initial_root_yaw: float = 0.0
+    initial_root_yaw_affect_velocity: bool = False
     random_init_source_npz_path: Path | None = None
     random_init_frame: int | None = None
     generated_pos: list[np.ndarray] = field(default_factory=list)
@@ -1089,6 +1113,7 @@ class ModelViewerApp(tk.Tk):
         self.animation_browser_paths: list[Path] = []
         self.animation_browser_paths_by_tab: dict[str, list[Path]] = {"anim1": [], "anim2": [], "anim3": []}
         self.animation_listboxes: dict[str, tk.Listbox] = {}
+        self.last_selected_animation_tab_key: str | None = None
         self.animation_folder_vars: dict[str, tk.StringVar] = {}
         self.fps_last_time = time.perf_counter()
         self.fps_frame_count = 0
@@ -1135,6 +1160,7 @@ class ModelViewerApp(tk.Tk):
         self.offset_vars = [tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0)]
         self.pelvis_offset_vars = [tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0), tk.DoubleVar(value=0.0)]
         self.root_yaw_var = tk.DoubleVar(value=0.0)
+        self.root_yaw_affect_velocity_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Open an NPZ or checkpoint to begin.")
         current_target = self.camera_target()
         self.settings_yaw_var = tk.DoubleVar(value=self.yaw)
@@ -1439,6 +1465,7 @@ class ModelViewerApp(tk.Tk):
             listbox.configure(yscrollcommand=animation_scroll.set)
             listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
             animation_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            listbox.bind("<<ListboxSelect>>", lambda _event, key=tab_key: self.on_animation_browser_select(key))
             listbox.bind("<Double-1>", lambda event, key=tab_key: self.load_selected_animation(event, key))
             listbox.bind("<Return>", lambda event, key=tab_key: self.load_selected_animation(event, key))
             self.animation_listboxes[tab_key] = listbox
@@ -1479,12 +1506,9 @@ class ModelViewerApp(tk.Tk):
         inspector.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(inspector, text="Name", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=2)
         ttk.Entry(inspector, textvariable=self.name_var).grid(row=0, column=1, sticky=tk.EW, pady=2)
-        ttk.Checkbutton(inspector, text="Visible", variable=self.visible_var, command=self.apply_inspector).grid(
-            row=1, column=1, sticky=tk.W, pady=2
-        )
-        ttk.Label(inspector, text="Start", style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Label(inspector, text="Start", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=2)
         vector_row = ttk.Frame(inspector)
-        vector_row.grid(row=2, column=1, sticky=tk.EW, pady=2)
+        vector_row.grid(row=1, column=1, sticky=tk.EW, pady=2)
         for index, label in enumerate(("X", "Y", "Z")):
             ttk.Label(vector_row, text=label, style="Muted.TLabel").pack(side=tk.LEFT, padx=(0 if index == 0 else 6, 2))
             ttk.Spinbox(
@@ -1496,9 +1520,9 @@ class ModelViewerApp(tk.Tk):
                 width=6,
                 command=self.apply_inspector,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(inspector, text="Pelvis F0", style="Muted.TLabel").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ttk.Label(inspector, text="Pelvis F0", style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=2)
         pelvis_row = ttk.Frame(inspector)
-        pelvis_row.grid(row=3, column=1, sticky=tk.EW, pady=2)
+        pelvis_row.grid(row=2, column=1, sticky=tk.EW, pady=2)
         for index, label in enumerate(("X", "Y", "Z")):
             ttk.Label(pelvis_row, text=label, style="Muted.TLabel").pack(side=tk.LEFT, padx=(0 if index == 0 else 6, 2))
             ttk.Spinbox(
@@ -1510,16 +1534,24 @@ class ModelViewerApp(tk.Tk):
                 width=6,
                 command=self.apply_inspector,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(inspector, text="Root Yaw F0", style="Muted.TLabel").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Label(inspector, text="Root Yaw F0", style="Muted.TLabel").grid(row=3, column=0, sticky=tk.W, pady=2)
+        root_yaw_row = ttk.Frame(inspector)
+        root_yaw_row.grid(row=3, column=1, sticky=tk.EW, pady=2)
         ttk.Spinbox(
-            inspector,
+            root_yaw_row,
             from_=-1000.0,
             to=1000.0,
             increment=0.05,
             textvariable=self.root_yaw_var,
             width=10,
             command=self.apply_inspector,
-        ).grid(row=4, column=1, sticky=tk.EW, pady=2)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Checkbutton(
+            root_yaw_row,
+            text="affect vel",
+            variable=self.root_yaw_affect_velocity_var,
+            command=self.apply_inspector,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         inspector.columnconfigure(1, weight=1)
         self.source_button = ttk.Button(actors_content, text="Set Model Source NPZ...", command=self.set_selected_source_npz)
         self.source_button.pack(fill=tk.X, pady=(4, 3))
@@ -1542,7 +1574,13 @@ class ModelViewerApp(tk.Tk):
         self.bind("<Left>", lambda _event: self.step_frame(-1))
         self.bind("<Right>", lambda _event: self.step_frame(1))
         self.bind("<Delete>", self.on_delete_selected)
-        for var in (self.name_var, self.visible_var, *self.offset_vars, *self.pelvis_offset_vars, self.root_yaw_var):
+        for var in (
+            self.name_var,
+            *self.offset_vars,
+            *self.pelvis_offset_vars,
+            self.root_yaw_var,
+            self.root_yaw_affect_velocity_var,
+        ):
             var.trace_add("write", lambda *_args: self.apply_inspector())
         self.scale_var.trace_add("write", lambda *_args: self.draw())
         for var in (
@@ -1906,7 +1944,25 @@ class ModelViewerApp(tk.Tk):
             return None
         return paths[index]
 
+    def on_animation_browser_select(self, tab_key: str) -> None:
+        if self.selected_animation_path(tab_key) is not None:
+            self.last_selected_animation_tab_key = tab_key
+
+    def highlighted_animation_path(self) -> Path | None:
+        keys: list[str] = []
+        if self.last_selected_animation_tab_key is not None:
+            keys.append(self.last_selected_animation_tab_key)
+        keys.append(self.active_animation_tab_key())
+        keys.extend(key for key in ("anim1", "anim2", "anim3") if key not in keys)
+        for key in keys:
+            path = self.selected_animation_path(key)
+            if path is not None:
+                return path
+        return None
+
     def load_selected_animation(self, _event: tk.Event | None = None, tab_key: str | None = None) -> str | None:
+        if tab_key is not None:
+            self.last_selected_animation_tab_key = tab_key
         path = self.selected_animation_path(tab_key)
         if path is None:
             return "break" if _event is not None else None
@@ -1970,7 +2026,7 @@ class ModelViewerApp(tk.Tk):
         if actor is None or actor.kind != "model":
             self.status_var.set("Select a model actor before shuffling.")
             return
-        if self.playing:
+        if self.playing or float(self.frame) > 1e-4:
             self.sample_random_pose_at_current_root(actor)
             return
         if not self.random_initialization_var.get():
@@ -2133,11 +2189,13 @@ class ModelViewerApp(tk.Tk):
         )
         self.next_actor_id += 1
         self.actors.append(actor)
-        source_path = source_npz_path or self.startup_source_npz()
+        source_path = source_npz_path or self.highlighted_animation_path()
         if source_path is None:
             source = self.selected_actor()
             if source is not None and source.kind == "npz" and source.npz_path is not None:
                 source_path = source.npz_path
+        if source_path is None:
+            source_path = self.startup_source_npz()
         if source_path is not None:
             self.load_model_source(actor, source_path)
         if self.random_initialization_var.get() and actor.clip is not None:
@@ -2162,6 +2220,7 @@ class ModelViewerApp(tk.Tk):
             offset=actor.offset + np.asarray([0.75, 0.0, 0.0], dtype=np.float32),
             initial_pelvis_offset=actor.initial_pelvis_offset.copy(),
             initial_root_yaw=float(actor.initial_root_yaw),
+            initial_root_yaw_affect_velocity=bool(actor.initial_root_yaw_affect_velocity),
             random_init_source_npz_path=actor.random_init_source_npz_path,
             random_init_frame=actor.random_init_frame,
             npz_path=actor.npz_path,
@@ -2268,22 +2327,28 @@ class ModelViewerApp(tk.Tk):
     def selected_actor(self) -> Actor | None:
         if self.selected_actor_id is None:
             return None
+        return self.actor_by_id(self.selected_actor_id)
+
+    def actor_by_id(self, actor_id: int) -> Actor | None:
         for actor in self.actors:
-            if actor.actor_id == self.selected_actor_id:
+            if actor.actor_id == actor_id:
                 return actor
         return None
+
+    def actor_tree_text(self, actor: Actor) -> str:
+        icon = "[x]" if actor.visible else "[ ]"
+        return f"{icon} {actor.name}"
 
     def refresh_tree(self, select_id: int | None = None) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
         for actor in self.actors:
-            icon = "[x]" if actor.visible else "[ ]"
             state = actor.status
             self.tree.insert(
                 "",
                 tk.END,
                 iid=str(actor.actor_id),
-                text=f"{icon} {actor.name}",
+                text=self.actor_tree_text(actor),
                 values=(actor.kind, state),
             )
         if select_id is not None:
@@ -2317,14 +2382,51 @@ class ModelViewerApp(tk.Tk):
         if redraw:
             self.draw()
 
-    def on_tree_button_press(self, event: tk.Event) -> None:
-        if not self.tree.identify_row(event.y):
+    def tree_visibility_checkbox_hit(self, item: str, event: tk.Event) -> bool:
+        if self.tree.identify_column(event.x) != "#0":
+            return False
+        bbox = self.tree.bbox(item, "#0")
+        if not bbox:
+            return False
+        x, _y, _width, _height = bbox
+        return x <= event.x <= x + 44
+
+    def toggle_actor_visibility_from_tree(self, item: str) -> None:
+        try:
+            actor_id = int(item)
+        except ValueError:
+            return
+        actor = self.actor_by_id(actor_id)
+        if actor is None:
+            return
+        actor.visible = not actor.visible
+        self.selected_actor_id = actor.actor_id
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        self.tree.item(item, text=self.actor_tree_text(actor), values=(actor.kind, actor.status))
+        self.load_inspector()
+        self.update_gizmo_visibility()
+        self.update_timeline()
+        self.update_bounds()
+        self.invalidate_shadow_cache()
+        self.draw()
+
+    def on_tree_button_press(self, event: tk.Event) -> str | None:
+        item = self.tree.identify_row(event.y)
+        if not item:
             self.tree_select_source = None
             self.programmatic_tree_selection = False
             self.clear_actor_selection()
-            return
+            return None
+        if self.tree_visibility_checkbox_hit(item, event):
+            self.tree_select_source = "user"
+            self.programmatic_tree_selection = False
+            self.toggle_actor_visibility_from_tree(item)
+            self.after(150, lambda: self.clear_tree_select_source("user"))
+            return "break"
         self.tree_select_source = "user"
         self.programmatic_tree_selection = False
+        return None
 
     def on_tree_select(self, _event: tk.Event) -> None:
         selection = self.tree.selection()
@@ -2342,7 +2444,7 @@ class ModelViewerApp(tk.Tk):
 
     def update_gizmo_visibility(self) -> None:
         actor = self.selected_actor()
-        self.gizmo_visible = bool(actor is not None and actor.clip is not None and not self.playing)
+        self.gizmo_visible = bool(actor is not None and actor.visible and actor.clip is not None and not self.playing)
 
     def on_tree_double_click(self, event: tk.Event) -> None:
         item = self.tree.identify_row(event.y)
@@ -2365,6 +2467,7 @@ class ModelViewerApp(tk.Tk):
             for var in self.pelvis_offset_vars:
                 var.set(0.0)
             self.root_yaw_var.set(0.0)
+            self.root_yaw_affect_velocity_var.set(False)
             self.source_button.state(["disabled"])
             self.status_var.set("No actor selected.")
             self.loading_inspector = False
@@ -2376,6 +2479,7 @@ class ModelViewerApp(tk.Tk):
         for i, var in enumerate(self.pelvis_offset_vars):
             var.set(float(actor.initial_pelvis_offset[i] if actor.kind == "model" else 0.0))
         self.root_yaw_var.set(float(actor.initial_root_yaw))
+        self.root_yaw_affect_velocity_var.set(bool(actor.initial_root_yaw_affect_velocity))
         if actor.kind == "model":
             self.source_button.state(["!disabled"])
             checkpoint = actor.checkpoint_path.name if actor.checkpoint_path else "checkpoint"
@@ -2406,6 +2510,7 @@ class ModelViewerApp(tk.Tk):
             actor.offset = np.asarray([var.get() for var in self.offset_vars], dtype=np.float32)
             pelvis_offset = np.asarray([var.get() for var in self.pelvis_offset_vars], dtype=np.float32)
             root_yaw = float(self.root_yaw_var.get())
+            root_yaw_affect_velocity = bool(self.root_yaw_affect_velocity_var.get())
         except tk.TclError:
             return
         if actor.kind == "model" and np.linalg.norm(actor.initial_pelvis_offset - pelvis_offset) > 1e-7:
@@ -2415,9 +2520,10 @@ class ModelViewerApp(tk.Tk):
             self.update_timeline()
         if abs(float(actor.initial_root_yaw) - root_yaw) > 1e-7:
             actor.initial_root_yaw = root_yaw
+        if bool(actor.initial_root_yaw_affect_velocity) != root_yaw_affect_velocity:
+            actor.initial_root_yaw_affect_velocity = root_yaw_affect_velocity
         if self.tree.exists(str(actor.actor_id)):
-            icon = "[x]" if actor.visible else "[ ]"
-            self.tree.item(str(actor.actor_id), text=f"{icon} {actor.name}", values=(actor.kind, actor.status))
+            self.tree.item(str(actor.actor_id), text=self.actor_tree_text(actor), values=(actor.kind, actor.status))
         self.update_bounds()
         self.invalidate_shadow_cache()
         self.draw()
@@ -2447,10 +2553,17 @@ class ModelViewerApp(tk.Tk):
         for actor in self.actors:
             if not actor.visible or actor.clip is None:
                 continue
-            clip_pos = actor.clip.global_pos.detach().cpu().numpy().reshape(-1, 3)
+            clip_global = actor.clip.global_pos.detach().cpu().numpy().astype(np.float32)
+            clip_pos = clip_global.reshape(-1, 3)
             if abs(float(actor.initial_root_yaw)) > 1e-8:
-                pivot = self.actor_root_yaw_pivot(actor)
-                clip_pos = (clip_pos - pivot[None, :]) @ self.actor_root_yaw_matrix(actor) + pivot[None, :]
+                yaw_matrix = self.actor_root_yaw_matrix(actor)
+                if self.actor_root_yaw_affects_velocity(actor):
+                    pivot = self.actor_root_yaw_pivot(actor)
+                    clip_pos = (clip_pos - pivot[None, :]) @ yaw_matrix + pivot[None, :]
+                else:
+                    root_index = max(0, min(actor.root_index, clip_global.shape[1] - 1))
+                    pivot = clip_global[:, root_index : root_index + 1, :]
+                    clip_pos = ((clip_global - pivot) @ yaw_matrix + pivot).reshape(-1, 3)
             points.append((clip_pos + actor.offset[None, :]).astype(np.float32))
         if not points:
             self.center = np.zeros(3, dtype=np.float32)
@@ -2846,9 +2959,12 @@ class ModelViewerApp(tk.Tk):
     def actor_root_yaw_matrix(self, actor: Actor) -> np.ndarray:
         return yaw_rotation_matrix_np(float(actor.initial_root_yaw))
 
+    def actor_root_yaw_affects_velocity(self, actor: Actor) -> bool:
+        return bool(actor.initial_root_yaw_affect_velocity)
+
     def apply_actor_root_yaw_local_point(self, actor: Actor, point: np.ndarray) -> np.ndarray:
         point = np.asarray(point, dtype=np.float32)
-        if abs(float(actor.initial_root_yaw)) <= 1e-8:
+        if abs(float(actor.initial_root_yaw)) <= 1e-8 or not self.actor_root_yaw_affects_velocity(actor):
             return point.astype(np.float32, copy=True)
         pivot = self.actor_root_yaw_pivot(actor)
         return ((point - pivot) @ self.actor_root_yaw_matrix(actor) + pivot).astype(np.float32)
@@ -2863,8 +2979,12 @@ class ModelViewerApp(tk.Tk):
         transformed_rot = np.asarray(rotations, dtype=np.float32).copy()
         if abs(float(actor.initial_root_yaw)) <= 1e-8:
             return transformed_pos, transformed_rot
-        pivot = self.actor_root_yaw_pivot(actor)
         yaw_matrix = self.actor_root_yaw_matrix(actor)
+        if self.actor_root_yaw_affects_velocity(actor):
+            pivot = self.actor_root_yaw_pivot(actor)
+        else:
+            root = max(0, min(actor.root_index, len(transformed_pos) - 1))
+            pivot = transformed_pos[root].astype(np.float32, copy=True)
         flat = transformed_pos.reshape(-1, 3)
         transformed_pos = ((flat - pivot[None, :]) @ yaw_matrix + pivot[None, :]).reshape(transformed_pos.shape)
         transformed_rot = np.matmul(transformed_rot, yaw_matrix).astype(np.float32)
@@ -4262,6 +4382,157 @@ class ModelViewerApp(tk.Tk):
             return None
         return max(1, min(frame, max_cur))
 
+    def ae_root_state_for_actor(
+        self,
+        actor: Actor,
+        idx: torch.Tensor,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert actor.clip is not None
+        frames = [int(frame) for frame in idx.detach().cpu().reshape(-1).tolist()]
+        positions: list[torch.Tensor] = []
+        rotations: list[torch.Tensor] = []
+        yaws: list[torch.Tensor] = []
+        headings: list[torch.Tensor] = []
+        extend_live = bool(actor.kind == "model" and self.extend_playback_active(actor))
+        for frame in frames:
+            if extend_live and frame >= int(actor.clip.T):
+                root_pos, root_rot, root_yaw, root_heading = actor.authored_root_state(frame, device, True)
+            else:
+                frame_idx = torch.tensor([frame], dtype=torch.long, device=device)
+                if not actor.clip.cyclic_animation:
+                    frame_idx = torch.clamp(frame_idx, min=0, max=actor.clip.T - 1)
+                root_pos, root_rot, root_yaw, root_heading = tl.root_state(actor.clip, frame_idx, cfg, device)
+            positions.append(root_pos[0])
+            rotations.append(root_rot[0])
+            yaws.append(root_yaw.reshape(-1)[0])
+            headings.append(root_heading[0])
+        return (
+            torch.stack(positions, dim=0),
+            torch.stack(rotations, dim=0),
+            torch.stack(yaws, dim=0),
+            torch.stack(headings, dim=0),
+        )
+
+    def ae_root_delta_feature(
+        self,
+        actor: Actor,
+        prev_idx: torch.Tensor,
+        cur_idx: torch.Tensor,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> torch.Tensor:
+        prev_pos, _prev_rot, prev_yaw, prev_heading = self.ae_root_state_for_actor(actor, prev_idx, cfg, device)
+        cur_pos, _cur_rot, cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+        delta_local = torch.matmul((cur_pos - prev_pos).unsqueeze(1), prev_heading).squeeze(1)
+        dx = delta_local[:, 0] / cfg.max_speed_scale_final
+        dz = delta_local[:, 2] / cfg.max_speed_scale_final
+        dyaw = tl.wrap_angle(cur_yaw - prev_yaw) / cfg.max_turn_rate_scale_final
+        return torch.stack((dx, dz, dyaw), dim=-1)
+
+    def ae_future_root_features(
+        self,
+        actor: Actor,
+        cur_idx: torch.Tensor,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> torch.Tensor:
+        feats: list[torch.Tensor] = []
+        cur_pos, _cur_rot, cur_yaw, cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+        for k in range(1, int(cfg.future_window) + 1):
+            fut_idx = cur_idx + k
+            if actor.clip is not None and not actor.clip.cyclic_animation and not self.extend_playback_active(actor):
+                fut_idx = torch.clamp(fut_idx, max=actor.clip.T - 1)
+            fut_pos, _fut_rot, fut_yaw, _fut_heading = self.ae_root_state_for_actor(actor, fut_idx, cfg, device)
+            fut_local = torch.matmul((fut_pos - cur_pos).unsqueeze(1), cur_heading).squeeze(1)
+            scale_k = max(1e-6, float(k) * float(cfg.max_speed_scale_final))
+            dx = torch.clamp(fut_local[:, 0] / scale_k, -2.0, 2.0)
+            dz = torch.clamp(fut_local[:, 2] / scale_k, -2.0, 2.0)
+            dyaw = tl.wrap_angle(fut_yaw - cur_yaw)
+            feats.append(torch.stack((dx, dz, torch.cos(dyaw), torch.sin(dyaw)), dim=-1))
+        return torch.cat(feats, dim=-1)
+
+    def ae_transition_foot_motion_features(
+        self,
+        actor: Actor,
+        cur_idx: torch.Tensor,
+        cur_pose: dict[str, torch.Tensor],
+        next_pose: dict[str, torch.Tensor],
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert actor.clip is not None
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+        next_root_pos, next_root_rot, _next_yaw, _next_heading = self.ae_root_state_for_actor(
+            actor, cur_idx + 1, cfg, device
+        )
+        cur_pos, cur_rot, _cur_canon = tl.fk_from_pose(actor.clip, cur_root_pos, cur_root_rot, cur_pose, device)
+        next_pos, next_rot, _next_canon = tl.fk_from_pose(actor.clip, next_root_pos, next_root_rot, next_pose, device)
+        foot_indices = tuple(int(x) for x in actor.clip.foot_indices_tensor.tolist())
+        toe_indices = tuple(int(x) for x in actor.clip.toe_indices_tensor.tolist())
+        slide = cp.foot_slide_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, actor.clip.fps)
+        yaw = cp.foot_vertical_yaw_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, actor.clip.fps)
+        slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
+        yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+        return torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1)
+
+    def ae_root_lookahead_features(
+        self,
+        actor: Actor,
+        cur_idx: torch.Tensor,
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> torch.Tensor:
+        steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
+        if steps <= 0:
+            return torch.empty((cur_idx.shape[0], 0), dtype=torch.float32, device=device)
+        feats = []
+        for offset in range(1, steps + 1):
+            prev_idx = cur_idx + offset
+            next_idx = cur_idx + offset + 1
+            if actor.clip is not None and not actor.clip.cyclic_animation and not self.extend_playback_active(actor):
+                prev_idx = torch.clamp(prev_idx, max=actor.clip.T - 1)
+                next_idx = torch.clamp(next_idx, max=actor.clip.T - 1)
+            feats.append(self.ae_root_delta_feature(actor, prev_idx, next_idx, cfg, device))
+        return torch.cat(feats, dim=-1)
+
+    def ae_transition_feature_from_next_pose(
+        self,
+        actor: Actor,
+        prev_idx: torch.Tensor,
+        cur_idx: torch.Tensor,
+        prev_pose: dict[str, torch.Tensor],
+        cur_pose: dict[str, torch.Tensor],
+        next_pose: dict[str, torch.Tensor],
+        cfg: tl.TrainConfig,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert actor.clip is not None
+        current = tl.body_pose_vector(cur_pose, cfg.use_contact_state, cfg.zero_contact_state)
+        previous = tl.body_pose_vector(prev_pose, cfg.use_contact_state, cfg.zero_contact_state)
+        pelvis_vel = (cur_pose["pelvis_pos"] - prev_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
+        joint_vel = (cur_pose["canon_pos"] - prev_pose["canon_pos"]).reshape(cur_idx.shape[0], -1) / cfg.pose_delta_scale_final
+        root_feat = self.ae_root_delta_feature(actor, prev_idx, cur_idx, cfg, device)
+        future_feat = self.ae_future_root_features(actor, cur_idx, cfg, device)
+        model_input = torch.cat((current, previous, pelvis_vel, joint_vel, root_feat, future_feat), dim=-1)
+        next_output = tl.pose_target_output(next_pose)
+        pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
+        joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
+        joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
+        parts = [
+            model_input,
+            next_output,
+            next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
+            pelvis_next_vel,
+            joint_next_vel,
+        ]
+        if getattr(cfg, "include_transition_foot_motion", False):
+            parts.append(self.ae_transition_foot_motion_features(actor, cur_idx, cur_pose, next_pose, cfg, device))
+        if max(0, int(getattr(cfg, "root_lookahead_steps", 0))) > 0:
+            parts.append(self.ae_root_lookahead_features(actor, cur_idx, cfg, device))
+        return torch.cat(parts, dim=-1)
+
     def ae_pose_from_generated_frame(
         self,
         actor: Actor,
@@ -4276,9 +4547,8 @@ class ModelViewerApp(tk.Tk):
             return None
         positions = torch.as_tensor(actor.generated_pos[frame], dtype=torch.float32, device=device).unsqueeze(0)
         rotations = torch.as_tensor(actor.generated_rot[frame], dtype=torch.float32, device=device).unsqueeze(0)
-        idx_value = min(frame, actor.clip.T - 1)
-        idx = torch.tensor([idx_value], dtype=torch.long, device=device)
-        root_pos, root_rot, root_yaw, heading = tl.root_state(actor.clip, idx, cfg, device)
+        idx = torch.tensor([frame], dtype=torch.long, device=device)
+        root_pos, root_rot, _root_yaw, heading = self.ae_root_state_for_actor(actor, idx, cfg, device)
 
         local_rotations = torch.empty_like(rotations)
         root_inv = root_rot.transpose(-1, -2)
@@ -4355,8 +4625,8 @@ class ModelViewerApp(tk.Tk):
         cur_idx = torch.tensor([cur], dtype=torch.long, device=device)
         try:
             with torch.no_grad():
-                features = tae.transition_feature_from_next_pose(
-                    actor.clip, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
+                features = self.ae_transition_feature_from_next_pose(
+                    actor, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
                 )
                 total_dim = int(prior["schema"]["total_dim"]) if isinstance(prior.get("schema"), dict) else 0
                 if total_dim > 0 and int(features.shape[-1]) != total_dim:
@@ -4367,7 +4637,8 @@ class ModelViewerApp(tk.Tk):
                 model = prior["model"]
                 x = (features - mean) / std
                 recon = model(x)
-                score = torch.mean((recon - x).square(), dim=-1)
+                target = model.target(x) if hasattr(model, "target") else x
+                score = torch.mean((recon - target).square(), dim=-1)
                 compat_weight = float(prior.get("compatibility_weight", 0.0) or 0.0)
                 if compat_weight > 0.0 and hasattr(model, "has_compatibility_head") and model.has_compatibility_head():
                     score = score + compat_weight * F.softplus(-model.compatibility_logits(x))
