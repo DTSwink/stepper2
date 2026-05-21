@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IK Pole Playground</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07090c;
+      --panel: #121821;
+      --panel-2: #1b2430;
+      --line: #7da7ff;
+      --muted: #91a0b5;
+      --text: #edf4ff;
+      --green: #55e6ad;
+      --red: #ff5f6f;
+      --amber: #ffb35f;
+      --blue: #74a7ff;
+      --border: #4c5a6d;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 14px;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: minmax(500px, 1fr) 360px;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    .viewport {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      background: #050608;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+      outline: none;
+    }
+
+    .hud {
+      position: absolute;
+      left: 12px;
+      top: 10px;
+      color: white;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 13px;
+      line-height: 1.35;
+      pointer-events: none;
+      text-shadow: 0 1px 2px black;
+      white-space: pre;
+    }
+
+    .panel {
+      min-width: 0;
+      min-height: 0;
+      padding: 12px;
+      overflow-y: auto;
+      border-left: 1px solid #253142;
+      background: var(--panel);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    h2 {
+      margin: 16px 0 8px;
+      font-size: 13px;
+      letter-spacing: .02em;
+      color: #cbd7e8;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+
+    .limb-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    button {
+      height: 34px;
+      border: 1px solid #aeb7c5;
+      color: var(--text);
+      background: var(--panel-2);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #263244;
+    }
+
+    button.active {
+      background: #315477;
+      border-color: #d6e4ff;
+    }
+
+    button.primary {
+      background: #2ebd82;
+      color: #07100d;
+      border-color: #70ffc1;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 76px 1fr 74px;
+      align-items: center;
+      gap: 8px;
+      margin: 8px 0;
+    }
+
+    .row.two {
+      grid-template-columns: 120px 1fr;
+    }
+
+    .row.compact {
+      grid-template-columns: 24px 1fr 68px;
+    }
+
+    label {
+      color: #b7c4d6;
+      white-space: nowrap;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--green);
+    }
+
+    input[type="number"],
+    textarea {
+      width: 100%;
+      min-width: 0;
+      height: 30px;
+      border: 1px solid #aeb7c5;
+      color: var(--text);
+      background: #0c1016;
+      padding: 4px 6px;
+      font: inherit;
+    }
+
+    textarea {
+      height: 96px;
+      resize: vertical;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .num-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .num-cell label {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 10px 0;
+      color: #cbd7e8;
+    }
+
+    .toggle-row input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--green);
+    }
+
+    .mini-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      color: #dbe8f8;
+    }
+
+    .mini-table th,
+    .mini-table td {
+      padding: 5px 4px;
+      border-bottom: 1px solid #283446;
+      text-align: right;
+    }
+
+    .mini-table th:first-child,
+    .mini-table td:first-child {
+      text-align: left;
+    }
+
+    .hint {
+      margin-top: 12px;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 12px;
+    }
+
+    @media (max-width: 1000px) {
+      .app {
+        grid-template-columns: 1fr 330px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <section class="viewport">
+      <canvas id="canvas" tabindex="0"></canvas>
+      <div id="hud" class="hud"></div>
+    </section>
+
+    <aside class="panel">
+      <h1>IK Pole Playground</h1>
+
+      <div class="limb-grid" id="limbButtons"></div>
+
+      <h2>Endpoint</h2>
+      <div class="num-grid">
+        <div class="num-cell">
+          <label for="eeX">X</label>
+          <input id="eeX" type="number" step="0.01">
+        </div>
+        <div class="num-cell">
+          <label for="eeY">Y</label>
+          <input id="eeY" type="number" step="0.01">
+        </div>
+        <div class="num-cell">
+          <label for="eeZ">Z</label>
+          <input id="eeZ" type="number" step="0.01">
+        </div>
+      </div>
+
+      <h2>Pole Float</h2>
+      <div class="row">
+        <label for="pole">Theta</label>
+        <input id="pole" type="range" min="-90" max="90" step="0.1">
+        <input id="poleNum" type="number" step="0.1">
+      </div>
+      <div class="row">
+        <label for="alpha">Alpha</label>
+        <input id="alpha" type="range" min="5" max="180" step="1">
+        <input id="alphaNum" type="number" step="1">
+      </div>
+
+      <h2>Camera</h2>
+      <div class="row compact">
+        <label for="yaw">Y</label>
+        <input id="yaw" type="range" min="-180" max="180" step="0.5">
+        <input id="yawNum" type="number" step="0.5">
+      </div>
+      <div class="row compact">
+        <label for="pitch">P</label>
+        <input id="pitch" type="range" min="-85" max="85" step="0.5">
+        <input id="pitchNum" type="number" step="0.5">
+      </div>
+      <div class="row compact">
+        <label for="zoom">Z</label>
+        <input id="zoom" type="range" min="120" max="520" step="1">
+        <input id="zoomNum" type="number" step="1">
+      </div>
+
+      <div class="limb-grid">
+        <button id="front">Front</button>
+        <button id="side">Side</button>
+        <button id="top">Top</button>
+        <button id="resetCam">Reset Cam</button>
+      </div>
+
+      <h2>Display</h2>
+      <label class="toggle-row">
+        <input id="showNatural" type="checkbox" checked>
+        <span>Natural pole ghost</span>
+      </label>
+      <label class="toggle-row">
+        <input id="showCone" type="checkbox" checked>
+        <span>Swivel cone</span>
+      </label>
+      <label class="toggle-row">
+        <input id="showRest" type="checkbox">
+        <span>Rest pose guides</span>
+      </label>
+
+      <h2>Actions</h2>
+      <div class="limb-grid">
+        <button id="resetSelected">Reset Selected</button>
+        <button id="resetAll">Reset All</button>
+      </div>
+
+      <h2>Values</h2>
+      <table class="mini-table" id="valueTable">
+        <thead>
+          <tr>
+            <th>Limb</th>
+            <th>theta</th>
+            <th>norm</th>
+            <th>reach</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+      <h2>Export</h2>
+      <textarea id="export" readonly></textarea>
+
+      <p class="hint">
+        Drag colored endpoint handles in the viewport. Empty drag rotates the view.
+        Mouse wheel changes zoom. Hold Shift while dragging an endpoint to move it along view depth.
+      </p>
+    </aside>
+  </main>
+
+  <script>
+    "use strict";
+
+    const TAU = Math.PI * 2;
+    const DEG = Math.PI / 180;
+    const RAD = 180 / Math.PI;
+    const EPS = 1e-6;
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const hud = document.getElementById("hud");
+
+    const ids = [
+      "limbButtons", "eeX", "eeY", "eeZ", "pole", "poleNum", "alpha", "alphaNum",
+      "yaw", "yawNum", "pitch", "pitchNum", "zoom", "zoomNum", "front", "side",
+      "top", "resetCam", "showNatural", "showCone", "showRest", "resetSelected",
+      "resetAll", "valueTable", "export"
+    ];
+    const ui = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
+
+    const body = {
+      pelvis: v(0, 0, 1.02),
+      spine: v(0, 0, 1.30),
+      neck: v(0, 0, 1.57),
+      head: v(0, 0, 1.76),
+      shoulderL: v(-0.24, 0, 1.48),
+      shoulderR: v(0.24, 0, 1.48),
+      hipL: v(-0.14, 0, 1.00),
+      hipR: v(0.14, 0, 1.00)
+    };
+
+    const defaultLimbs = {
+      armL: {
+        id: "armL",
+        label: "Left Arm",
+        short: "LH",
+        baseName: "shoulderL",
+        color: "#55e6ad",
+        l1: 0.34,
+        l2: 0.34,
+        end: v(-0.30, 0.12, 0.90),
+        restEnd: v(-0.24, 0, 0.80),
+        restPole: v(0, -1, 0),
+        theta: 0,
+        alpha: 90
+      },
+      armR: {
+        id: "armR",
+        label: "Right Arm",
+        short: "RH",
+        baseName: "shoulderR",
+        color: "#ffb35f",
+        l1: 0.34,
+        l2: 0.34,
+        end: v(0.30, 0.12, 0.90),
+        restEnd: v(0.24, 0, 0.80),
+        restPole: v(0, -1, 0),
+        theta: 0,
+        alpha: 90
+      },
+      legL: {
+        id: "legL",
+        label: "Left Leg",
+        short: "LF",
+        baseName: "hipL",
+        color: "#74a7ff",
+        l1: 0.47,
+        l2: 0.48,
+        end: v(-0.15, 0.18, 0.08),
+        restEnd: v(-0.14, 0, 0.05),
+        restPole: v(0, 1, 0),
+        theta: 0,
+        alpha: 90
+      },
+      legR: {
+        id: "legR",
+        label: "Right Leg",
+        short: "RF",
+        baseName: "hipR",
+        color: "#ff5f6f",
+        l1: 0.47,
+        l2: 0.48,
+        end: v(0.15, -0.10, 0.08),
+        restEnd: v(0.14, 0, 0.05),
+        restPole: v(0, 1, 0),
+        theta: 0,
+        alpha: 90
+      }
+    };
+
+    const limbs = structuredClone(defaultLimbs);
+    let selectedId = "legL";
+    let handles = [];
+
+    const camera = {
+      yaw: -38 * DEG,
+      pitch: 18 * DEG,
+      zoom: 280,
+      target: v(0, 0.03, 0.9),
+      basis: null
+    };
+
+    const pointer = {
+      down: false,
+      draggingHandle: null,
+      startX: 0,
+      startY: 0,
+      lastX: 0,
+      lastY: 0
+    };
+
+    function v(x, y, z) {
+      return { x, y, z };
+    }
+
+    function add(a, b) {
+      return v(a.x + b.x, a.y + b.y, a.z + b.z);
+    }
+
+    function sub(a, b) {
+      return v(a.x - b.x, a.y - b.y, a.z - b.z);
+    }
+
+    function mul(a, s) {
+      return v(a.x * s, a.y * s, a.z * s);
+    }
+
+    function dot(a, b) {
+      return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    function cross(a, b) {
+      return v(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+      );
+    }
+
+    function len(a) {
+      return Math.sqrt(dot(a, a));
+    }
+
+    function norm(a, fallback = v(1, 0, 0)) {
+      const l = len(a);
+      return l > EPS ? mul(a, 1 / l) : { ...fallback };
+    }
+
+    function clamp(x, lo, hi) {
+      return Math.max(lo, Math.min(hi, x));
+    }
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function stablePerpendicular(axis) {
+      const a = Math.abs(axis.z) < 0.8 ? v(0, 0, 1) : v(1, 0, 0);
+      return norm(cross(axis, a), v(0, 1, 0));
+    }
+
+    function rotateAroundAxis(vec, axis, angle) {
+      const c = Math.cos(angle);
+      const s = Math.sin(angle);
+      const a = norm(axis);
+      return add(add(mul(vec, c), mul(cross(a, vec), s)), mul(a, dot(a, vec) * (1 - c)));
+    }
+
+    function swingOnlyVector(restAxis, currentAxis, vecToMove) {
+      const a = norm(restAxis);
+      const b = norm(currentAxis);
+      const c = clamp(dot(a, b), -1, 1);
+      if (c > 0.999999) return { ...vecToMove };
+      if (c < -0.999999) {
+        return rotateAroundAxis(vecToMove, stablePerpendicular(a), Math.PI);
+      }
+      const axis = norm(cross(a, b));
+      const angle = Math.acos(c);
+      return rotateAroundAxis(vecToMove, axis, angle);
+    }
+
+    function projectOntoPlane(vecToProject, planeNormal, fallback) {
+      const n = norm(planeNormal);
+      return norm(sub(vecToProject, mul(n, dot(vecToProject, n))), fallback);
+    }
+
+    function limbBase(limb) {
+      return body[limb.baseName];
+    }
+
+    function limbRestAxis(limb) {
+      return sub(limb.restEnd, limbBase(limb));
+    }
+
+    function naturalPole(limb, axis) {
+      const transported = swingOnlyVector(limbRestAxis(limb), axis, limb.restPole);
+      return projectOntoPlane(transported, axis, stablePerpendicular(axis));
+    }
+
+    function solveLimb(limb, thetaOverride = null) {
+      const base = limbBase(limb);
+      const endRaw = limb.end;
+      const baseToEndRaw = sub(endRaw, base);
+      const rawDist = len(baseToEndRaw);
+      const maxReach = limb.l1 + limb.l2 - 0.0001;
+      const minReach = Math.abs(limb.l1 - limb.l2) + 0.0001;
+      const usedDist = clamp(rawDist, minReach, maxReach);
+      const axis = norm(baseToEndRaw, norm(limbRestAxis(limb)));
+      const end = add(base, mul(axis, usedDist));
+
+      const a = (limb.l1 * limb.l1 - limb.l2 * limb.l2 + usedDist * usedDist) / (2 * usedDist);
+      const h = Math.sqrt(Math.max(0, limb.l1 * limb.l1 - a * a));
+      const pole0 = naturalPole(limb, axis);
+      const theta = (thetaOverride ?? limb.theta) * DEG;
+      const pole = rotateAroundAxis(pole0, axis, theta);
+      const mid = add(add(base, mul(axis, a)), mul(pole, h));
+
+      return {
+        base,
+        mid,
+        end,
+        axis,
+        pole0,
+        pole,
+        rawDist,
+        usedDist,
+        reach: rawDist / (limb.l1 + limb.l2)
+      };
+    }
+
+    function cameraBasis() {
+      const cy = Math.cos(camera.yaw);
+      const sy = Math.sin(camera.yaw);
+      const cp = Math.cos(camera.pitch);
+      const sp = Math.sin(camera.pitch);
+      const forward = norm(v(cp * sy, cp * cy, sp));
+      const right = norm(v(cy, -sy, 0));
+      const up = norm(cross(right, forward));
+      camera.basis = { forward, right, up };
+      return camera.basis;
+    }
+
+    function worldToScreen(p) {
+      const basis = camera.basis || cameraBasis();
+      const r = sub(p, camera.target);
+      return {
+        x: canvas.width * 0.5 + dot(r, basis.right) * camera.zoom,
+        y: canvas.height * 0.55 - dot(r, basis.up) * camera.zoom,
+        z: dot(r, basis.forward)
+      };
+    }
+
+    function screenDeltaToWorld(dx, dy, depthMode) {
+      const basis = camera.basis || cameraBasis();
+      if (depthMode) {
+        return mul(basis.forward, -dy / camera.zoom);
+      }
+      return add(mul(basis.right, dx / camera.zoom), mul(basis.up, -dy / camera.zoom));
+    }
+
+    function fitCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(2, Math.floor(rect.width * dpr));
+      const h = Math.max(2, Math.floor(rect.height * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    }
+
+    function drawLine(a, b, color, width = 2, dash = null) {
+      const pa = worldToScreen(a);
+      const pb = worldToScreen(b);
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width * (window.devicePixelRatio || 1);
+      ctx.lineCap = "round";
+      ctx.setLineDash(dash || []);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawCircleScreen(x, y, radius, fill, stroke = null, width = 2) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, TAU);
+      ctx.fillStyle = fill;
+      ctx.fill();
+      if (stroke) {
+        ctx.lineWidth = width;
+        ctx.strokeStyle = stroke;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawPoint(p, radius, fill, stroke = null) {
+      const sp = worldToScreen(p);
+      drawCircleScreen(sp.x, sp.y, radius * (window.devicePixelRatio || 1), fill, stroke);
+      return sp;
+    }
+
+    function drawLabel(p, text, color) {
+      const sp = worldToScreen(p);
+      ctx.save();
+      ctx.font = `${12 * (window.devicePixelRatio || 1)}px Consolas, monospace`;
+      ctx.fillStyle = color;
+      ctx.textAlign = "center";
+      ctx.fillText(text, sp.x, sp.y - 12 * (window.devicePixelRatio || 1));
+      ctx.restore();
+    }
+
+    function drawGround() {
+      const yMin = -1.4;
+      const yMax = 1.4;
+      const xMin = -1.4;
+      const xMax = 1.4;
+      const step = 0.2;
+      ctx.save();
+      ctx.strokeStyle = "#1e2b3a";
+      ctx.lineWidth = window.devicePixelRatio || 1;
+      for (let x = xMin; x <= xMax + EPS; x += step) {
+        drawLine(v(x, yMin, 0), v(x, yMax, 0), "#1e2b3a", 1);
+      }
+      for (let y = yMin; y <= yMax + EPS; y += step) {
+        drawLine(v(xMin, y, 0), v(xMax, y, 0), "#1e2b3a", 1);
+      }
+      drawLine(v(0, 0, 0), v(0.5, 0, 0), "#d05d63", 2);
+      drawLine(v(0, 0, 0), v(0, 0.5, 0), "#5fe0a3", 2);
+      drawLine(v(0, 0, 0), v(0, 0, 0.5), "#70a5ff", 2);
+      ctx.restore();
+    }
+
+    function drawBodyFrame() {
+      drawLine(body.pelvis, body.spine, "#6c7888", 3);
+      drawLine(body.spine, body.neck, "#6c7888", 3);
+      drawLine(body.neck, body.head, "#6c7888", 2);
+      drawLine(body.shoulderL, body.shoulderR, "#6c7888", 4);
+      drawLine(body.hipL, body.hipR, "#6c7888", 4);
+      drawLine(body.shoulderL, body.hipL, "#3f4a59", 1.5);
+      drawLine(body.shoulderR, body.hipR, "#3f4a59", 1.5);
+      drawPoint(body.pelvis, 5, "#d7e0ed", "#26313e");
+      drawPoint(body.neck, 4, "#d7e0ed", "#26313e");
+      drawPoint(body.head, 16, "#d7e0ed", "#26313e");
+    }
+
+    function drawCone(limb, solve) {
+      const base = solve.base;
+      const axis = solve.axis;
+      const a = (limb.l1 * limb.l1 - limb.l2 * limb.l2 + solve.usedDist * solve.usedDist) / (2 * solve.usedDist);
+      const h = Math.sqrt(Math.max(0, limb.l1 * limb.l1 - a * a));
+      const center = add(base, mul(axis, a));
+      const ref = solve.pole0;
+      const pts = [];
+      const segments = 64;
+      for (let i = 0; i <= segments; i++) {
+        const t = (i / segments) * TAU;
+        const p = add(center, mul(rotateAroundAxis(ref, axis, t), h));
+        pts.push(worldToScreen(p));
+      }
+      ctx.save();
+      ctx.strokeStyle = "rgba(160, 180, 210, 0.22)";
+      ctx.lineWidth = 1 * (window.devicePixelRatio || 1);
+      ctx.setLineDash([4 * (window.devicePixelRatio || 1), 6 * (window.devicePixelRatio || 1)]);
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawLimbs() {
+      handles = [];
+      for (const limb of Object.values(limbs)) {
+        const solve = solveLimb(limb);
+        const natural = solveLimb(limb, 0);
+        const selected = limb.id === selectedId;
+        const color = limb.color;
+        if (ui.showCone.checked) {
+          drawCone(limb, solve);
+        }
+        if (ui.showRest.checked) {
+          drawLine(limbBase(limb), limb.restEnd, "rgba(255,255,255,0.22)", 1.5, [6, 7]);
+        }
+        if (ui.showNatural.checked && Math.abs(limb.theta) > 0.01) {
+          drawLine(natural.base, natural.mid, "rgba(255,255,255,0.35)", 2, [6, 7]);
+          drawLine(natural.mid, natural.end, "rgba(255,255,255,0.35)", 2, [6, 7]);
+          drawPoint(natural.mid, 6, "rgba(255,255,255,0.35)");
+        }
+        drawLine(solve.base, solve.mid, color, selected ? 7 : 5);
+        drawLine(solve.mid, solve.end, color, selected ? 7 : 5);
+        drawPoint(solve.base, 7, "#d7e0ed", "#111822");
+        drawPoint(solve.mid, selected ? 8 : 6, color, "#07100d");
+        const sp = drawPoint(limb.end, selected ? 12 : 10, "#0b1017", color);
+        drawLabel(add(limb.end, v(0, 0, 0.03)), limb.short, color);
+        handles.push({ id: limb.id, type: "end", x: sp.x, y: sp.y });
+        drawLine(add(solve.base, mul(solve.axis, 0.12)), add(add(solve.base, mul(solve.axis, 0.12)), mul(solve.pole0, 0.18)), "rgba(255,255,255,0.30)", 2);
+        drawLine(add(solve.base, mul(solve.axis, 0.16)), add(add(solve.base, mul(solve.axis, 0.16)), mul(solve.pole, 0.22)), color, 2.5);
+      }
+    }
+
+    function render() {
+      fitCanvas();
+      cameraBasis();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawGround();
+      drawBodyFrame();
+      drawLimbs();
+      drawHud();
+      requestAnimationFrame(render);
+    }
+
+    function selectedLimb() {
+      return limbs[selectedId];
+    }
+
+    function drawHud() {
+      const limb = selectedLimb();
+      const solve = solveLimb(limb);
+      const natural = solveLimb(limb, 0);
+      const midErr = len(sub(solve.mid, natural.mid));
+      hud.textContent =
+        `${limb.label}\n` +
+        `theta ${limb.theta.toFixed(1)} / alpha ${limb.alpha.toFixed(0)} deg\n` +
+        `endpoint ${limb.end.x.toFixed(3)} ${limb.end.y.toFixed(3)} ${limb.end.z.toFixed(3)}\n` +
+        `reach ${(solve.reach * 100).toFixed(1)}%   pole offset ${midErr.toFixed(3)} m`;
+    }
+
+    function refreshButtons() {
+      ui.limbButtons.innerHTML = "";
+      for (const limb of Object.values(limbs)) {
+        const btn = document.createElement("button");
+        btn.textContent = limb.label;
+        btn.className = limb.id === selectedId ? "active" : "";
+        btn.addEventListener("click", () => {
+          selectedId = limb.id;
+          syncUiFromState();
+        });
+        ui.limbButtons.appendChild(btn);
+      }
+    }
+
+    function syncUiFromState() {
+      refreshButtons();
+      const limb = selectedLimb();
+      ui.eeX.value = limb.end.x.toFixed(3);
+      ui.eeY.value = limb.end.y.toFixed(3);
+      ui.eeZ.value = limb.end.z.toFixed(3);
+      ui.pole.min = -limb.alpha;
+      ui.pole.max = limb.alpha;
+      ui.pole.value = limb.theta;
+      ui.poleNum.value = limb.theta.toFixed(1);
+      ui.alpha.value = limb.alpha;
+      ui.alphaNum.value = limb.alpha.toFixed(0);
+      ui.yaw.value = camera.yaw * RAD;
+      ui.yawNum.value = (camera.yaw * RAD).toFixed(1);
+      ui.pitch.value = camera.pitch * RAD;
+      ui.pitchNum.value = (camera.pitch * RAD).toFixed(1);
+      ui.zoom.value = camera.zoom;
+      ui.zoomNum.value = camera.zoom.toFixed(0);
+      refreshTable();
+      refreshExport();
+    }
+
+    function refreshTable() {
+      const tbody = ui.valueTable.querySelector("tbody");
+      tbody.innerHTML = "";
+      for (const limb of Object.values(limbs)) {
+        const tr = document.createElement("tr");
+        const solve = solveLimb(limb);
+        const normTheta = limb.alpha > EPS ? limb.theta / limb.alpha : 0;
+        tr.innerHTML =
+          `<td>${limb.short}</td>` +
+          `<td>${limb.theta.toFixed(1)}</td>` +
+          `<td>${normTheta.toFixed(3)}</td>` +
+          `<td>${solve.reach.toFixed(3)}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+
+    function refreshExport() {
+      const data = {};
+      for (const limb of Object.values(limbs)) {
+        data[limb.id] = {
+          endpoint: [
+            Number(limb.end.x.toFixed(4)),
+            Number(limb.end.y.toFixed(4)),
+            Number(limb.end.z.toFixed(4))
+          ],
+          pole_theta_deg: Number(limb.theta.toFixed(4)),
+          pole_theta_norm: Number((limb.theta / limb.alpha).toFixed(4)),
+          alpha_deg: Number(limb.alpha.toFixed(4))
+        };
+      }
+      ui.export.value = JSON.stringify(data, null, 2);
+    }
+
+    function setEndpointFromInputs() {
+      const limb = selectedLimb();
+      limb.end = v(
+        Number(ui.eeX.value) || 0,
+        Number(ui.eeY.value) || 0,
+        Number(ui.eeZ.value) || 0
+      );
+      refreshTable();
+      refreshExport();
+    }
+
+    function setPoleFromValue(value) {
+      const limb = selectedLimb();
+      limb.theta = clamp(Number(value) || 0, -limb.alpha, limb.alpha);
+      syncUiFromState();
+    }
+
+    function setAlphaFromValue(value) {
+      const limb = selectedLimb();
+      limb.alpha = clamp(Number(value) || 90, 5, 180);
+      limb.theta = clamp(limb.theta, -limb.alpha, limb.alpha);
+      syncUiFromState();
+    }
+
+    function resetSelected() {
+      const id = selectedId;
+      limbs[id].end = { ...defaultLimbs[id].end };
+      limbs[id].theta = defaultLimbs[id].theta;
+      limbs[id].alpha = defaultLimbs[id].alpha;
+      syncUiFromState();
+    }
+
+    function resetAll() {
+      for (const id of Object.keys(limbs)) {
+        limbs[id].end = { ...defaultLimbs[id].end };
+        limbs[id].theta = defaultLimbs[id].theta;
+        limbs[id].alpha = defaultLimbs[id].alpha;
+      }
+      syncUiFromState();
+    }
+
+    function setView(yawDeg, pitchDeg, zoom = camera.zoom) {
+      camera.yaw = yawDeg * DEG;
+      camera.pitch = pitchDeg * DEG;
+      camera.zoom = zoom;
+      syncUiFromState();
+    }
+
+    function nearestHandle(x, y) {
+      let best = null;
+      let bestD = 18 * (window.devicePixelRatio || 1);
+      for (const h of handles) {
+        const d = Math.hypot(h.x - x, h.y - y);
+        if (d < bestD) {
+          best = h;
+          bestD = d;
+        }
+      }
+      return best;
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      return {
+        x: (event.clientX - rect.left) * dpr,
+        y: (event.clientY - rect.top) * dpr
+      };
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      canvas.focus();
+      const p = canvasPoint(event);
+      const hit = nearestHandle(p.x, p.y);
+      pointer.down = true;
+      pointer.draggingHandle = hit;
+      pointer.startX = p.x;
+      pointer.startY = p.y;
+      pointer.lastX = p.x;
+      pointer.lastY = p.y;
+      if (hit) {
+        selectedId = hit.id;
+        syncUiFromState();
+      }
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!pointer.down) return;
+      const p = canvasPoint(event);
+      const dx = p.x - pointer.lastX;
+      const dy = p.y - pointer.lastY;
+      pointer.lastX = p.x;
+      pointer.lastY = p.y;
+      if (pointer.draggingHandle) {
+        const limb = limbs[pointer.draggingHandle.id];
+        limb.end = add(limb.end, screenDeltaToWorld(dx, dy, event.shiftKey));
+        ui.eeX.value = limb.end.x.toFixed(3);
+        ui.eeY.value = limb.end.y.toFixed(3);
+        ui.eeZ.value = limb.end.z.toFixed(3);
+        refreshTable();
+        refreshExport();
+      } else {
+        camera.yaw -= dx * 0.006;
+        camera.pitch = clamp(camera.pitch + dy * 0.006, -85 * DEG, 85 * DEG);
+        ui.yaw.value = camera.yaw * RAD;
+        ui.yawNum.value = (camera.yaw * RAD).toFixed(1);
+        ui.pitch.value = camera.pitch * RAD;
+        ui.pitchNum.value = (camera.pitch * RAD).toFixed(1);
+      }
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      pointer.down = false;
+      pointer.draggingHandle = null;
+      canvas.releasePointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      camera.zoom = clamp(camera.zoom * Math.exp(-event.deltaY * 0.001), 120, 520);
+      ui.zoom.value = camera.zoom;
+      ui.zoomNum.value = camera.zoom.toFixed(0);
+    }, { passive: false });
+
+    for (const id of ["eeX", "eeY", "eeZ"]) {
+      ui[id].addEventListener("input", setEndpointFromInputs);
+    }
+    ui.pole.addEventListener("input", () => setPoleFromValue(ui.pole.value));
+    ui.poleNum.addEventListener("input", () => setPoleFromValue(ui.poleNum.value));
+    ui.alpha.addEventListener("input", () => setAlphaFromValue(ui.alpha.value));
+    ui.alphaNum.addEventListener("input", () => setAlphaFromValue(ui.alphaNum.value));
+    ui.yaw.addEventListener("input", () => {
+      camera.yaw = Number(ui.yaw.value) * DEG;
+      ui.yawNum.value = Number(ui.yaw.value).toFixed(1);
+    });
+    ui.yawNum.addEventListener("input", () => {
+      camera.yaw = Number(ui.yawNum.value) * DEG;
+      ui.yaw.value = Number(ui.yawNum.value);
+    });
+    ui.pitch.addEventListener("input", () => {
+      camera.pitch = Number(ui.pitch.value) * DEG;
+      ui.pitchNum.value = Number(ui.pitch.value).toFixed(1);
+    });
+    ui.pitchNum.addEventListener("input", () => {
+      camera.pitch = Number(ui.pitchNum.value) * DEG;
+      ui.pitch.value = Number(ui.pitchNum.value);
+    });
+    ui.zoom.addEventListener("input", () => {
+      camera.zoom = Number(ui.zoom.value);
+      ui.zoomNum.value = Number(ui.zoom.value).toFixed(0);
+    });
+    ui.zoomNum.addEventListener("input", () => {
+      camera.zoom = clamp(Number(ui.zoomNum.value) || 280, 120, 520);
+      ui.zoom.value = camera.zoom;
+    });
+    for (const id of ["showNatural", "showCone", "showRest"]) {
+      ui[id].addEventListener("change", () => {});
+    }
+    ui.front.addEventListener("click", () => setView(0, 0, 290));
+    ui.side.addEventListener("click", () => setView(90, 0, 290));
+    ui.top.addEventListener("click", () => setView(0, 85, 320));
+    ui.resetCam.addEventListener("click", () => setView(-38, 18, 280));
+    ui.resetSelected.addEventListener("click", resetSelected);
+    ui.resetAll.addEventListener("click", resetAll);
+
+    window.addEventListener("resize", fitCanvas);
+    syncUiFromState();
+    render();
+  </script>
+</body>
+</html>
