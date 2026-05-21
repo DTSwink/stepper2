@@ -86,8 +86,14 @@ def clip_vertical_yaw_points(
         clip.fps,
     )
     root_delta, future_motion_bend = root_window_features(clip, prev_idx, cur_idx, future_idx, cfg, device)
-    max_per_frame, side_idx = yaw_speeds.max(dim=-1)
-    peak_i = int(torch.argmax(max_per_frame).detach().cpu())
+    planted_per_frame, side_idx, _heights = cp.planted_foot_values(
+        yaw_speeds,
+        cur_pos,
+        cur_rot,
+        tuple(clip.foot_indices),
+        tuple(clip.toe_indices),
+    )
+    peak_i = int(torch.argmax(planted_per_frame).detach().cpu())
 
     rows: list[dict[str, float | int | str]] = []
     for i in range(cur_idx.numel()):
@@ -97,7 +103,7 @@ def clip_vertical_yaw_points(
                 "frame": int(cur_idx[i].detach().cpu()),
                 "root_delta_yaw_deg": float(torch.rad2deg(root_delta[i]).detach().cpu()),
                 "future_root_motion_bend_deg": float(torch.rad2deg(future_motion_bend[i]).detach().cpu()),
-                "max_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(max_per_frame[i]).detach().cpu()),
+                "planted_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(planted_per_frame[i]).detach().cpu()),
                 "side": "L" if int(side_idx[i].detach().cpu()) == 0 else "R",
                 "left_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(yaw_speeds[i, 0]).detach().cpu()),
                 "right_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(yaw_speeds[i, 1]).detach().cpu()),
@@ -164,8 +170,14 @@ def clip_autoreg_vertical_yaw_points(
         clip.fps,
     )
     root_delta, future_motion_bend = root_window_features(clip, prev_eval_idx, eval_idx, future_idx, cfg, device)
-    max_per_frame, side_idx = yaw_speeds.max(dim=-1)
-    peak_i = int(torch.argmax(max_per_frame).detach().cpu())
+    planted_per_frame, side_idx, _heights = cp.planted_foot_values(
+        yaw_speeds,
+        pred_pos_t.index_select(0, eval_idx),
+        pred_rot_t.index_select(0, eval_idx),
+        tuple(clip.foot_indices),
+        tuple(clip.toe_indices),
+    )
+    peak_i = int(torch.argmax(planted_per_frame).detach().cpu())
 
     rows: list[dict[str, float | int | str]] = []
     for i in range(eval_idx.numel()):
@@ -175,7 +187,7 @@ def clip_autoreg_vertical_yaw_points(
                 "frame": int(eval_idx[i].detach().cpu()),
                 "root_delta_yaw_deg": float(torch.rad2deg(root_delta[i]).detach().cpu()),
                 "future_root_motion_bend_deg": float(torch.rad2deg(future_motion_bend[i]).detach().cpu()),
-                "max_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(max_per_frame[i]).detach().cpu()),
+                "planted_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(planted_per_frame[i]).detach().cpu()),
                 "side": "L" if int(side_idx[i].detach().cpu()) == 0 else "R",
                 "left_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(yaw_speeds[i, 0]).detach().cpu()),
                 "right_foot_vertical_yaw_deg_per_s": float(torch.rad2deg(yaw_speeds[i, 1]).detach().cpu()),
@@ -232,7 +244,7 @@ def write_html(output_dir: Path, peaks: list[dict[str, float | int | str]], cfg:
     if not peaks:
         raise ValueError("no peaks to plot")
     xs = [float(row["root_delta_yaw_deg"]) for row in peaks]
-    ys = [float(row["max_foot_vertical_yaw_deg_per_s"]) for row in peaks]
+    ys = [float(row["planted_foot_vertical_yaw_deg_per_s"]) for row in peaks]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = 0.0, max(ys)
     pad_x = max((max_x - min_x) * 0.08, 5.0)
@@ -279,7 +291,7 @@ def write_html(output_dir: Path, peaks: list[dict[str, float | int | str]], cfg:
         folder = str(row.get("folder", ""))
         color = "#59d6a5" if folder == "omni" else "#ff9b6a"
         x = sx(float(row["root_delta_yaw_deg"]))
-        y = sy(float(row["max_foot_vertical_yaw_deg_per_s"]))
+        y = sy(float(row["planted_foot_vertical_yaw_deg_per_s"]))
         payload = html.escape(json.dumps(row), quote=True)
         points.append(f'<circle class="pt" cx="{x:.2f}" cy="{y:.2f}" r="6.5" fill="{color}" data-row="{payload}"><title>{html.escape(name)}</title></circle>')
 
@@ -344,7 +356,7 @@ def write_html(output_dir: Path, peaks: list[dict[str, float | int | str]], cfg:
           `folder: ${{row.folder}}\\n` +
           `frame: ${{row.frame}}  side: ${{row.side}}\\n` +
           `root delta yaw: ${{row.root_delta_yaw_deg.toFixed(2)}} deg\\n` +
-          `max vertical foot yaw: ${{row.max_foot_vertical_yaw_deg_per_s.toFixed(2)}} deg/s`;
+          `planted-foot vertical yaw: ${{row.planted_foot_vertical_yaw_deg_per_s.toFixed(2)}} deg/s`;
       }});
       el.addEventListener('mouseleave', () => tip.style.display = 'none');
     }});
@@ -365,7 +377,7 @@ def write_3d_html(
 ) -> Path:
     all_rows = [row for _name, rows in series for row in rows]
     xs = [float(row["root_delta_yaw_deg"]) for row in all_rows]
-    ys = [float(row["max_foot_vertical_yaw_deg_per_s"]) for row in all_rows]
+    ys = [float(row["planted_foot_vertical_yaw_deg_per_s"]) for row in all_rows]
     zs = [float(row["future_root_motion_bend_deg"]) for row in all_rows]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = 0.0, max(ys)
@@ -527,13 +539,13 @@ def write_3d_html(
     function renderPanel(svg) {
       const seriesIndex = Number(svg.dataset.series);
       const rows = data.series[seriesIndex].rows.slice().sort((a, b) => {
-        const pa = project(a.root_delta_yaw_deg, a.max_foot_vertical_yaw_deg_per_s, a.future_root_motion_bend_deg);
-        const pb = project(b.root_delta_yaw_deg, b.max_foot_vertical_yaw_deg_per_s, b.future_root_motion_bend_deg);
+        const pa = project(a.root_delta_yaw_deg, a.planted_foot_vertical_yaw_deg_per_s, a.future_root_motion_bend_deg);
+        const pb = project(b.root_delta_yaw_deg, b.planted_foot_vertical_yaw_deg_per_s, b.future_root_motion_bend_deg);
         return pa.depth - pb.depth;
       });
       let out = axesHtml();
       rows.forEach((row, i) => {
-        const p = project(row.root_delta_yaw_deg, row.max_foot_vertical_yaw_deg_per_s, row.future_root_motion_bend_deg);
+        const p = project(row.root_delta_yaw_deg, row.planted_foot_vertical_yaw_deg_per_s, row.future_root_motion_bend_deg);
         const color = row.folder === 'omni' ? '#59d6a5' : '#ff9b6a';
         out += `<circle class="pt" cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="6.2" fill="${color}" data-index="${i}"><title>${row.clip}</title></circle>`;
       });
@@ -550,7 +562,7 @@ def write_3d_html(
             `frame: ${row.frame}  side: ${row.side}\n` +
             `root yaw delta: ${row.root_delta_yaw_deg.toFixed(2)} deg\n` +
             `future path bend: ${row.future_root_motion_bend_deg.toFixed(2)} deg\n` +
-            `max vertical foot/toe yaw: ${row.max_foot_vertical_yaw_deg_per_s.toFixed(2)} deg/s`;
+            `planted-foot vertical yaw: ${row.planted_foot_vertical_yaw_deg_per_s.toFixed(2)} deg/s`;
         });
       el.addEventListener('mouseleave', () => tip.style.display = 'none');
       });
@@ -741,8 +753,8 @@ def main() -> None:
         "checkpoint": str(checkpoint) if checkpoint else None,
         "html": str(html_path),
         "latest_html": str(latest),
-        "top_10_gt_by_vertical_yaw": sorted(gt_peaks, key=lambda x: float(x["max_foot_vertical_yaw_deg_per_s"]), reverse=True)[:10],
-        "top_10_model_by_vertical_yaw": sorted(model_peaks, key=lambda x: float(x["max_foot_vertical_yaw_deg_per_s"]), reverse=True)[:10],
+        "top_10_gt_by_vertical_yaw": sorted(gt_peaks, key=lambda x: float(x["planted_foot_vertical_yaw_deg_per_s"]), reverse=True)[:10],
+        "top_10_model_by_vertical_yaw": sorted(model_peaks, key=lambda x: float(x["planted_foot_vertical_yaw_deg_per_s"]), reverse=True)[:10],
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+import train_locomotion as tl
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,12 +83,11 @@ def main() -> None:
     except Exception as exc:
         print(f"torch probe failed: {exc}", flush=True)
 
-    run_name = os.environ.get("STEPPER_RUN_NAME", "kaggle_k111_from_best_k64")
+    run_name = tl.date_prefixed_run_name(os.environ.get("STEPPER_RUN_NAME", "kaggle_k111_from_best_k64"))
     max_train_seconds = os.environ.get("STEPPER_MAX_TRAIN_SECONDS", "0")
     batch_size = os.environ.get("STEPPER_BATCH_SIZE", "256")
     learning_rate = os.environ.get("STEPPER_LEARNING_RATE", "1e-6")
-    footslide_weight = os.environ.get("STEPPER_FOOTSLIDE_WEIGHT", "0.10")
-    footslide_threshold = os.environ.get("STEPPER_FOOTSLIDE_THRESHOLD_MPS", "0.2135299310088158")
+    slide_excess_weight = os.environ.get("STEPPER_SLIDE_EXCESS_WEIGHT", "0.10")
     max_epochs = os.environ.get("STEPPER_MAX_EPOCHS", "100000")
     initial_k = os.environ.get("STEPPER_INITIAL_ROLLOUT_K", "111")
     prior_checkpoint = os.environ.get(
@@ -153,9 +154,6 @@ def main() -> None:
         "agents",
         "--agent-sampling",
         "random",
-        "--agent-batch-clips",
-        "0",
-        "--packed-agent-rollout",
         "--agent-batches-per-epoch",
         os.environ.get("STEPPER_AGENT_BATCHES_PER_EPOCH", "1"),
         "--gradient-accumulation-batches",
@@ -194,12 +192,8 @@ def main() -> None:
         os.environ.get("STEPPER_VISUAL_REPORT_DEVICE", "cpu"),
         "--visual-report-max-frames",
         os.environ.get("STEPPER_VISUAL_REPORT_MAX_FRAMES", "180"),
-        "--simple-footslide-loss-weight",
-        footslide_weight,
-        "--simple-footslide-threshold-mps",
-        footslide_threshold,
-        "--simple-footslide-gt-margin",
-        os.environ.get("STEPPER_FOOTSLIDE_GT_MARGIN", "1.05"),
+        "--slide-excess-loss-weight",
+        slide_excess_weight,
         "--no-contact-physics-losses",
         "--no-live-viewer",
         "--no-visual-reporter",
@@ -212,10 +206,10 @@ def main() -> None:
         cmd.extend(["--periodic-folder-path", periodic_folder])
     if nonperiodic_folder.strip().lower() not in {"", "none", "null", "__empty__"}:
         cmd.extend(["--nonperiodic-folder-path", nonperiodic_folder])
-    if env_flag("STEPPER_SUPPORT_ENVELOPE", False):
-        cmd.append("--support-envelope")
+    if env_flag("STEPPER_EXCESS_ENVELOPE", False):
+        cmd.append("--excess-envelope")
     else:
-        cmd.append("--no-support-envelope")
+        cmd.append("--no-excess-envelope")
 
     if env_flag("STEPPER_FINAL_STAGE_RANDOM_ROLLOUT", True):
         cmd.append("--final-stage-random-rollout")

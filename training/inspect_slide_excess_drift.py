@@ -13,10 +13,6 @@ import train_locomotion as tl
 from inspect_foot_sliding import load_controller, rollout_autoreg, short_name
 
 
-def is_idle(clip: tl.MotionClip) -> bool:
-    return "idle" in Path(clip.path).stem.lower()
-
-
 def clip_metrics(model, clip: tl.MotionClip, cfg: tl.TrainConfig, device: torch.device, frame_count: int) -> dict[str, float | str | int]:
     pred_pos, pred_rot = rollout_autoreg(model, clip, cfg, device, frame_count)
     gt_pos, _gt_rot = tl.global_from_clip(clip, torch.arange(frame_count, device=device), cfg, device)
@@ -32,8 +28,15 @@ def clip_metrics(model, clip: tl.MotionClip, cfg: tl.TrainConfig, device: torch.
         foot_indices,
         toe_indices,
         clip.fps,
-    ).detach().cpu().numpy()
-    support = speeds.mean(axis=-1) if is_idle(clip) else speeds.min(axis=-1)
+    )
+    slide_excess_t, _planted, _heights = cp.planted_foot_values(
+        speeds,
+        pred_pos[1:],
+        pred_rot[1:],
+        foot_indices,
+        toe_indices,
+    )
+    slide_excess = slide_excess_t.detach().cpu().numpy()
 
     pred_np = pred_pos.detach().cpu().numpy()
     gt_np = gt_pos.detach().cpu().numpy()
@@ -54,24 +57,24 @@ def clip_metrics(model, clip: tl.MotionClip, cfg: tl.TrainConfig, device: torch.
         gt_lat = gt_side / (gt_side + gt_forward + 1e-8)
         lateral_excess = lat - gt_lat
     else:
-        lateral_excess = np.zeros_like(support)
+        lateral_excess = np.zeros_like(slide_excess)
 
-    window = min(15, support.shape[0])
-    first = support[:window]
-    last = support[-window:]
+    window = min(15, slide_excess.shape[0])
+    first = slide_excess[:window]
+    last = slide_excess[-window:]
     first_lat = lateral_excess[:window]
     last_lat = lateral_excess[-window:]
     return {
         "clip": short_name(clip.path),
         "frames": frame_count,
-        "support_mean": float(np.mean(support)),
-        "support_p95": float(np.percentile(support, 95)),
-        "support_max": float(np.max(support)),
-        "support_first_mean": float(np.mean(first)),
-        "support_last_mean": float(np.mean(last)),
-        "support_first_p95": float(np.percentile(first, 95)),
-        "support_last_p95": float(np.percentile(last, 95)),
-        "support_mean_drift": float(np.mean(last) - np.mean(first)),
+        "slide_excess_mean": float(np.mean(slide_excess)),
+        "slide_excess_p95": float(np.percentile(slide_excess, 95)),
+        "slide_excess_max": float(np.max(slide_excess)),
+        "slide_excess_first_mean": float(np.mean(first)),
+        "slide_excess_last_mean": float(np.mean(last)),
+        "slide_excess_first_p95": float(np.percentile(first, 95)),
+        "slide_excess_last_p95": float(np.percentile(last, 95)),
+        "slide_excess_mean_drift": float(np.mean(last) - np.mean(first)),
         "lateral_excess_mean": float(np.mean(lateral_excess)),
         "lateral_excess_first": float(np.mean(first_lat)),
         "lateral_excess_last": float(np.mean(last_lat)),
@@ -80,7 +83,7 @@ def clip_metrics(model, clip: tl.MotionClip, cfg: tl.TrainConfig, device: torch.
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chronological support-slide and lateral-drift monitor.")
+    parser = argparse.ArgumentParser(description="Chronological slide-excess and lateral-drift monitor.")
     parser.add_argument("--folder-path", required=True)
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--output-csv", default="")
@@ -114,19 +117,19 @@ def main() -> None:
             writer.writerows(rows)
         print(f"wrote {out}")
 
-    print("clip frames mean p95 first_mean last_mean drift lat_first lat_last lat_drift")
+    print("clip frames slide_mean slide_p95 first_mean last_mean drift lat_first lat_last lat_drift")
     for row in rows:
         print(
             f"{row['clip']:>5s} {int(row['frames']):4d} "
-            f"{row['support_mean']:.4f} {row['support_p95']:.4f} "
-            f"{row['support_first_mean']:.4f} {row['support_last_mean']:.4f} {row['support_mean_drift']:+.4f} "
+            f"{row['slide_excess_mean']:.4f} {row['slide_excess_p95']:.4f} "
+            f"{row['slide_excess_first_mean']:.4f} {row['slide_excess_last_mean']:.4f} {row['slide_excess_mean_drift']:+.4f} "
             f"{row['lateral_excess_first']:+.4f} {row['lateral_excess_last']:+.4f} {row['lateral_excess_drift']:+.4f}"
         )
-    mean_support = float(np.mean([float(row["support_mean"]) for row in rows]))
-    mean_p95 = float(np.mean([float(row["support_p95"]) for row in rows]))
-    mean_drift = float(np.mean([float(row["support_mean_drift"]) for row in rows]))
+    mean_slide_excess = float(np.mean([float(row["slide_excess_mean"]) for row in rows]))
+    mean_p95 = float(np.mean([float(row["slide_excess_p95"]) for row in rows]))
+    mean_drift = float(np.mean([float(row["slide_excess_mean_drift"]) for row in rows]))
     mean_lat_drift = float(np.mean([float(row["lateral_excess_drift"]) for row in rows]))
-    print(f"MEAN support_mean={mean_support:.4f} support_p95={mean_p95:.4f} support_drift={mean_drift:+.4f} lat_drift={mean_lat_drift:+.4f}")
+    print(f"MEAN slide_excess_mean={mean_slide_excess:.4f} slide_excess_p95={mean_p95:.4f} slide_excess_drift={mean_drift:+.4f} lat_drift={mean_lat_drift:+.4f}")
 
 
 if __name__ == "__main__":

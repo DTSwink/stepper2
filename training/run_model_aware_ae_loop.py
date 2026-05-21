@@ -222,6 +222,7 @@ def main() -> None:
     folder = tl.resolve_path(args.folder_path)
     device = torch.device(args.device)
     python = sys.executable
+    args.run_prefix = tl.date_prefixed_run_name(args.run_prefix)
     loop_dir = output_dir / args.run_prefix
     loop_dir.mkdir(parents=True, exist_ok=True)
 
@@ -351,8 +352,6 @@ def main() -> None:
             "agents",
             "--agent-sampling",
             "random",
-            "--agent-batch-clips",
-            "1",
             "--agent-batches-per-epoch",
             str(args.agent_batches_per_epoch),
             "--rollout-schedule",

@@ -221,7 +221,7 @@ def load_base_prior(path: Path, device: torch.device) -> tuple[tae.TransitionAut
         ckpt.get("locomotion_config", {}).get("include_transition_foot_motion", schema.get("transition_foot_motion_dim", 0) > 0)
     )
     locomotion_cfg.foot_slide_scale_mps = float(ckpt.get("locomotion_config", {}).get("foot_slide_scale_mps", 1.0))
-    locomotion_cfg.foot_yaw_scale_radps = float(ckpt.get("locomotion_config", {}).get("foot_yaw_scale_radps", 10.0))
+    locomotion_cfg.transition_yaw_scale_radps = float(ckpt.get("locomotion_config", {}).get("transition_yaw_scale_radps", 10.0))
 
     mean = ckpt["mean"].float().to(device)
     std = ckpt["std"].float().to(device)
@@ -870,7 +870,7 @@ def compare_models(
         apply_config_dict(feature_cfg_for_rollout, asdict(controller_cfg))
         feature_cfg_for_rollout.include_transition_foot_motion = bool(feature_cfg.include_transition_foot_motion)
         feature_cfg_for_rollout.foot_slide_scale_mps = float(feature_cfg.foot_slide_scale_mps)
-        feature_cfg_for_rollout.foot_yaw_scale_radps = float(feature_cfg.foot_yaw_scale_radps)
+        feature_cfg_for_rollout.transition_yaw_scale_radps = float(feature_cfg.transition_yaw_scale_radps)
         feature_cfg_for_rollout.root_lookahead_steps = int(getattr(feature_cfg, "root_lookahead_steps", 0))
         feature_cfg_for_rollout.use_torch_compile = False
         feature_cfg_for_rollout.device = str(device)

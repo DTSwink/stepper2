@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 import contact_physics as cp
-import support_envelope as se
+import excess_envelope as ee
 import train_locomotion as tl
 import transition_autoencoder as tae
 import window_transition_autoencoder as wae
@@ -55,7 +55,7 @@ def load_prior(path: Path, device: torch.device):
         for param in model.parameters():
             param.requires_grad_(False)
         return model, ckpt
-    cfg = tae.AEConfig(**ckpt["config"])
+    cfg = tae.ae_config_from_dict(ckpt["config"])
     model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
     missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
     allowed_missing = {"reconstruction_weights"}
@@ -283,7 +283,7 @@ def clip_sample_start_max(
     return max_start
 
 
-def clip_supports_any_start(clip: tl.MotionClip, cfg: tl.TrainConfig) -> bool:
+def clip_has_any_start(clip: tl.MotionClip, cfg: tl.TrainConfig) -> bool:
     return clip_any_start_max(clip, cfg) >= 1
 
 
@@ -312,62 +312,6 @@ def clip_is_idle(clip: tl.MotionClip) -> bool:
 def clip_is_turn_in_place(clip: tl.MotionClip) -> bool:
     stem = Path(clip.path).stem.lower()
     return "stand_turn" in stem and any(token in stem for token in ("045", "090", "135", "180"))
-
-
-@torch.no_grad()
-def compute_groundtruth_support_slide_threshold(
-    clips: list[tl.MotionClip],
-    cfg: tl.TrainConfig,
-    device: torch.device,
-    margin: float,
-) -> float:
-    max_support = 0.0
-    for clip in clips:
-        limit = clip.cyclic_period if clip.cyclic_animation else clip.T - 1
-        idx = torch.arange(0, limit + 1, dtype=torch.long, device=device)
-        pos, rot = tl.global_from_clip(clip, idx, cfg, device)
-        foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
-        toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
-        speeds = cp.foot_slide_speeds(
-            pos[:-1],
-            rot[:-1],
-            pos[1:],
-            rot[1:],
-            foot_indices,
-            toe_indices,
-            clip.fps,
-        )
-        support = speeds.reshape(-1) if clip_is_idle(clip) else speeds.amin(dim=-1)
-        max_support = max(max_support, float(support.max().detach().cpu()))
-    return max_support * float(margin)
-
-
-def simple_generated_footslide_loss(
-    clip: tl.MotionClip,
-    cur_pos: torch.Tensor,
-    cur_rot: torch.Tensor,
-    next_pos: torch.Tensor,
-    next_rot: torch.Tensor,
-    threshold_mps: float,
-    special_tolerance_divisor: float = 1.0,
-) -> torch.Tensor:
-    foot_indices = tuple(int(x) for x in clip.foot_indices_tensor.tolist())
-    toe_indices = tuple(int(x) for x in clip.toe_indices_tensor.tolist())
-    speeds = cp.foot_slide_speeds(
-        cur_pos,
-        cur_rot,
-        next_pos,
-        next_rot,
-        foot_indices,
-        toe_indices,
-        clip.fps,
-    )
-    support_speed = speeds.mean(dim=-1) if clip_is_idle(clip) else speeds.amin(dim=-1)
-    threshold = float(threshold_mps)
-    if clip_is_idle(clip) or clip_is_turn_in_place(clip):
-        threshold = threshold / max(1.0, float(special_tolerance_divisor))
-    return F.relu(support_speed - threshold).mean()
-
 
 class PackedClips:
     """Dense multi-clip storage for Isaac-style per-agent random rollouts."""
@@ -429,19 +373,19 @@ class PackedClips:
         self.canonical_pos = torch.cat([t["canonical_pos"] for t in tensors], dim=0)
         self.contacts = torch.cat([t["contacts"] for t in tensors], dim=0)
         self.local_offsets = torch.stack([t["local_offsets"] for t in tensors], dim=0)
-        self.support_slide_bound_mps: torch.Tensor | None = None
-        self.support_foot_yaw_bound_radps: torch.Tensor | None = None
-        self.support_envelope_metadata: dict[str, float | int | str] = {}
-        if cfg.support_envelope_enabled and (
-            cfg.simple_footslide_loss_weight > 0.0 or cfg.foot_yaw_loss_weight > 0.0
+        self.slide_bound_mps: torch.Tensor | None = None
+        self.yaw_bound_radps: torch.Tensor | None = None
+        self.excess_envelope_metadata: dict[str, float | int | str] = {}
+        if cfg.excess_envelope_enabled and (
+            cfg.slide_excess_loss_weight > 0.0 or cfg.yaw_excess_loss_weight > 0.0
         ):
-            env_cfg = se.SupportEnvelopeConfig(
-                margin=float(cfg.support_envelope_margin),
-                knn=int(cfg.support_envelope_knn),
-                cache_dir=str(cfg.support_envelope_cache_dir),
+            env_cfg = ee.ExcessEnvelopeConfig(
+                margin=float(cfg.excess_envelope_margin),
+                knn=int(cfg.excess_envelope_knn),
+                cache_dir=str(cfg.excess_envelope_cache_dir),
             )
             real_indices = [i for i in range(len(clips)) if i not in synthetic_clip_indices]
-            envelope = se.load_or_build_support_envelope(
+            envelope = ee.load_or_build_excess_envelope(
                 clips,
                 cfg,
                 device,
@@ -449,16 +393,16 @@ class PackedClips:
                 real_clip_indices=real_indices,
                 env_cfg=env_cfg,
             )
-            self.support_slide_bound_mps = envelope["slide_bound_mps"].to(device)  # type: ignore[union-attr]
-            self.support_foot_yaw_bound_radps = envelope["foot_yaw_bound_radps"].to(device)  # type: ignore[union-attr]
-            self.support_envelope_metadata = envelope["metadata"]  # type: ignore[assignment]
+            self.slide_bound_mps = envelope["slide_bound_mps"].to(device)  # type: ignore[union-attr]
+            self.yaw_bound_radps = envelope["yaw_excess_bound_radps"].to(device)  # type: ignore[union-attr]
+            self.excess_envelope_metadata = envelope["metadata"]  # type: ignore[assignment]
             print(
-                "support envelope "
-                f"cache_hit={self.support_envelope_metadata.get('cache_hit')} "
-                f"real_transitions={self.support_envelope_metadata.get('source_real_transitions')} "
-                f"targets={self.support_envelope_metadata.get('target_transitions')} "
-                f"max_real_slide={self.support_envelope_metadata.get('max_real_slide_mps'):.6g} "
-                f"max_real_foot_yaw={self.support_envelope_metadata.get('max_real_foot_yaw_radps'):.6g}",
+                "excess envelope "
+                f"cache_hit={self.excess_envelope_metadata.get('cache_hit')} "
+                f"real_transitions={self.excess_envelope_metadata.get('source_real_transitions')} "
+                f"targets={self.excess_envelope_metadata.get('target_transitions')} "
+                f"max_real_slide={self.excess_envelope_metadata.get('max_real_slide_mps'):.6g} "
+                f"max_real_yaw_excess={self.excess_envelope_metadata.get('max_real_yaw_excess_radps'):.6g}",
                 flush=True,
             )
 
@@ -527,14 +471,14 @@ class PackedClips:
         if require_full:
             cyclic = self.cyclic.index_select(0, indices)
             lengths = self.lengths.index_select(0, indices)
-            full_support = torch.logical_or(
+            full_ok = torch.logical_or(
                 cyclic,
                 lengths - transition_feature_horizon(self.cfg) - max(1, int(requested_k)) >= 1,
             )
-            if not bool(full_support.any()):
-                raise ValueError(f"no clips in this pool support a full K={requested_k} rollout")
-            indices = indices[full_support]
-            probs = probs[full_support]
+            if not bool(full_ok.any()):
+                raise ValueError(f"no clips in this pool cover a full K={requested_k} rollout")
+            indices = indices[full_ok]
+            probs = probs[full_ok]
             probs = probs / probs.sum().clamp_min(1e-12)
         choices = torch.multinomial(probs, int(count), replacement=True)
         clip_ids = indices.index_select(0, choices)
@@ -818,7 +762,7 @@ def packed_transition_feature_from_next_pose(
             packed.fps,
         )
         slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
-        yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+        yaw_scale = max(float(getattr(cfg, "transition_yaw_scale_radps", 10.0)), 1e-6)
         parts.append(torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1))
     root_lookahead_steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
     if root_lookahead_steps > 0:
@@ -918,30 +862,7 @@ def packed_transform_transition_feature_to_anchor(
     return out
 
 
-def packed_generated_footslide_loss(
-    packed: PackedClips,
-    cur_pos: torch.Tensor,
-    cur_rot: torch.Tensor,
-    next_pos: torch.Tensor,
-    next_rot: torch.Tensor,
-    threshold_mps: float,
-    clip_ids: torch.Tensor,
-) -> torch.Tensor:
-    speeds = cp.foot_slide_speeds(
-        cur_pos,
-        cur_rot,
-        next_pos,
-        next_rot,
-        packed.foot_indices,
-        packed.toe_indices,
-        packed.fps,
-    )
-    idle_mask = packed.idle.index_select(0, clip_ids.to(packed.device).long())
-    support_speed = torch.where(idle_mask, speeds.mean(dim=-1), speeds.amin(dim=-1))
-    return F.relu(support_speed - float(threshold_mps)).mean()
-
-
-def packed_support_footslide_speeds(
+def packed_slide_speed(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -958,11 +879,17 @@ def packed_support_footslide_speeds(
         packed.toe_indices,
         packed.fps,
     )
-    idle_mask = packed.idle.index_select(0, clip_ids.to(packed.device).long())
-    return torch.where(idle_mask, speeds.mean(dim=-1), speeds.amin(dim=-1))
+    selected, _planted, _heights = cp.planted_foot_values(
+        speeds,
+        cur_pos,
+        cur_rot,
+        packed.foot_indices,
+        packed.toe_indices,
+    )
+    return selected
 
 
-def packed_envelope_footslide_loss(
+def packed_slide_excess_loss(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -970,10 +897,9 @@ def packed_envelope_footslide_loss(
     next_rot: torch.Tensor,
     clip_ids: torch.Tensor,
     cur_idx: torch.Tensor,
-    fallback_threshold_mps: float,
     special_tolerance_divisor: float = 1.0,
 ) -> torch.Tensor:
-    return packed_envelope_footslide_loss_rows(
+    return packed_slide_excess_loss_rows(
         packed,
         cur_pos,
         cur_rot,
@@ -981,12 +907,11 @@ def packed_envelope_footslide_loss(
         next_rot,
         clip_ids,
         cur_idx,
-        fallback_threshold_mps,
         special_tolerance_divisor,
     ).mean()
 
 
-def packed_envelope_footslide_loss_rows(
+def packed_slide_excess_loss_rows(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -994,10 +919,9 @@ def packed_envelope_footslide_loss_rows(
     next_rot: torch.Tensor,
     clip_ids: torch.Tensor,
     cur_idx: torch.Tensor,
-    fallback_threshold_mps: float,
     special_tolerance_divisor: float = 1.0,
 ) -> torch.Tensor:
-    support_speed = packed_support_footslide_speeds(
+    slide_speed = packed_slide_speed(
         packed,
         cur_pos,
         cur_rot,
@@ -1005,22 +929,18 @@ def packed_envelope_footslide_loss_rows(
         next_rot,
         clip_ids,
     )
-    if packed.support_slide_bound_mps is not None:
-        bounds = packed.support_slide_bound_mps.index_select(0, packed.frame_index(clip_ids, cur_idx))
-    else:
-        bounds = torch.full_like(support_speed, float(fallback_threshold_mps))
+    if packed.slide_bound_mps is None:
+        raise RuntimeError("slide-excess loss requires packed slide_bound_mps")
+    bounds = packed.slide_bound_mps.index_select(0, packed.frame_index(clip_ids, cur_idx))
     divisor = max(1.0, float(special_tolerance_divisor))
     if divisor > 1.0:
         rows = clip_ids.to(packed.device).long()
-        special = torch.logical_or(
-            packed.idle.index_select(0, rows),
-            packed.turn_in_place.index_select(0, rows),
-        )
+        special = packed.turn_in_place.index_select(0, rows)
         bounds = torch.where(special, bounds / divisor, bounds)
-    return F.relu(support_speed - bounds)
+    return F.relu(slide_speed - bounds)
 
 
-def packed_vertical_foot_yaw_loss(
+def packed_vertical_yaw_excess_loss(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -1030,7 +950,7 @@ def packed_vertical_foot_yaw_loss(
     cur_idx: torch.Tensor,
     scale_radps: float,
 ) -> torch.Tensor:
-    return packed_vertical_foot_yaw_loss_rows(
+    return packed_vertical_yaw_excess_loss_rows(
         packed,
         cur_pos,
         cur_rot,
@@ -1042,7 +962,7 @@ def packed_vertical_foot_yaw_loss(
     ).mean()
 
 
-def packed_vertical_foot_yaw_loss_rows(
+def packed_vertical_yaw_excess_loss_rows(
     packed: PackedClips,
     cur_pos: torch.Tensor,
     cur_rot: torch.Tensor,
@@ -1060,24 +980,31 @@ def packed_vertical_foot_yaw_loss_rows(
         packed.foot_indices,
         packed.toe_indices,
         packed.fps,
-    ).amax(dim=-1)
-    if packed.support_foot_yaw_bound_radps is None:
-        bounds = torch.zeros_like(speeds)
+    )
+    selected, _planted, _heights = cp.planted_foot_values(
+        speeds,
+        cur_pos,
+        cur_rot,
+        packed.foot_indices,
+        packed.toe_indices,
+    )
+    if packed.yaw_bound_radps is None:
+        bounds = torch.zeros_like(selected)
     else:
-        bounds = packed.support_foot_yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
+        bounds = packed.yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
     scale = max(float(scale_radps), 1e-6)
-    return F.relu(speeds - bounds) / scale
+    return F.relu(selected - bounds) / scale
 
 
 @torch.no_grad()
-def estimate_forward_foot_yaw_scale(
+def estimate_forward_yaw_excess_scale(
     model: torch.nn.Module,
     packed: PackedClips,
     cfg: tl.TrainConfig,
     device: torch.device,
 ) -> float:
     """Scale yaw-excess so the current forward-walk checkpoint has max loss 1."""
-    if packed.support_foot_yaw_bound_radps is None:
+    if packed.yaw_bound_radps is None:
         return 1.0
     candidates = []
     for ci, clip in enumerate(packed.clips):
@@ -1123,8 +1050,15 @@ def estimate_forward_foot_yaw_scale(
             packed.foot_indices,
             packed.toe_indices,
             packed.fps,
-        ).amax(dim=-1)
-        bounds = packed.support_foot_yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
+        )
+        speeds, _planted, _heights = cp.planted_foot_values(
+            speeds,
+            cur_global_pos,
+            cur_global_rot,
+            packed.foot_indices,
+            packed.toe_indices,
+        )
+        bounds = packed.yaw_bound_radps.index_select(0, packed.frame_index(clip_ids, cur_idx))
         max_excess = torch.maximum(max_excess, F.relu(speeds - bounds).amax())
         next_pose = {
             "pelvis_pos": pred_pose["pelvis_pos"],
@@ -1155,7 +1089,7 @@ def run_batch_ae_truncated(
     reset_sampler=None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if any(prior_info.get("kind") == "window" for prior_info in priors):
-        raise NotImplementedError("Window AE priors currently require --packed-agent-rollout.")
+        raise NotImplementedError("Window AE priors currently require the packed random-agent rollout path.")
     clip_indices, starts = batch[0], batch[1]
     init_clip_indices = batch[2] if len(batch) >= 4 else None
     init_starts = batch[3] if len(batch) >= 4 else None
@@ -1168,7 +1102,7 @@ def run_batch_ae_truncated(
     joint_rmses: list[torch.Tensor] = []
     ee_rmses: list[torch.Tensor] = []
     output_mses: list[torch.Tensor] = []
-    footslide_losses: list[torch.Tensor] = []
+    slide_excess_losses: list[torch.Tensor] = []
     active_step_counts: list[torch.Tensor] = []
 
     def select_pose_rows(pose: dict[str, torch.Tensor], mask: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -1340,18 +1274,11 @@ def run_batch_ae_truncated(
                 else torch.zeros((), device=device)
             )
             step_loss = cfg.ae_loss_weight * score
-            simple_slide_loss = torch.zeros((), device=device)
-            if cfg.simple_footslide_loss_weight > 0.0:
-                simple_slide_loss = simple_generated_footslide_loss(
-                    clip,
-                    cur_global_pos[active],
-                    cur_global_rot[active],
-                    pred_global_pos[active],
-                    pred_global_rot[active],
-                    cfg.simple_footslide_threshold_mps,
-                    cfg.turn_idle_footslide_tolerance_divisor,
+            if cfg.slide_excess_loss_weight > 0.0:
+                raise RuntimeError(
+                    "excess-envelope slide-excess loss requires packed random-agent rollout; "
+                    "the old scalar fallback has been removed"
                 )
-                step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
             term_mask = torch.zeros(cur_idx.shape[0], dtype=torch.bool, device=device)
             if cfg.enable_contact_physics_losses:
                 target_pose = tl.get_pose_from_clip(clip, target_idx[active], device)
@@ -1380,8 +1307,6 @@ def run_batch_ae_truncated(
                 step_loss = step_loss + physics_loss
             group_loss = group_loss + step_loss / rollout_k
             scores.append(score.detach())
-            if cfg.simple_footslide_loss_weight > 0.0:
-                footslide_losses.append(simple_slide_loss.detach())
             motion_sizes.append(
                 (next_pose["canon_pos"][active].detach() - cur_pose["canon_pos"][active].detach())
                 .square()
@@ -1466,7 +1391,7 @@ def run_batch_ae_truncated(
         "joint_rmse": mean_metric(joint_rmses),
         "ee_rmse": mean_metric(ee_rmses),
         "output_mse": mean_metric(output_mses),
-        "simple_footslide": mean_metric(footslide_losses),
+        "slide_excess": mean_metric(slide_excess_losses),
         "active_fraction": (
             float(torch.stack(active_step_counts).sum().item()) / max(1.0, float(rollout_k * len(clip_indices)))
             if active_step_counts
@@ -1488,7 +1413,7 @@ def run_batch_ae_resetting(
     compatibility_score_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if any(prior_info.get("kind") == "window" for prior_info in priors):
-        raise NotImplementedError("Window AE priors currently require --packed-agent-rollout.")
+        raise NotImplementedError("Window AE priors currently require the packed random-agent rollout path.")
     clip_indices, starts = batch[0].long().cpu(), batch[1].long().cpu()
     init_clip_indices = batch[2].long().cpu() if len(batch) >= 4 else None
     init_starts = batch[3].long().cpu() if len(batch) >= 4 else None
@@ -1508,8 +1433,8 @@ def run_batch_ae_resetting(
     ee_counts: list[int] = []
     output_values: list[torch.Tensor] = []
     output_counts: list[int] = []
-    footslide_values: list[torch.Tensor] = []
-    footslide_counts: list[int] = []
+    slide_excess_values: list[torch.Tensor] = []
+    slide_excess_counts: list[int] = []
 
     def select_pose_rows(pose: dict[str, torch.Tensor], rows_dev: torch.Tensor) -> dict[str, torch.Tensor]:
         return {key: value.index_select(0, rows_dev) for key, value in pose.items()}
@@ -1644,24 +1569,11 @@ def run_batch_ae_resetting(
             ]
             score = torch.stack(prior_scores).mean()
             step_loss = cfg.ae_loss_weight * score
-            simple_slide_loss = torch.zeros((), device=device)
-            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, local_cur_idx, cfg, device)
-            cur_global_pos, cur_global_rot, _cur_canon = tl.fk_from_pose(
-                clip, cur_root_pos, cur_root_rot, local_cur_pose, device
-            )
-            if cfg.simple_footslide_loss_weight > 0.0:
-                simple_slide_loss = simple_generated_footslide_loss(
-                    clip,
-                    cur_global_pos,
-                    cur_global_rot,
-                    pred_global_pos,
-                    pred_global_rot,
-                    cfg.simple_footslide_threshold_mps,
-                    cfg.turn_idle_footslide_tolerance_divisor,
+            if cfg.slide_excess_loss_weight > 0.0:
+                raise RuntimeError(
+                    "excess-envelope slide-excess loss requires packed random-agent rollout; "
+                    "the old scalar fallback has been removed"
                 )
-                step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
-                footslide_values.append(simple_slide_loss.detach() * n_rows)
-                footslide_counts.append(n_rows)
 
             if cfg.enable_contact_physics_losses:
                 target_pose = tl.get_pose_from_clip(clip, local_target_idx, device)
@@ -1746,7 +1658,7 @@ def run_batch_ae_resetting(
         "joint_rmse": weighted_metric(joint_values, joint_counts),
         "ee_rmse": weighted_metric(ee_values, ee_counts),
         "output_mse": weighted_metric(output_values, output_counts),
-        "simple_footslide": weighted_metric(footslide_values, footslide_counts),
+        "slide_excess": weighted_metric(slide_excess_values, slide_excess_counts),
         "active_fraction": 1.0,
     }
 
@@ -1791,8 +1703,8 @@ def run_batch_ae_packed(
     joint_values: list[torch.Tensor] = []
     ee_values: list[torch.Tensor] = []
     output_values: list[torch.Tensor] = []
-    footslide_values: list[torch.Tensor] = []
-    foot_yaw_values: list[torch.Tensor] = []
+    slide_excess_values: list[torch.Tensor] = []
+    yaw_excess_values: list[torch.Tensor] = []
     motion_floor_values: list[torch.Tensor] = []
     prior_raw_values: dict[str, list[torch.Tensor]] = {
         str(prior_info.get("label", f"prior_{i}")): []
@@ -1998,8 +1910,8 @@ def run_batch_ae_packed(
                 prior_raw_values.setdefault(label, []).append(raw_score.detach())
                 prior_weighted_values.setdefault(label, []).append((raw_score * weight).detach())
         step_loss = torch.zeros((), device=device)
-        simple_slide_loss = torch.zeros((), device=device)
-        needs_current_global = cfg.simple_footslide_loss_weight > 0.0 or cfg.foot_yaw_loss_weight > 0.0
+        slide_excess_loss = torch.zeros((), device=device)
+        needs_current_global = cfg.slide_excess_loss_weight > 0.0 or cfg.yaw_excess_loss_weight > 0.0
         cur_global_pos: torch.Tensor | None = None
         cur_global_rot: torch.Tensor | None = None
         if needs_current_global:
@@ -2010,9 +1922,9 @@ def run_batch_ae_packed(
                 cur_root_rot,
                 cur_pose,
             )
-        if cfg.simple_footslide_loss_weight > 0.0:
+        if cfg.slide_excess_loss_weight > 0.0:
             assert cur_global_pos is not None and cur_global_rot is not None
-            simple_slide_rows = packed_envelope_footslide_loss_rows(
+            slide_excess_rows = packed_slide_excess_loss_rows(
                 packed,
                 cur_global_pos,
                 cur_global_rot,
@@ -2020,18 +1932,17 @@ def run_batch_ae_packed(
                 pred_global_rot,
                 clip_ids,
                 cur_idx,
-                cfg.simple_footslide_threshold_mps,
-                cfg.turn_idle_footslide_tolerance_divisor,
+                cfg.turn_slide_bound_divisor,
             )
-            simple_slide_loss = simple_slide_rows.mean()
-            step_loss = step_loss + cfg.simple_footslide_loss_weight * simple_slide_loss
+            slide_excess_loss = slide_excess_rows.mean()
+            step_loss = step_loss + cfg.slide_excess_loss_weight * slide_excess_loss
             row_loss_accum = row_loss_accum + (
-                cfg.simple_footslide_loss_weight * simple_slide_rows / max(1, int(rollout_k))
+                cfg.slide_excess_loss_weight * slide_excess_rows / max(1, int(rollout_k))
             ).detach()
-        foot_yaw_loss = torch.zeros((), device=device)
-        if cfg.foot_yaw_loss_weight > 0.0:
+        yaw_excess_loss = torch.zeros((), device=device)
+        if cfg.yaw_excess_loss_weight > 0.0:
             assert cur_global_pos is not None and cur_global_rot is not None
-            foot_yaw_rows = packed_vertical_foot_yaw_loss_rows(
+            yaw_excess_rows = packed_vertical_yaw_excess_loss_rows(
                 packed,
                 cur_global_pos,
                 cur_global_rot,
@@ -2039,12 +1950,12 @@ def run_batch_ae_packed(
                 pred_global_rot,
                 clip_ids,
                 cur_idx,
-                cfg.foot_yaw_loss_scale_radps,
+                cfg.yaw_excess_scale_radps,
             )
-            foot_yaw_loss = foot_yaw_rows.mean()
-            step_loss = step_loss + cfg.foot_yaw_loss_weight * foot_yaw_loss
+            yaw_excess_loss = yaw_excess_rows.mean()
+            step_loss = step_loss + cfg.yaw_excess_loss_weight * yaw_excess_loss
             row_loss_accum = row_loss_accum + (
-                cfg.foot_yaw_loss_weight * foot_yaw_rows / max(1, int(rollout_k))
+                cfg.yaw_excess_loss_weight * yaw_excess_rows / max(1, int(rollout_k))
             ).detach()
         motion_floor_loss = torch.zeros((), device=device)
         if cfg.motion_floor_loss_weight > 0.0:
@@ -2085,8 +1996,8 @@ def run_batch_ae_packed(
         total_loss = total_loss + step_loss / max(1, int(rollout_k))
         if prior_scores:
             score_values.append(score.detach())
-        footslide_values.append(simple_slide_loss.detach())
-        foot_yaw_values.append(foot_yaw_loss.detach())
+        slide_excess_values.append(slide_excess_loss.detach())
+        yaw_excess_values.append(yaw_excess_loss.detach())
         motion_floor_values.append(motion_floor_loss.detach())
         motion_values.append(
             (next_pose["canon_pos"].detach() - cur_pose["canon_pos"].detach())
@@ -2143,8 +2054,8 @@ def run_batch_ae_packed(
         "joint_rmse": mean_metric(joint_values),
         "ee_rmse": mean_metric(ee_values),
         "output_mse": mean_metric(output_values),
-        "simple_footslide": mean_metric(footslide_values),
-        "foot_yaw": mean_metric(foot_yaw_values),
+        "slide_excess": mean_metric(slide_excess_values),
+        "yaw_excess": mean_metric(yaw_excess_values),
         "motion_floor": mean_metric(motion_floor_values),
         "active_fraction": 1.0,
         "__clip_ids": initial_clip_ids.detach().cpu(),
@@ -2244,29 +2155,33 @@ def train(args: argparse.Namespace) -> None:
     cfg.ae_huber_delta = args.ae_huber_delta
     cfg.ae_row_top_fraction = min(1.0, max(0.0, float(args.ae_row_top_fraction)))
     cfg.ae_row_top_weight = max(0.0, float(args.ae_row_top_weight))
-    cfg.simple_footslide_loss_weight = args.simple_footslide_loss_weight
-    cfg.simple_footslide_threshold_mps = args.simple_footslide_threshold_mps
-    cfg.simple_footslide_gt_margin = args.simple_footslide_gt_margin
-    cfg.turn_idle_footslide_tolerance_divisor = max(1.0, float(args.turn_idle_footslide_tolerance_divisor))
-    cfg.support_envelope_enabled = bool(args.support_envelope)
-    cfg.support_envelope_knn = max(1, int(args.support_envelope_knn))
-    cfg.support_envelope_margin = float(args.support_envelope_margin)
-    cfg.support_envelope_cache_dir = str(args.support_envelope_cache_dir)
-    cfg.foot_yaw_loss_weight = float(args.foot_yaw_loss_weight)
-    cfg.foot_yaw_loss_scale_radps = max(0.0, float(args.foot_yaw_loss_scale_radps))
-    cfg.foot_yaw_loss_scale_checkpoint = str(args.foot_yaw_loss_scale_checkpoint or "")
+    cfg.slide_excess_loss_weight = args.slide_excess_loss_weight
+    cfg.turn_slide_bound_divisor = max(1.0, float(args.turn_slide_bound_divisor))
+    cfg.excess_envelope_enabled = bool(args.excess_envelope)
+    cfg.excess_envelope_knn = max(1, int(args.excess_envelope_knn))
+    cfg.excess_envelope_margin = float(args.excess_envelope_margin)
+    cfg.excess_envelope_cache_dir = str(args.excess_envelope_cache_dir)
+    cfg.yaw_excess_loss_weight = float(args.yaw_excess_loss_weight)
+    cfg.yaw_excess_scale_radps = max(0.0, float(args.yaw_excess_scale_radps))
+    cfg.yaw_excess_scale_checkpoint = str(args.yaw_excess_scale_checkpoint or "")
     cfg.motion_floor_loss_weight = max(0.0, float(args.motion_floor_loss_weight))
     cfg.motion_floor_margin = max(0.0, float(args.motion_floor_margin))
     cfg.timed_checkpoint_interval_minutes = max(0.0, float(args.timed_checkpoint_interval_minutes))
     if cfg.init_pose_sampling != "same_clip" and cfg.training_loop != "agents":
         raise ValueError("--init-pose-sampling random_dataset currently requires --training-loop agents")
     will_use_packed_rollout = (
-        args.packed_agent_rollout
-        and cfg.training_loop == "agents"
+        cfg.training_loop == "agents"
         and cfg.agent_sampling == "random"
-        and args.agent_batch_clips != 1
         and not cfg.enable_contact_physics_losses
     )
+    if cfg.slide_excess_loss_weight > 0.0:
+        if not cfg.excess_envelope_enabled:
+            raise ValueError("--slide-excess-loss-weight requires --excess-envelope")
+        if not will_use_packed_rollout:
+            raise ValueError(
+                "--slide-excess-loss-weight requires packed random-agent rollout; "
+                "use --training-loop agents --agent-sampling random and --no-contact-physics-losses"
+            )
     tl.set_seed(cfg.seed)
     device = torch.device(cfg.device)
     tl.apply_cuda_performance_settings(cfg, device)
@@ -2324,23 +2239,6 @@ def train(args: argparse.Namespace) -> None:
                 f"transition feature horizon uses root_lookahead_steps={cfg.root_lookahead_steps} from AE prior",
                 flush=True,
             )
-        if (
-            cfg.simple_footslide_loss_weight > 0.0
-            and cfg.simple_footslide_threshold_mps <= 0.0
-            and not (cfg.support_envelope_enabled and will_use_packed_rollout)
-        ):
-            cfg.simple_footslide_threshold_mps = compute_groundtruth_support_slide_threshold(
-                clips[:real_clip_count],
-                cfg,
-                device,
-                cfg.simple_footslide_gt_margin,
-            )
-            print(
-                f"auto simple_footslide_threshold_mps={cfg.simple_footslide_threshold_mps:.6g} "
-                f"(margin={cfg.simple_footslide_gt_margin:.3f})",
-                flush=True,
-            )
-
     with profiler.section("setup/model_optimizer_compile"):
         input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
         model = tl.MLPController(input_dim, output_dim, cfg).to(device)
@@ -2397,17 +2295,15 @@ def train(args: argparse.Namespace) -> None:
         "loss_type": "pure_transition_ae_prior",
         "ae_score_loss": args.ae_score_loss,
         "ae_huber_delta": args.ae_huber_delta,
-        "simple_footslide_loss_weight": cfg.simple_footslide_loss_weight,
-        "simple_footslide_threshold_mps": cfg.simple_footslide_threshold_mps,
-        "simple_footslide_gt_margin": cfg.simple_footslide_gt_margin,
-        "turn_idle_footslide_tolerance_divisor": cfg.turn_idle_footslide_tolerance_divisor,
-        "support_envelope_enabled": cfg.support_envelope_enabled,
-        "support_envelope_knn": cfg.support_envelope_knn,
-        "support_envelope_margin": cfg.support_envelope_margin,
-        "support_envelope_cache_dir": cfg.support_envelope_cache_dir,
-        "foot_yaw_loss_weight": cfg.foot_yaw_loss_weight,
-        "foot_yaw_loss_scale_radps": cfg.foot_yaw_loss_scale_radps,
-        "foot_yaw_loss_scale_checkpoint": cfg.foot_yaw_loss_scale_checkpoint,
+        "slide_excess_loss_weight": cfg.slide_excess_loss_weight,
+        "turn_slide_bound_divisor": cfg.turn_slide_bound_divisor,
+        "excess_envelope_enabled": cfg.excess_envelope_enabled,
+        "excess_envelope_knn": cfg.excess_envelope_knn,
+        "excess_envelope_margin": cfg.excess_envelope_margin,
+        "excess_envelope_cache_dir": cfg.excess_envelope_cache_dir,
+        "yaw_excess_loss_weight": cfg.yaw_excess_loss_weight,
+        "yaw_excess_scale_radps": cfg.yaw_excess_scale_radps,
+        "yaw_excess_scale_checkpoint": cfg.yaw_excess_scale_checkpoint,
         "motion_floor_loss_weight": cfg.motion_floor_loss_weight,
         "motion_floor_margin": cfg.motion_floor_margin,
         "init_pose_sampling": cfg.init_pose_sampling,
@@ -2429,9 +2325,7 @@ def train(args: argparse.Namespace) -> None:
             if cfg.reset_exhausted_agents
             else "weighted by inverse expected active rollout steps to reduce truncation imbalance"
         ),
-        "packed_agent_rollout": bool(
-            will_use_packed_rollout
-        ),
+        "rollout_tensor_path": "packed_mixed_per_row" if will_use_packed_rollout else "legacy_unpacked",
         "final_stage_random_rollout": bool(args.final_stage_random_rollout),
         "final_stage_random_rollout_choices": list(schedule),
         "mixed_rollout_cohorts": bool(args.mixed_rollout_cohorts),
@@ -2468,26 +2362,25 @@ def train(args: argparse.Namespace) -> None:
     ):
         with profiler.section("setup/pack_clips"):
             packed = PackedClips(clips, cfg, device, synthetic_clip_indices=synthetic_clip_indices)
-            if packed.support_envelope_metadata:
-                metadata["support_envelope"] = dict(packed.support_envelope_metadata)
-            if cfg.foot_yaw_loss_weight > 0.0 and cfg.foot_yaw_loss_scale_radps <= 0.0:
-                scale = estimate_forward_foot_yaw_scale(model, packed, cfg, device)
-                cfg.foot_yaw_loss_scale_radps = scale
-                metadata["foot_yaw_loss_scale_radps"] = float(scale)
-                metadata["foot_yaw_loss_auto_scale_radps"] = float(scale)
+            if packed.excess_envelope_metadata:
+                metadata["excess_envelope"] = dict(packed.excess_envelope_metadata)
+            if cfg.yaw_excess_loss_weight > 0.0 and cfg.yaw_excess_scale_radps <= 0.0:
+                scale = estimate_forward_yaw_excess_scale(model, packed, cfg, device)
+                cfg.yaw_excess_scale_radps = scale
+                metadata["yaw_excess_scale_radps"] = float(scale)
+                metadata["yaw_excess_auto_scale_radps"] = float(scale)
                 print(
-                    f"auto foot_yaw_loss_scale_radps={scale:.6g} "
+                    f"auto yaw_excess_scale_radps={scale:.6g} "
                     "(max forward-walk autoreg excess on the current checkpoint)",
                     flush=True,
                 )
     if cfg.synthetic_agent_fraction > 0.0 and packed is None:
         raise ValueError(
             "--synthetic-agent-fraction currently requires packed random agents: "
-            "--training-loop agents --agent-sampling random --agent-batch-clips 0 --packed-agent-rollout "
-            "and --no-contact-physics-losses"
+            "--training-loop agents --agent-sampling random and --no-contact-physics-losses"
         )
-    if cfg.foot_yaw_loss_weight > 0.0 and packed is None:
-        raise ValueError("--foot-yaw-loss-weight currently requires the packed random-agent rollout path")
+    if cfg.yaw_excess_loss_weight > 0.0 and packed is None:
+        raise ValueError("--yaw-excess-loss-weight currently requires the packed random-agent rollout path")
     agent_rng = random.Random(cfg.seed + 4817)
     agent_coverage_order: list[tuple[int, int]] = []
     agent_coverage_cursor = 0
@@ -2512,13 +2405,13 @@ def train(args: argparse.Namespace) -> None:
 
     def refresh_stage_sampling(max_rollout: int) -> None:
         nonlocal stage_clip_indices, stage_clip_weights, synthetic_stage_clip_indices, synthetic_stage_clip_weights
-        supported_indices = [ci for ci, clip in enumerate(clips) if clip_supports_any_start(clip, cfg)]
-        stage_clip_indices = [ci for ci in supported_indices if ci not in synthetic_clip_indices]
-        synthetic_stage_clip_indices = [ci for ci in supported_indices if ci in synthetic_clip_indices]
+        eligible_indices = [ci for ci, clip in enumerate(clips) if clip_has_any_start(clip, cfg)]
+        stage_clip_indices = [ci for ci in eligible_indices if ci not in synthetic_clip_indices]
+        synthetic_stage_clip_indices = [ci for ci in eligible_indices if ci in synthetic_clip_indices]
         if not stage_clip_indices:
-            raise ValueError("No clips support one-step training")
+            raise ValueError("No clips cover one-step training")
         if cfg.synthetic_agent_fraction > 0.0 and not synthetic_stage_clip_indices:
-            raise ValueError("Synthetic agent fraction requested, but no synthetic clips support one-step training")
+            raise ValueError("Synthetic agent fraction requested, but no synthetic clips cover one-step training")
         periodic_indices = [ci for ci in stage_clip_indices if clips[ci].cyclic_animation]
         nonperiodic_indices = [ci for ci in stage_clip_indices if not clips[ci].cyclic_animation]
         group_counts = {
@@ -2788,7 +2681,7 @@ def train(args: argparse.Namespace) -> None:
         return ci, agent_rng.randint(1, max_start)
 
     def random_initial_pose_start() -> tuple[int, int]:
-        ci = agent_rng.choice(real_clip_indices)
+        ci = agent_rng.randrange(len(clips))
         max_start = max(1, clips[ci].cyclic_period - 1 if clips[ci].cyclic_animation else clips[ci].T - 1)
         if cfg.agent_fixed_start_frame > 0:
             return ci, min(cfg.agent_fixed_start_frame, max_start)
@@ -2874,14 +2767,9 @@ def train(args: argparse.Namespace) -> None:
         starts: list[int] = []
         init_clip_ids: list[int] = []
         init_starts: list[int] = []
-        fixed_clip = None
-        if args.agent_batch_clips == 1 and cfg.agent_sampling == "random" and len(clips) > 1:
-            fixed_clip = agent_rng.choices(stage_clip_indices, weights=stage_clip_weights, k=1)[0]
-
         if (
             packed is not None
             and cfg.agent_sampling == "random"
-            and args.agent_batch_clips != 1
             and (cfg.synthetic_agent_fraction > 0.0 or cohort_lengths is not None)
         ):
             lengths_dev = (
@@ -2958,7 +2846,7 @@ def train(args: argparse.Namespace) -> None:
                     max_start = clip_sample_start_max(clips[ci], cfg, max_rollout, cfg.agent_min_cohort_steps)
                     start = min(cfg.agent_fixed_start_frame, max_start)
             else:
-                ci, start = random_agent_start(max_rollout, fixed_clip)
+                ci, start = random_agent_start(max_rollout)
             clip_ids.append(ci)
             starts.append(start)
             if cfg.init_pose_sampling == "random_dataset":
@@ -3083,8 +2971,8 @@ def train(args: argparse.Namespace) -> None:
         train_total = float(np.mean([p["total"] for p in parts]))
         train_score = float(np.mean([p["ae_score"] for p in parts]))
         motion_rms = float(np.mean([p["canon_step_rms"] for p in parts]))
-        footslide_loss = float(np.mean([p["simple_footslide"] for p in parts]))
-        foot_yaw_loss = float(np.mean([p.get("foot_yaw", 0.0) for p in parts]))
+        slide_excess_loss = float(np.mean([p["slide_excess"] for p in parts]))
+        yaw_excess_loss = float(np.mean([p.get("yaw_excess", 0.0) for p in parts]))
         motion_floor_loss = float(np.mean([p.get("motion_floor", 0.0) for p in parts]))
         ae_raw_by_prior = {
             key.removeprefix("ae_raw/"): float(np.mean([p.get(key, 0.0) for p in parts]))
@@ -3111,8 +2999,8 @@ def train(args: argparse.Namespace) -> None:
             "output_mse": output_mse,
         }[args.best_metric]
         weighted_ae_score = cfg.ae_loss_weight * train_score
-        weighted_footslide = cfg.simple_footslide_loss_weight * footslide_loss
-        weighted_foot_yaw = cfg.foot_yaw_loss_weight * foot_yaw_loss
+        weighted_slide_excess = cfg.slide_excess_loss_weight * slide_excess_loss
+        weighted_yaw_excess = cfg.yaw_excess_loss_weight * yaw_excess_loss
         weighted_motion_floor = cfg.motion_floor_loss_weight * motion_floor_loss
         writer.add_scalar("loss/train_total", train_total, epoch)
         writer.add_scalar("loss/ae_score", weighted_ae_score, epoch)
@@ -3122,22 +3010,22 @@ def train(args: argparse.Namespace) -> None:
             writer.add_scalar(f"loss/ae_weighted/{label}", cfg.ae_loss_weight * value, epoch)
         for label, value in ae_raw_by_prior.items():
             writer.add_scalar(f"monitor/ae_raw/{label}", value, epoch)
-        writer.add_scalar("monitor/raw_simple_footslide", footslide_loss, epoch)
+        writer.add_scalar("monitor/raw_slide_excess", slide_excess_loss, epoch)
         writer.add_scalar(
-            "loss/simple_footslide",
-            weighted_footslide,
+            "loss/slide_excess",
+            weighted_slide_excess,
             epoch,
         )
         writer.add_scalar(
-            "loss/weighted_simple_footslide",
-            weighted_footslide,
+            "loss/weighted_slide_excess",
+            weighted_slide_excess,
             epoch,
         )
-        if cfg.foot_yaw_loss_weight > 0.0:
-            writer.add_scalar("loss/foot_yaw", weighted_foot_yaw, epoch)
-            writer.add_scalar("loss/weighted_foot_yaw", weighted_foot_yaw, epoch)
-            writer.add_scalar("monitor/raw_foot_yaw", foot_yaw_loss, epoch)
-            writer.add_scalar("monitor/foot_yaw_loss_scale_radps", cfg.foot_yaw_loss_scale_radps, epoch)
+        if cfg.yaw_excess_loss_weight > 0.0:
+            writer.add_scalar("loss/yaw_excess", weighted_yaw_excess, epoch)
+            writer.add_scalar("loss/weighted_yaw_excess", weighted_yaw_excess, epoch)
+            writer.add_scalar("monitor/raw_yaw_excess", yaw_excess_loss, epoch)
+            writer.add_scalar("monitor/yaw_excess_scale_radps", cfg.yaw_excess_scale_radps, epoch)
         if cfg.motion_floor_loss_weight > 0.0:
             writer.add_scalar("loss/motion_floor", weighted_motion_floor, epoch)
             writer.add_scalar("loss/weighted_motion_floor", weighted_motion_floor, epoch)
@@ -3145,14 +3033,12 @@ def train(args: argparse.Namespace) -> None:
             writer.add_scalar("monitor/motion_floor_margin", cfg.motion_floor_margin, epoch)
         writer.add_scalar("curriculum/active_fraction", active_fraction, epoch)
         writer.add_scalar("optim/gradient_accumulation_batches", cfg.gradient_accumulation_batches, epoch)
-        if cfg.support_envelope_enabled and packed is not None and packed.support_slide_bound_mps is not None:
+        if cfg.excess_envelope_enabled and packed is not None and packed.slide_bound_mps is not None:
             writer.add_scalar(
-                "monitor/simple_footslide_bound_mean_mps",
-                float(packed.support_slide_bound_mps.mean().detach().cpu()),
+                "monitor/slide_excess_bound_mean_mps",
+                float(packed.slide_bound_mps.mean().detach().cpu()),
                 epoch,
             )
-        else:
-            writer.add_scalar("monitor/simple_footslide_threshold_mps", cfg.simple_footslide_threshold_mps, epoch)
         writer.add_scalar("motion/canon_step_rms", motion_rms, epoch)
         if compute_diagnostics:
             writer.add_scalar("accuracy/joint_rmse_m", joint_rmse, epoch)
@@ -3162,9 +3048,9 @@ def train(args: argparse.Namespace) -> None:
         writer.add_scalar("curriculum/rollout_k", rollout_k, epoch)
         writer.add_scalar("curriculum/effective_rollout_k_mean", effective_rollout_mean, epoch)
         writer.add_scalar("curriculum/effective_rollout_k_max", effective_rollout_max, epoch)
-        eligible_clip_count = max(1, sum(clip_supports_any_start(clip, cfg) for clip in clips))
-        real_eligible_clip_count = max(1, sum(clip_supports_any_start(clips[ci], cfg) for ci in real_clip_indices))
-        synthetic_eligible_clip_count = sum(clip_supports_any_start(clips[ci], cfg) for ci in synthetic_clip_indices)
+        eligible_clip_count = max(1, sum(clip_has_any_start(clip, cfg) for clip in clips))
+        real_eligible_clip_count = max(1, sum(clip_has_any_start(clips[ci], cfg) for ci in real_clip_indices))
+        synthetic_eligible_clip_count = sum(clip_has_any_start(clips[ci], cfg) for ci in synthetic_clip_indices)
         min_stage_batches = (
             math.ceil(float(args.curriculum_min_eligible_clip_visits) * eligible_clip_count)
             if args.curriculum_min_eligible_clip_visits > 0.0
@@ -3229,7 +3115,7 @@ def train(args: argparse.Namespace) -> None:
         )
         print(
             f"epoch={epoch:04d} K={rollout_k:02d} ae={train_total:.6g} best_{args.best_metric}={best:.6g} "
-            f"ae_score={train_score:.6g} footslide={footslide_loss:.6g} footyaw={foot_yaw_loss:.6g} "
+            f"ae_score={train_score:.6g} slide_excess={slide_excess_loss:.6g} yaw_excess={yaw_excess_loss:.6g} "
             f"motionfloor={motion_floor_loss:.6g} joint_rmse={joint_rmse:.6g} ee_rmse={ee_rmse:.6g} motion_rms={motion_rms:.6g} "
             f"active={active_fraction:.3f} stalls={stalls} stage_batches={stage_batches}/{min_stage_batches} "
             f"eligible_clips={eligible_clip_count} real_clips={real_eligible_clip_count} "
@@ -3320,21 +3206,6 @@ def main() -> None:
     parser.add_argument("--training-loop", choices=("sampled", "agents"), default="sampled")
     parser.add_argument("--agent-sampling", choices=("random", "coverage"), default="random")
     parser.add_argument("--agent-batches-per-epoch", type=int, default=1)
-    parser.add_argument(
-        "--packed-agent-rollout",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use dense packed tensors for per-agent random multi-clip rollouts.",
-    )
-    parser.add_argument(
-        "--agent-batch-clips",
-        type=int,
-        default=0,
-        help=(
-            "With random agent sampling, 0 means per-agent random clips using the packed rollout path; "
-            "1 keeps the legacy one-clip cohort path."
-        ),
-    )
     parser.add_argument(
         "--agent-min-cohort-steps",
         type=int,
@@ -3555,77 +3426,65 @@ def main() -> None:
     parser.add_argument("--alpha12-termination", type=float, default=0.07)
     parser.add_argument("--ae-loss-weight", type=float, default=1.0)
     parser.add_argument(
-        "--simple-footslide-loss-weight",
+        "--slide-excess-loss-weight",
         type=float,
         default=0.0,
-        help="Extra simple generated-geometry support-foot slide loss. Default off.",
+        help="Excess-envelope generated-geometry slide-excess loss. Requires packed random-agent rollout.",
     )
     parser.add_argument(
-        "--simple-footslide-threshold-mps",
-        type=float,
-        default=0.0,
-        help="Zero-loss support slide threshold. If <=0, use max ground-truth support slide times margin.",
-    )
-    parser.add_argument(
-        "--simple-footslide-gt-margin",
-        type=float,
-        default=1.05,
-        help="Multiplier for the auto threshold from ground-truth support slide.",
-    )
-    parser.add_argument(
-        "--turn-idle-footslide-tolerance-divisor",
+        "--turn-slide-bound-divisor",
         type=float,
         default=1.0,
         help=(
-            "Divide the simple footslide tolerance by this value for idle and stand-turn clips. "
-            "Idle still uses both feet pinned; stand-turn clips still use the best support foot."
+            "Divide the slide-excess tolerance by this value for stand-turn clips. "
+            "Slide-excess uses the foot with the lowest custom collider point."
         ),
     )
     parser.add_argument(
-        "--support-envelope",
+        "--excess-envelope",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Use cached root-conditioned support envelopes for simple footslide and vertical foot-yaw losses. "
+            "Use cached root-conditioned excess envelopes for slide-excess and yaw-excess losses. "
             "Synthetic clips get cached bounds but do not define them."
         ),
     )
     parser.add_argument(
-        "--support-envelope-knn",
+        "--excess-envelope-knn",
         type=int,
         default=32,
-        help="Number of nearest real root-motion situations used to build the zero-loss support envelope.",
+        help="Number of nearest real root-motion situations used to build the zero-loss excess envelope.",
     )
     parser.add_argument(
-        "--support-envelope-margin",
+        "--excess-envelope-margin",
         type=float,
         default=1.05,
-        help="Safety multiplier applied to root-conditioned ground-truth support bounds.",
+        help="Safety multiplier applied to root-conditioned ground-truth excess bounds.",
     )
     parser.add_argument(
-        "--support-envelope-cache-dir",
-        default="training/runs/cache/support_envelopes",
-        help="Directory for cached per-frame support envelopes.",
+        "--excess-envelope-cache-dir",
+        default="training/runs/cache/excess_envelopes",
+        help="Directory for cached per-frame excess envelopes.",
     )
     parser.add_argument(
-        "--foot-yaw-loss-weight",
+        "--yaw-excess-loss-weight",
         type=float,
         default=0.0,
-        help="Extra loss on vertical-axis foot/toe angular speed above the cached root-conditioned support envelope.",
+        help="Extra loss on vertical-axis foot/toe angular speed above the cached root-conditioned excess envelope.",
     )
     parser.add_argument(
-        "--foot-yaw-loss-scale-radps",
+        "--yaw-excess-scale-radps",
         type=float,
         default=0.0,
         help=(
-            "Scale for vertical foot-yaw excess. If <=0 and the packed path is used, it is set so the current "
+            "Scale for yaw-excess. If <=0 and the packed path is used, it is set so the current "
             "checkpoint's forward-walk autoreg max excess has loss 1."
         ),
     )
     parser.add_argument(
-        "--foot-yaw-loss-scale-checkpoint",
+        "--yaw-excess-scale-checkpoint",
         default="",
-        help="Metadata-only note for the checkpoint used to choose foot-yaw scaling; model weights come from --resume-checkpoint.",
+        help="Metadata-only note for the checkpoint used to choose yaw-excess scaling; model weights come from --resume-checkpoint.",
     )
     parser.add_argument(
         "--motion-floor-loss-weight",

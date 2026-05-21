@@ -46,6 +46,25 @@ def load_controller(
     return model
 
 
+def load_matching_state_dict(model: torch.nn.Module, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str], list[str]]:
+    model_state = model.state_dict()
+    compatible: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    unexpected: list[str] = []
+    for key, value in state_dict.items():
+        target = model_state.get(key)
+        if target is None:
+            unexpected.append(key)
+            continue
+        if tuple(target.shape) != tuple(value.shape):
+            skipped.append(key)
+            continue
+        compatible[key] = value
+    missing, load_unexpected = model.load_state_dict(compatible, strict=False)
+    unexpected.extend(str(key) for key in load_unexpected)
+    return [str(key) for key in missing], unexpected, skipped
+
+
 def evenly_spaced_starts(max_start: int, count: int) -> list[int]:
     if max_start <= 1:
         return [1]
@@ -64,7 +83,7 @@ class GeneratedFeatureBatch:
     gt_difference_sum_m: torch.Tensor
 
 
-def support_slide_distance_step(
+def slide_excess_distance_step(
     prev_pos: torch.Tensor,
     prev_rot: torch.Tensor,
     cur_pos: torch.Tensor,
@@ -82,8 +101,14 @@ def support_slide_distance_step(
         toe_indices,
         clip.fps,
     )
-    support_speed = speeds.mean(dim=-1) if "idle" in clip.path.stem.lower() else speeds.amin(dim=-1)
-    return support_speed / float(clip.fps)
+    slide_speed, _planted, _heights = cp.planted_foot_values(
+        speeds,
+        cur_pos,
+        cur_rot,
+        foot_indices,
+        toe_indices,
+    )
+    return slide_speed / float(clip.fps)
 
 
 @torch.no_grad()
@@ -133,14 +158,14 @@ def collect_generated_feature_batch(
             pred_global_pos, pred_global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
             gt_cur_pos, gt_cur_rot = tl.global_from_clip(clip, cur_idx, cfg, device)
             gt_next_pos, gt_next_rot = tl.global_from_clip(clip, target_idx, cfg, device)
-            fake_slide_sum = fake_slide_sum + support_slide_distance_step(
+            fake_slide_sum = fake_slide_sum + slide_excess_distance_step(
                 cur_global_pos,
                 cur_global_rot,
                 pred_global_pos,
                 pred_global_rot,
                 clip,
             )
-            gt_slide_sum = gt_slide_sum + support_slide_distance_step(
+            gt_slide_sum = gt_slide_sum + slide_excess_distance_step(
                 gt_cur_pos,
                 gt_cur_rot,
                 gt_next_pos,
@@ -228,18 +253,42 @@ def sample_feature_rows(features: torch.Tensor, max_rows: int, seed: int) -> tor
     return features.index_select(0, indices)
 
 
-def sample_feature_rows_with_weights(
+def sample_feature_rows_with_metadata(
     features: torch.Tensor,
     weights: torch.Tensor,
+    source_cycles: torch.Tensor,
     max_rows: int,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if max_rows <= 0 or features.shape[0] <= max_rows:
-        return features, weights
+        return features, weights, source_cycles
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(seed))
     indices = torch.randperm(features.shape[0], generator=gen)[:max_rows]
-    return features.index_select(0, indices), weights.index_select(0, indices)
+    return (
+        features.index_select(0, indices),
+        weights.index_select(0, indices),
+        source_cycles.index_select(0, indices),
+    )
+
+
+def fake_replay_summary(source_cycles: torch.Tensor, current_cycle: int, decay: float) -> list[dict[str, object]]:
+    if source_cycles.numel() == 0:
+        return []
+    cycles, counts = torch.unique(source_cycles.cpu().long(), sorted=True, return_counts=True)
+    rows: list[dict[str, object]] = []
+    for cycle_t, count_t in zip(cycles.tolist(), counts.tolist()):
+        cycle_i = int(cycle_t)
+        age = max(0, int(current_cycle) - cycle_i)
+        rows.append(
+            {
+                "source_cycle": cycle_i,
+                "age": age,
+                "rows": int(count_t),
+                "coefficient": float(decay**age),
+            }
+        )
+    return rows
 
 
 @torch.no_grad()
@@ -255,7 +304,7 @@ def keep_low_energy_fakes(
     keep_fraction = float(keep_fraction)
     if init_ckpt is None or keep_fraction <= 0.0 or keep_fraction >= 1.0 or fake_features.shape[0] <= 1:
         return fake_features
-    ae_cfg = tae.AEConfig(**init_ckpt["config"])
+    ae_cfg = tae.ae_config_from_dict(init_ckpt["config"])
     prior = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
     missing, unexpected = prior.load_state_dict(init_ckpt["model"], strict=False)
     if missing or unexpected:
@@ -310,14 +359,14 @@ def filter_hard_negative_fakes(
     )
     if init_ckpt is None or keep_fraction <= 0.0 or keep_fraction >= 1.0 or fake_features.shape[0] <= 1:
         metadata["selected_by_filter"] = False
-        if mode in ("low_energy_high_footslide", "low_energy_high_gtdiff"):
+        if mode in ("low_energy_high_slide_excess", "low_energy_high_gtdiff"):
             ref = float(weight_reference_m)
             if ref <= 0.0:
                 positive = row_severity[row_severity > 1e-8]
                 ref = float(positive.mean().item()) if positive.numel() else 1.0
             weights = row_severity / max(ref, 1e-8)
             metadata["severity_weight_reference"] = ref
-            metadata["slide_excess_weight_reference_m"] = ref
+            metadata["slide_excess_weight_reference_m"] = ref if severity_name == "slide_excess" else 0.0
             metadata["selected_fake_weight_mean"] = float(weights.mean().item())
             return fake_features, weights.float(), metadata
         weights = torch.ones((fake_features.shape[0],), dtype=torch.float32)
@@ -325,7 +374,7 @@ def filter_hard_negative_fakes(
         metadata["selected_fake_weight_mean"] = 1.0
         return fake_features, weights, metadata
 
-    ae_cfg = tae.AEConfig(**init_ckpt["config"])
+    ae_cfg = tae.ae_config_from_dict(init_ckpt["config"])
     prior = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
     missing, unexpected = prior.load_state_dict(init_ckpt["model"], strict=False)
     if missing or unexpected:
@@ -350,7 +399,7 @@ def filter_hard_negative_fakes(
         )
         return selected, weights, metadata
 
-    if mode not in ("low_energy_high_footslide", "low_energy_high_gtdiff"):
+    if mode not in ("low_energy_high_slide_excess", "low_energy_high_gtdiff"):
         raise ValueError(f"unknown hard-negative mode: {mode}")
 
     rollout_ids = generated.rollout_ids.long()
@@ -410,7 +459,7 @@ def filter_hard_negative_fakes(
             "kept_gt_difference_mean_m": float(generated.gt_difference_sum_m.index_select(0, selected_rollouts).mean().item()),
             "kept_gt_difference_max_m": float(generated.gt_difference_sum_m.index_select(0, selected_rollouts).max().item()),
             "severity_weight_reference": ref,
-            "slide_excess_weight_reference_m": ref,
+            "slide_excess_weight_reference_m": ref if severity_name == "slide_excess" else 0.0,
             "selected_fake_weight_mean": float(weights.mean().item()),
             "selected_fake_weight_max": float(weights.max().item()) if weights.numel() else 0.0,
         }
@@ -455,9 +504,17 @@ def save_checkpoint(
 
 def train(args: argparse.Namespace) -> None:
     start_time = time.perf_counter()
+    if getattr(args, "date_prefix_run_name", True):
+        args.run_name = tl.date_prefixed_run_name(args.run_name)
     tl.set_seed(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
+    current_source_cycle = int(args.fake_buffer_source_cycle)
+    replay_decay = float(args.fake_replay_decay)
+    if current_source_cycle < 0:
+        raise ValueError("--fake-buffer-source-cycle must be >= 0")
+    if replay_decay < 0.0 or replay_decay > 1.0:
+        raise ValueError("--fake-replay-decay must be between 0 and 1")
     device = torch.device(args.device)
 
     folder = tl.resolve_path(args.folder_path)
@@ -498,7 +555,7 @@ def train(args: argparse.Namespace) -> None:
 
     if init_prior_path is not None:
         assert init_ckpt is not None
-        ae_cfg = tae.AEConfig(**init_ckpt["config"])
+        ae_cfg = tae.ae_config_from_dict(init_ckpt["config"])
     else:
         ae_cfg = tae.AEConfig(
             folder_path=args.folder_path,
@@ -530,6 +587,7 @@ def train(args: argparse.Namespace) -> None:
     ae_cfg.input_noise_std = args.input_noise_std
     ae_cfg.std_floor = args.std_floor
     ae_cfg.compatibility_weight = 1.0 if args.compatibility_fake_weight > 0.0 else 0.0
+    ae_cfg.conditional_root_window = bool(args.conditional_root_window)
 
     schema = tae.transition_schema(clips[0], locomotion_cfg)
     if real_features.shape[1] != schema["total_dim"] or fake_features.shape[1] != schema["total_dim"]:
@@ -544,7 +602,7 @@ def train(args: argparse.Namespace) -> None:
     weight_reference_m = 0.0
     if fake_buffer_path is not None and fake_buffer_path.exists():
         existing_buffer_payload = torch.load(fake_buffer_path, map_location="cpu", weights_only=False)
-        if isinstance(existing_buffer_payload, dict):
+        if args.hard_negative_mode == "low_energy_high_slide_excess" and isinstance(existing_buffer_payload, dict):
             buffer_meta = existing_buffer_payload.get("hard_negative_metadata", {})
             if isinstance(buffer_meta, dict):
                 weight_reference_m = float(buffer_meta.get("slide_excess_weight_reference_m", 0.0) or 0.0)
@@ -564,6 +622,7 @@ def train(args: argparse.Namespace) -> None:
         weight_reference_m,
     )
     kept_fake_count = int(fake_features.shape[0])
+    fake_source_cycles = torch.full((kept_fake_count,), current_source_cycle, dtype=torch.long)
     buffer_loaded_count = 0
     if existing_buffer_payload is not None:
         payload = existing_buffer_payload
@@ -583,23 +642,43 @@ def train(args: argparse.Namespace) -> None:
                 )
         else:
             buffered_weights = torch.ones((buffered.shape[0],), dtype=torch.float32)
+        if isinstance(payload, dict) and "source_cycles" in payload and isinstance(payload["source_cycles"], torch.Tensor):
+            buffered_source_cycles = payload["source_cycles"].long().reshape(-1)
+            if buffered_source_cycles.shape[0] != buffered.shape[0]:
+                raise RuntimeError(
+                    f"fake buffer source_cycles shape mismatch {tuple(buffered_source_cycles.shape)} "
+                    f"for features {tuple(buffered.shape)}"
+                )
+        else:
+            buffered_source_cycles = torch.full(
+                (buffered.shape[0],),
+                max(0, current_source_cycle - 1),
+                dtype=torch.long,
+            )
         fake_features = torch.cat((buffered.float(), fake_features.cpu().float()), dim=0)
         fake_weights = torch.cat((buffered_weights.cpu().float(), fake_weights.cpu().float()), dim=0)
+        fake_source_cycles = torch.cat((buffered_source_cycles.cpu().long(), fake_source_cycles), dim=0)
     if fake_buffer_path is not None:
-        fake_features, fake_weights = sample_feature_rows_with_weights(
+        fake_features, fake_weights, fake_source_cycles = sample_feature_rows_with_metadata(
             fake_features.cpu().float(),
             fake_weights.cpu().float(),
+            fake_source_cycles.cpu().long(),
             args.fake_buffer_max_rows,
             args.seed + 1009,
         )
+        replay_summary = fake_replay_summary(fake_source_cycles, current_source_cycle, replay_decay)
         fake_buffer_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "features": fake_features,
                 "weights": fake_weights,
+                "source_cycles": fake_source_cycles,
                 "schema": schema,
                 "updated_at": time.time(),
                 "source_controller_checkpoint": str(controller_checkpoint),
+                "current_source_cycle": current_source_cycle,
+                "fake_replay_decay": replay_decay,
+                "fake_replay_summary": replay_summary,
                 "raw_fake_count": raw_fake_count,
                 "kept_fake_count": kept_fake_count,
                 "buffer_loaded_count": buffer_loaded_count,
@@ -611,21 +690,27 @@ def train(args: argparse.Namespace) -> None:
         print(
             f"fake buffer {fake_buffer_path} loaded={buffer_loaded_count} raw={raw_fake_count} "
             f"kept={kept_fake_count} total={fake_features.shape[0]} "
-            f"weight_mean={float(fake_weights.mean().item()):.4g}",
+            f"weight_mean={float(fake_weights.mean().item()):.4g} replay={replay_summary}",
             flush=True,
         )
+    else:
+        replay_summary = fake_replay_summary(fake_source_cycles, current_source_cycle, replay_decay)
     real_norm = tae.normalise(real_features, mean, std).to(device)
     fake_norm = tae.normalise(fake_features, mean, std).to(device)
     fake_weights = fake_weights.to(device).float()
+    fake_source_cycles = fake_source_cycles.to(device).long()
     mean = mean.to(device)
     std = std.to(device)
 
     model = tae.TransitionAutoencoder(schema["total_dim"], ae_cfg, schema).to(device)
     if init_prior_path is not None:
         init_ckpt = torch.load(init_prior_path, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(init_ckpt["model"], strict=False)
-        if missing or unexpected:
-            print(f"init prior partial load missing={missing} unexpected={unexpected}", flush=True)
+        missing, unexpected, skipped = load_matching_state_dict(model, init_ckpt["model"])
+        if missing or unexpected or skipped:
+            print(
+                f"init prior partial load missing={missing} unexpected={unexpected} skipped_shape={skipped}",
+                flush=True,
+            )
 
     opt = torch.optim.AdamW(model.parameters(), lr=ae_cfg.learning_rate, weight_decay=ae_cfg.weight_decay)
     run_dir = tl.resolve_path(args.output_dir) / args.run_name
@@ -644,8 +729,13 @@ def train(args: argparse.Namespace) -> None:
         "compatibility_fake_weight": args.compatibility_fake_weight,
         "fake_buffer_path": str(fake_buffer_path) if fake_buffer_path is not None else "",
         "fake_buffer_max_rows": args.fake_buffer_max_rows,
+        "fake_buffer_source_cycle": current_source_cycle,
+        "fake_replay_decay": replay_decay,
+        "fake_replay_sampling": "generation_weighted_normalized",
+        "fake_replay_summary": replay_summary,
         "hard_negative_keep_fraction": args.hard_negative_keep_fraction,
         "hard_negative_mode": args.hard_negative_mode,
+        "conditional_root_window": ae_cfg.conditional_root_window,
         "raw_fake_count": raw_fake_count,
         "kept_fake_count": kept_fake_count,
         "buffer_loaded_count": buffer_loaded_count,
@@ -666,6 +756,55 @@ def train(args: argparse.Namespace) -> None:
 
     real_indices = torch.arange(real_norm.shape[0], device=device)
     fake_indices = torch.arange(fake_norm.shape[0], device=device)
+    replay_cycles, replay_inverse, replay_counts = torch.unique(
+        fake_source_cycles,
+        sorted=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    replay_ages = (current_source_cycle - replay_cycles).clamp_min(0).float()
+    replay_coeffs = torch.pow(
+        torch.full_like(replay_ages, replay_decay, dtype=torch.float32, device=device),
+        replay_ages,
+    )
+    replay_probs = replay_coeffs / replay_coeffs.sum().clamp_min(1e-8)
+    replay_group_indices = [
+        fake_indices.index_select(0, torch.nonzero(replay_inverse == group_i, as_tuple=False).flatten())
+        for group_i in range(int(replay_cycles.numel()))
+    ]
+    replay_row_probs = torch.empty((fake_norm.shape[0],), dtype=torch.float32, device=device)
+    for group_i, group_indices in enumerate(replay_group_indices):
+        replay_row_probs.index_fill_(
+            0,
+            group_indices,
+            float(replay_probs[group_i].detach().cpu()) / max(1, int(group_indices.numel())),
+        )
+    print(
+        "fake replay groups "
+        + ", ".join(
+            (
+                f"cycle={int(cycle.item())} age={int(max(0, current_source_cycle - int(cycle.item())))} "
+                f"rows={int(count.item())} prob={float(prob.item()):.4g}"
+            )
+            for cycle, count, prob in zip(replay_cycles.detach().cpu(), replay_counts.detach().cpu(), replay_probs.detach().cpu())
+        ),
+        flush=True,
+    )
+
+    def sample_fake_indices(row_count: int) -> torch.Tensor:
+        if len(replay_group_indices) <= 1:
+            return fake_indices[torch.randint(0, fake_indices.numel(), (row_count,), device=device)]
+        group_draws = torch.multinomial(replay_probs, row_count, replacement=True)
+        sampled = torch.empty((row_count,), dtype=torch.long, device=device)
+        for group_i, group_indices in enumerate(replay_group_indices):
+            mask = group_draws == group_i
+            draw_count = int(mask.sum().item())
+            if draw_count <= 0:
+                continue
+            row_draws = torch.randint(0, group_indices.numel(), (draw_count,), device=device)
+            sampled[mask] = group_indices.index_select(0, row_draws)
+        return sampled
+
     rows: list[dict[str, float]] = []
     best = math.inf
     stalls = 0
@@ -684,7 +823,7 @@ def train(args: argparse.Namespace) -> None:
         for start in range(0, perm.numel(), args.batch_size):
             real_idx = perm[start : start + args.batch_size]
             real_batch = real_norm.index_select(0, real_idx)
-            fake_idx = fake_indices[torch.randint(0, fake_indices.numel(), real_idx.shape, device=device)]
+            fake_idx = sample_fake_indices(int(real_idx.numel()))
             fake_batch = fake_norm.index_select(0, fake_idx)
             fake_weight_batch = fake_weights.index_select(0, fake_idx)
             noisy_real = real_batch
@@ -751,6 +890,15 @@ def train(args: argparse.Namespace) -> None:
         if epoch == 1 or epoch % args.eval_every_epochs == 0:
             real_e = energy(model, real_norm)
             fake_e = energy(model, fake_norm)
+            fake_ok = (fake_e > args.fake_margin).float()
+            fresh_mask = fake_source_cycles == current_source_cycle
+            replay_mask = fake_source_cycles < current_source_cycle
+
+            def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+                if not bool(mask.any().item()):
+                    return 0.0
+                return float(values[mask].mean().detach().cpu())
+
             if model.has_compatibility_head():
                 real_logits = model.compatibility_logits(real_norm)
                 fake_logits = model.compatibility_logits(fake_norm)
@@ -768,8 +916,14 @@ def train(args: argparse.Namespace) -> None:
                 "real_energy_mean": float(real_e.mean().cpu()),
                 "real_energy_p95": float(torch.quantile(real_e, 0.95).cpu()),
                 "fake_energy_mean": float(fake_e.mean().cpu()),
+                "fake_energy_mean_grouped": float((fake_e * replay_row_probs).sum().cpu()),
+                "fresh_fake_energy_mean": masked_mean(fake_e, fresh_mask),
+                "replay_fake_energy_mean": masked_mean(fake_e, replay_mask),
                 "fake_energy_p05": float(torch.quantile(fake_e, 0.05).cpu()),
-                "fake_margin_success": float((fake_e > args.fake_margin).float().mean().cpu()),
+                "fake_margin_success": float(fake_ok.mean().cpu()),
+                "fake_margin_success_grouped": float((fake_ok * replay_row_probs).sum().cpu()),
+                "fresh_fake_margin_success": masked_mean(fake_ok, fresh_mask),
+                "replay_fake_margin_success": masked_mean(fake_ok, replay_mask),
                 "gap": float((fake_e.mean() - real_e.mean()).cpu()),
                 "compat_real_acc": real_compat_acc,
                 "compat_fake_acc": fake_compat_acc,
@@ -778,10 +932,14 @@ def train(args: argparse.Namespace) -> None:
             }
             rows.append(row)
             write_rows(run_dir / "model_aware_ae_report.csv", rows)
+            writer.add_scalar("replay/fake_margin_success_grouped", row["fake_margin_success_grouped"], epoch)
+            writer.add_scalar("replay/fresh_fake_margin_success", row["fresh_fake_margin_success"], epoch)
+            writer.add_scalar("replay/replay_fake_margin_success", row["replay_fake_margin_success"], epoch)
             print(
                 f"epoch={epoch:04d} loss={train_loss:.6g} real={train_real:.6g} "
                 f"fake_hinge={train_fake:.6g} real_e={row['real_energy_mean']:.6g} "
-                f"fake_e={row['fake_energy_mean']:.6g} fake_ok={row['fake_margin_success']:.3f} "
+                f"fake_e={row['fake_energy_mean']:.6g} fake_ok={row['fake_margin_success_grouped']:.3f} "
+                f"fresh_ok={row['fresh_fake_margin_success']:.3f} replay_ok={row['replay_fake_margin_success']:.3f} "
                 f"compat_real={real_compat_acc:.3f} compat_fake={fake_compat_acc:.3f} "
                 f"stalls={stalls} elapsed_s={time.perf_counter() - start_time:.1f}",
                 flush=True,
@@ -831,6 +989,7 @@ def main() -> None:
     parser.add_argument("--model-checkpoint", required=True)
     parser.add_argument("--init-prior-checkpoint", default="")
     parser.add_argument("--run-name", default="model_aware_transition_ae")
+    parser.add_argument("--date-prefix-run-name", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-dir", default="training/runs")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--cyclic-animation", action=argparse.BooleanOptionalAction, default=True)
@@ -858,6 +1017,18 @@ def main() -> None:
     )
     parser.add_argument("--fake-buffer-max-rows", type=int, default=200000)
     parser.add_argument(
+        "--fake-buffer-source-cycle",
+        type=int,
+        default=0,
+        help="Cycle id assigned to freshly generated fakes when saving/loading the replay buffer.",
+    )
+    parser.add_argument(
+        "--fake-replay-decay",
+        type=float,
+        default=1.0,
+        help="Generation-level replay decay. A source cycle with age N is sampled with coefficient decay**N.",
+    )
+    parser.add_argument(
         "--hard-negative-keep-fraction",
         type=float,
         default=1.0,
@@ -865,17 +1036,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--hard-negative-mode",
-        choices=("low_energy", "low_energy_high_footslide", "low_energy_high_gtdiff"),
+        choices=("low_energy", "low_energy_high_slide_excess", "low_energy_high_gtdiff"),
         default="low_energy",
         help=(
-            "Fresh fake selector. 'low_energy_high_footslide' keeps rollout windows that the init AE scores "
-            "as easy while their 32-frame support-slide distance exceeds matching GT. "
+            "Fresh fake selector. 'low_energy_high_slide_excess' keeps rollout windows that the init AE scores "
+            "as easy while their 32-frame slide-excess distance exceeds matching GT. "
             "'low_energy_high_gtdiff' uses 32-frame global joint-position RMS versus GT as the severity."
         ),
     )
     parser.add_argument("--eval-every-epochs", type=int, default=10)
     parser.add_argument("--stall-patience-epochs", type=int, default=50)
     parser.add_argument("--min-delta", type=float, default=1e-6)
+    parser.add_argument("--conditional-root-window", action=argparse.BooleanOptionalAction, default=False)
     train(parser.parse_args())
 
 

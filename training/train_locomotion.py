@@ -107,7 +107,6 @@ class TrainConfig:
     zero_contact_state: bool = False
     training_loop: str = "sampled"
     agent_sampling: str = "random"
-    agent_batch_clips: int = 1
     agent_min_cohort_steps: int = 8
     gradient_accumulation_batches: int = 1
     periodic_sampling_weight: float = 1.0
@@ -137,22 +136,22 @@ class TrainConfig:
     ae_loss_weight: float = 1.0
     ae_row_top_fraction: float = 0.0
     ae_row_top_weight: float = 0.0
-    simple_footslide_loss_weight: float = 0.0
-    simple_footslide_threshold_mps: float = 0.0
-    simple_footslide_gt_margin: float = 1.05
-    turn_idle_footslide_tolerance_divisor: float = 1.0
-    support_envelope_enabled: bool = True
-    support_envelope_knn: int = 32
-    support_envelope_margin: float = 1.05
-    support_envelope_cache_dir: str = "training/runs/cache/support_envelopes"
-    foot_yaw_loss_weight: float = 0.0
-    foot_yaw_loss_scale_radps: float = 1.0
-    foot_yaw_loss_scale_checkpoint: str = ""
+    slide_excess_loss_weight: float = 0.0
+    slide_excess_threshold_mps: float = 0.0
+    slide_excess_gt_margin: float = 1.05
+    turn_slide_bound_divisor: float = 1.0
+    excess_envelope_enabled: bool = True
+    excess_envelope_knn: int = 32
+    excess_envelope_margin: float = 1.05
+    excess_envelope_cache_dir: str = "training/runs/cache/excess_envelopes"
+    yaw_excess_loss_weight: float = 0.0
+    yaw_excess_scale_radps: float = 1.0
+    yaw_excess_scale_checkpoint: str = ""
     motion_floor_loss_weight: float = 0.0
     motion_floor_margin: float = 0.9
     include_transition_foot_motion: bool = False
     foot_slide_scale_mps: float = 1.0
-    foot_yaw_scale_radps: float = 10.0
+    transition_yaw_scale_radps: float = 10.0
     root_lookahead_steps: int = 0
 
     end_effector_bones: tuple[str, ...] = ("foot_l", "ball_l", "foot_r", "ball_r")
@@ -200,7 +199,11 @@ def date_prefixed_run_name(run_name: str, now: float | None = None) -> str:
     text = str(run_name).strip() or "run"
     if len(text) >= 15 and text[:8].isdigit() and text[8] == "_" and text[9:15].isdigit():
         return text
-    return f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now or time.time()))}_{text}"
+    while len(text) >= 8 and text[:8].isdigit() and (len(text) == 8 or text[8] in "_/\\"):
+        text = text[9:] if len(text) > 8 else "run"
+        text = text.strip("_/\\") or "run"
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now or time.time()))
+    return f"{stamp}_{text}"
 
 
 def wrap_angle(x: torch.Tensor) -> torch.Tensor:
@@ -393,6 +396,8 @@ class MotionClip:
         self.local_rot6 = rotmat_to_6d(self.local_rot)
         self.local_offsets = default_lcl_translation_full.index_select(0, keep)
         self.pelvis_local_pos = lcl_translation_full[:, self.keep_full[self.pelvis]]
+        self.pelvis_rot_mat = self.local_rot[:, self.pelvis]
+        self.non_pelvis_rot_mat = self.local_rot[:, self.non_pelvis]
         self.pelvis_rot6 = self.local_rot6[:, self.pelvis]
         self.non_pelvis_rot6 = self.local_rot6[:, self.non_pelvis]
         if "contacts" in arrays.files:
@@ -434,6 +439,8 @@ class MotionClip:
                 "global_rot": self.global_rot.to(device),
                 "local_offsets": self.local_offsets.to(device),
                 "pelvis_local_pos": self.pelvis_local_pos.to(device),
+                "pelvis_rot_mat": self.pelvis_rot_mat.to(device),
+                "non_pelvis_rot_mat": self.non_pelvis_rot_mat.to(device),
                 "pelvis_rot6": self.pelvis_rot6.to(device),
                 "non_pelvis_rot6": self.non_pelvis_rot6.to(device),
                 "canonical_pos": self.canonical_pos.to(device),
@@ -670,7 +677,7 @@ def clip_rollout_max_start(clip: MotionClip, rollout_k: int, cfg: TrainConfig | 
     return int(clip.T) - int(rollout_k) - 1
 
 
-def clip_supports_rollout(clip: MotionClip, rollout_k: int, cfg: TrainConfig | None = None) -> bool:
+def clip_can_rollout(clip: MotionClip, rollout_k: int, cfg: TrainConfig | None = None) -> bool:
     return clip_rollout_max_start(clip, rollout_k, cfg) >= 1
 
 
@@ -793,6 +800,8 @@ def get_pose_from_clip(clip: MotionClip, idx: torch.Tensor, device: torch.device
     idx = logical_pose_index(clip, idx, device)
     return {
         "pelvis_pos": tensors["pelvis_local_pos"].index_select(0, idx),
+        "pelvis_rot_mat": tensors["pelvis_rot_mat"].index_select(0, idx),
+        "nonpelvis_rot_mat": tensors["non_pelvis_rot_mat"].index_select(0, idx),
         "pelvis_rot6": tensors["pelvis_rot6"].index_select(0, idx),
         "nonpelvis_rot6": tensors["non_pelvis_rot6"].index_select(0, idx),
         "canon_pos": tensors["canonical_pos"].index_select(0, idx),
@@ -812,6 +821,7 @@ def blend_pose_by_mask(
             value,
         )
         for key, value in primary.items()
+        if key in replacement
     }
 
 
@@ -844,15 +854,23 @@ def compute_losses(
     pelvis_loc = weighted_batch_mean(
         F.huber_loss(pred_pose["pelvis_pos"], target_pose["pelvis_pos"], reduction="none"), sample_weight
     )
+    pred_pelvis_rot = rotation_6d_to_matrix(pred_pose["pelvis_rot6"])
+    target_pelvis_rot = target_pose.get("pelvis_rot_mat")
+    if target_pelvis_rot is None:
+        target_pelvis_rot = rotation_6d_to_matrix(target_pose["pelvis_rot6"])
     pelvis_rot = weighted_batch_mean(
-        geodesic_angles(
-            rotation_6d_to_matrix(pred_pose["pelvis_rot6"]), rotation_6d_to_matrix(target_pose["pelvis_rot6"])
-        ).unsqueeze(-1),
+        geodesic_angles(pred_pelvis_rot, target_pelvis_rot).unsqueeze(-1),
         sample_weight,
     )
+    pred_nonpelvis_rot = rotation_6d_to_matrix(pred_pose["nonpelvis_rot6"].reshape(-1, 6))
+    target_nonpelvis_rot = target_pose.get("nonpelvis_rot_mat")
+    if target_nonpelvis_rot is None:
+        target_nonpelvis_rot = rotation_6d_to_matrix(target_pose["nonpelvis_rot6"].reshape(-1, 6))
+    else:
+        target_nonpelvis_rot = target_nonpelvis_rot.reshape(-1, 3, 3)
     pose_rot_angles = geodesic_angles(
-        rotation_6d_to_matrix(pred_pose["nonpelvis_rot6"].reshape(-1, 6)),
-        rotation_6d_to_matrix(target_pose["nonpelvis_rot6"].reshape(-1, 6)),
+        pred_nonpelvis_rot,
+        target_nonpelvis_rot,
     ).reshape(b, clip.Jn)
     pose_rot = weighted_batch_mean(pose_rot_angles, sample_weight)
     pose_aux = weighted_batch_mean(
@@ -1726,8 +1744,6 @@ def train(args: argparse.Namespace) -> None:
         cfg.training_loop = args.training_loop
     if args.agent_sampling is not None:
         cfg.agent_sampling = args.agent_sampling
-    if args.agent_batch_clips is not None:
-        cfg.agent_batch_clips = max(0, int(args.agent_batch_clips))
     if args.live_viewer is not None:
         cfg.live_viewer = bool(args.live_viewer)
     if args.live_viewer_max_agents is not None:
@@ -1813,7 +1829,7 @@ def train(args: argparse.Namespace) -> None:
     profiler = TimingProfiler(cfg.profile_timing, device, cfg.profile_sync_cuda)
     with profiler.section("setup/load_npz_and_precompute"):
         clips = load_clips_from_specs(clip_specs, cfg)
-    schedule = tuple(k for k in cfg.rollout_schedule if all(clip_supports_rollout(clip, k, cfg) for clip in clips))
+    schedule = tuple(k for k in cfg.rollout_schedule if all(clip_can_rollout(clip, k, cfg) for clip in clips))
     if not schedule:
         schedule = (1,)
     def make_loaders(max_rollout: int) -> tuple[DataLoader, DataLoader | None]:
@@ -1838,9 +1854,9 @@ def train(args: argparse.Namespace) -> None:
     agent_coverage_cursor = 0
 
     def random_agent_start(max_rollout: int, clip_index: int | None = None) -> tuple[int, int]:
-        eligible = [ci for ci, clip in enumerate(clips) if clip_supports_rollout(clip, max_rollout, cfg)]
+        eligible = [ci for ci, clip in enumerate(clips) if clip_can_rollout(clip, max_rollout, cfg)]
         if not eligible:
-            raise ValueError(f"No clips support rollout K={max_rollout}")
+            raise ValueError(f"No clips cover rollout K={max_rollout}")
         ci = agent_rng.choice(eligible) if clip_index is None or int(clip_index) not in eligible else int(clip_index)
         max_start = clip_rollout_max_start(clips[ci], max_rollout, cfg)
         return ci, agent_rng.randint(1, max_start)
@@ -1866,15 +1882,11 @@ def train(args: argparse.Namespace) -> None:
         count = cfg.batch_size
         if cfg.agent_sampling == "coverage":
             count = min(cfg.batch_size, len(train_loader.dataset.items))
-        fixed_clip = None
-        if cfg.agent_sampling == "random" and cfg.agent_batch_clips == 1 and len(clips) > 1:
-            eligible = [ci for ci, clip in enumerate(clips) if clip_supports_rollout(clip, max_rollout, cfg)]
-            fixed_clip = agent_rng.choice(eligible) if eligible else None
         for _ in range(count):
             if cfg.agent_sampling == "coverage":
                 ci, start = coverage_agent_start()
             else:
-                ci, start = random_agent_start(max_rollout, fixed_clip)
+                ci, start = random_agent_start(max_rollout)
             clip_ids.append(ci)
             starts.append(start)
         agent_clip_indices = torch.tensor(clip_ids, dtype=torch.long)
@@ -1941,7 +1953,7 @@ def train(args: argparse.Namespace) -> None:
     if cfg.training_loop == "agents":
         train_sample_text = (
             f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
-            f"({cfg.agent_sampling}, agent_batch_clips={cfg.agent_batch_clips})"
+            f"({cfg.agent_sampling}, mixed per-row clips)"
         )
     else:
         train_sample_text = str(len(train_loader.dataset))
@@ -2177,7 +2189,7 @@ def train(args: argparse.Namespace) -> None:
             if cfg.training_loop == "agents":
                 train_sample_text = (
                     f"up to {cfg.batch_size} agents from {len(train_loader.dataset)} starts "
-                    f"({cfg.agent_sampling}, agent_batch_clips={cfg.agent_batch_clips})"
+                    f"({cfg.agent_sampling}, mixed per-row clips)"
                 )
             else:
                 train_sample_text = str(len(train_loader.dataset))
@@ -2315,12 +2327,6 @@ def main() -> None:
     parser.add_argument("--zero-contact-state", action="store_true")
     parser.add_argument("--training-loop", choices=("sampled", "agents"), default=None)
     parser.add_argument("--agent-sampling", choices=("random", "coverage"), default=None)
-    parser.add_argument(
-        "--agent-batch-clips",
-        type=int,
-        default=None,
-        help="For random agent sampling, 1 keeps each batch on one clip for maximum vectorization; 0 allows mixed clips.",
-    )
     parser.add_argument("--live-viewer", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--live-viewer-max-agents", type=int, default=None)
     parser.add_argument("--live-viewer-start-visualizing", action="store_true")

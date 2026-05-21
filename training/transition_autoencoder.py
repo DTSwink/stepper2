@@ -68,7 +68,7 @@ class AEConfig:
     compatibility_num_hidden_layers: int = 2
     include_transition_foot_motion: bool = False
     foot_slide_scale_mps: float = 1.0
-    foot_yaw_scale_radps: float = 10.0
+    transition_yaw_scale_radps: float = 10.0
     transition_foot_motion_loss_weight: float = 1.0
     root_lookahead_steps: int = 0
     pelvis_feature_weight: float = 1.0
@@ -79,6 +79,14 @@ class AEConfig:
     reconstruction_top_weight: float = 0.0
     conditional_root_window: bool = False
     condition_body_dropout_prob: float = 0.0
+
+
+def ae_config_from_dict(values: dict) -> AEConfig:
+    data = dict(values)
+    legacy_yaw_key = "foot" + "_yaw_scale_radps"
+    if legacy_yaw_key in data and "transition_yaw_scale_radps" not in data:
+        data["transition_yaw_scale_radps"] = data.pop(legacy_yaw_key)
+    return AEConfig(**data)
 
 
 def conditional_transition_indices(schema: dict[str, int], device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -437,7 +445,7 @@ def transition_foot_motion_features(
         clip.fps,
     )
     slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
-    yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+    yaw_scale = max(float(getattr(cfg, "transition_yaw_scale_radps", 10.0)), 1e-6)
     return torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1)
 
 
@@ -943,7 +951,7 @@ def train(args: argparse.Namespace) -> None:
     locomotion_cfg.cyclic_animation = cfg.cyclic_animation
     locomotion_cfg.include_transition_foot_motion = bool(cfg.include_transition_foot_motion)
     locomotion_cfg.foot_slide_scale_mps = float(cfg.foot_slide_scale_mps)
-    locomotion_cfg.foot_yaw_scale_radps = float(cfg.foot_yaw_scale_radps)
+    locomotion_cfg.transition_yaw_scale_radps = float(cfg.transition_yaw_scale_radps)
     locomotion_cfg.root_lookahead_steps = max(0, int(cfg.root_lookahead_steps))
     clip_specs = tl.clip_specs_from_folders(
         cfg.folder_path,

@@ -1863,7 +1863,7 @@ class ModelViewerApp(tk.Tk):
             elif path.suffix.lower() in {".pt", ".pth"}:
                 self.add_checkpoint_actor(path)
             else:
-                messagebox.showerror("Unsupported file", "Open an .npz motion file or a .pt/.pth checkpoint.")
+                messagebox.showerror("File not usable", "Open an .npz motion file or a .pt/.pth checkpoint.")
         except Exception as exc:
             messagebox.showerror("Open failed", str(exc))
 
@@ -4323,7 +4323,7 @@ class ModelViewerApp(tk.Tk):
             ):
                 continue
             try:
-                ae_cfg = tae.AEConfig(**ckpt["config"])
+                ae_cfg = tae.ae_config_from_dict(ckpt["config"])
                 model = tae.TransitionAutoencoder(int(schema["total_dim"]), ae_cfg, schema)
                 model.load_state_dict(ckpt["model"])
                 model.eval()
@@ -4474,7 +4474,7 @@ class ModelViewerApp(tk.Tk):
         slide = cp.foot_slide_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, actor.clip.fps)
         yaw = cp.foot_vertical_yaw_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, actor.clip.fps)
         slide_scale = max(float(getattr(cfg, "foot_slide_scale_mps", 1.0)), 1e-6)
-        yaw_scale = max(float(getattr(cfg, "foot_yaw_scale_radps", 10.0)), 1e-6)
+        yaw_scale = max(float(getattr(cfg, "transition_yaw_scale_radps", 10.0)), 1e-6)
         return torch.cat((slide / slide_scale, yaw / yaw_scale), dim=-1)
 
     def ae_root_lookahead_features(
@@ -4743,18 +4743,15 @@ class ModelViewerApp(tk.Tk):
         contact_speeds = contact_speeds_t[0].detach().cpu().numpy().astype(np.float32)
         slide_speeds = slide_speeds_t[0].detach().cpu().numpy().astype(np.float32)
         yaw_speeds = yaw_speeds_t[0].detach().cpu().numpy().astype(np.float32)
-        idle = "idle" in (actor.npz_path or actor.source_npz_path or Path(actor.name)).stem.lower()
-        support_slide = float(slide_speeds.mean() if idle else slide_speeds.min())
+        selected_index = int(np.argmin(heights)) if heights.size else 0
+        slide_excess = float(slide_speeds[selected_index]) if slide_speeds.size else 0.0
         cfg = self.foot_loss_config_for_actor(actor)
-        slide_threshold = max(0.0, float(getattr(cfg, "simple_footslide_threshold_mps", 0.0)))
-        yaw_speed = float(yaw_speeds.max())
-        yaw_scale = max(1e-6, float(getattr(cfg, "foot_yaw_loss_scale_radps", 1.0) or 1.0))
-        if idle:
-            support_mask = np.ones_like(slide_speeds, dtype=np.bool_)
-        else:
-            support_mask = np.zeros_like(slide_speeds, dtype=np.bool_)
-            if slide_speeds.size:
-                support_mask[int(np.argmin(slide_speeds))] = True
+        slide_threshold = max(0.0, float(getattr(cfg, "slide_excess_threshold_mps", 0.0)))
+        yaw_speed = float(yaw_speeds[selected_index]) if yaw_speeds.size else 0.0
+        yaw_scale = max(1e-6, float(getattr(cfg, "yaw_excess_scale_radps", 1.0) or 1.0))
+        selected_mask = np.zeros_like(slide_speeds, dtype=np.bool_)
+        if slide_speeds.size:
+            selected_mask[selected_index] = True
         side_metrics = []
         for i, (side_index, contact_name, foot_index, toe_index) in enumerate(sides):
             side_metrics.append(
@@ -4770,13 +4767,13 @@ class ModelViewerApp(tk.Tk):
                     "yaw_speed": float(yaw_speeds[i]),
                     "slide_loss": max(0.0, float(slide_speeds[i]) - slide_threshold),
                     "yaw_loss": max(0.0, float(yaw_speeds[i])) / yaw_scale,
-                    "computed_contact": bool(support_mask[i]),
+                    "computed_contact": bool(selected_mask[i]),
                 }
             )
         return {
             "config": geom,
             "sides": side_metrics,
-            "support_slide": support_slide,
+            "slide_excess": slide_excess,
             "slide_threshold": slide_threshold,
             "yaw_speed": yaw_speed,
             "yaw_scale": yaw_scale,
@@ -4881,7 +4878,7 @@ class ModelViewerApp(tk.Tk):
         config = metrics["config"]
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         source_mode = bool(self.foot_contact_from_source_var.get())
-        lines = [f"{actor.name} contact {'source' if source_mode else 'support'}"]
+        lines = [f"{actor.name} contact {'source' if source_mode else 'least-slide'}"]
         loss_by_side: dict[str, tuple[float, float]] = {}
         for side_metric in metrics["sides"]:
             side_index = int(side_metric["side_index"])

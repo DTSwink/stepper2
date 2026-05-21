@@ -35,7 +35,7 @@ def short_name(path: str | Path) -> str:
 
 def load_prior(path: Path, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg = tae.AEConfig(**ckpt["config"])
+    cfg = tae.ae_config_from_dict(ckpt["config"])
     model = tae.TransitionAutoencoder(int(ckpt["schema"]["total_dim"]), cfg, dict(ckpt["schema"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

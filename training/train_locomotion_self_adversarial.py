@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import datetime as dt
 import json
 import subprocess
 import sys
@@ -11,8 +10,59 @@ from pathlib import Path
 
 import torch
 
+import train_locomotion as tl
+import train_model_aware_transition_ae as model_aware
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# Canonical recipe branch: GT-difference hard negatives, reconstruction-only AE,
+# geometric fake replay, and pure AE-prior controller training.
+AE_EPOCHS = 80
+AE_LEARNING_RATE = 3e-4
+AE_BATCH_SIZE = 1024
+AE_INPUT_NOISE_STD = 0.02
+AE_FAKE_MARGIN = 0.04
+AE_FAKE_WEIGHT = 1.0
+AE_REAL_WEIGHT = 1.25
+AE_FAKE_STARTS_PER_CLIP = 10
+AE_FAKE_ROLLOUT_STEPS = 32
+AE_HARD_NEGATIVE_KEEP_FRACTION = 0.7
+AE_HARD_NEGATIVE_MODE = "low_energy_high_gtdiff"
+AE_FAKE_REPLAY_DECAY = 0.25
+AE_FAKE_BUFFER_MAX_ROWS = 0
+AE_EVAL_EVERY_EPOCHS = 10
+AE_STALL_PATIENCE_EPOCHS = 0
+AE_CONDITIONAL_ROOT_WINDOW = False
+
+CONTROLLER_EPOCHS = 620
+CONTROLLER_LEARNING_RATE = 5e-5
+CONTROLLER_BATCH_SIZE = 64
+CONTROLLER_HIDDEN_DIM = 512
+CONTROLLER_HIDDEN_LAYERS = 2
+CONTROLLER_PRIOR_WEIGHT = 1.0
+CONTROLLER_AGENT_BATCHES_PER_EPOCH = 1
+PERIODIC_SAMPLING_WEIGHT = 1.0
+NONPERIODIC_SAMPLING_WEIGHT = 1.0
+ROLLOUT_SCHEDULE = "2,4,8,16,32"
+MIXED_ROLLOUT_COHORT_SCHEDULE = "2,4,8,16,32"
+MIXED_ROLLOUT_COHORT_WEIGHTS = "5,15,20,30,40"
+EXPECTED_BEST_K = 32
+CURRICULUM_MAX_EPOCHS_PER_STAGE = 120
+CURRICULUM_STALL_PATIENCE_EPOCHS = 60
+CURRICULUM_MIN_EPOCHS = 30
+CURRICULUM_MIN_DELTA = 1e-6
+CONTROLLER_STOP_ON_FINAL_STALL = True
+CONTROLLER_SAVE_LIVE_EVERY_EPOCHS = 0
+TIMED_CHECKPOINT_INTERVAL_MINUTES = 30.0
+GT_RULE_STARTS_PER_CLIP = 10
+GT_RULE_ROLLOUT_STEPS = 32
+GT_RULE_TOLERANCE_P95 = 0.003
+
+DEFAULT_KEY_CLIPS = (
+    "Idle;Walk_Loop_F;Circle_Strafe_L;Circle_Strafe_R;"
+    "Stand_Turn_045_L;Stand_Turn_045_R;Box_RL_B_Lfoot;Box_RL_B_Rfoot"
+)
 
 
 def resolve_path(text: str | Path) -> Path:
@@ -93,6 +143,60 @@ def key_clip_paths(args: argparse.Namespace) -> list[Path]:
     return found
 
 
+def write_recipe_config(run_root: Path, args: argparse.Namespace) -> None:
+    write_json(
+        run_root / "config.json",
+        {
+            "exposed_args": vars(args),
+            "hardcoded_recipe": {
+                "ae": {
+                    "epochs": AE_EPOCHS,
+                    "learning_rate": AE_LEARNING_RATE,
+                    "batch_size": AE_BATCH_SIZE,
+                    "input_noise_std": AE_INPUT_NOISE_STD,
+                    "fake_margin": AE_FAKE_MARGIN,
+                    "fake_weight": AE_FAKE_WEIGHT,
+                    "real_weight": AE_REAL_WEIGHT,
+                    "compatibility_real_weight": 0.0,
+                    "compatibility_fake_weight": 0.0,
+                    "fake_starts_per_clip": AE_FAKE_STARTS_PER_CLIP,
+                    "fake_rollout_steps": AE_FAKE_ROLLOUT_STEPS,
+                    "fake_buffer": "geometric_generation_replay",
+                    "fake_replay_decay": AE_FAKE_REPLAY_DECAY,
+                    "fake_buffer_max_rows": AE_FAKE_BUFFER_MAX_ROWS,
+                    "fake_replay_sampling": "generation_weighted_normalized",
+                    "hard_negative_keep_fraction": AE_HARD_NEGATIVE_KEEP_FRACTION,
+                    "hard_negative_mode": AE_HARD_NEGATIVE_MODE,
+                    "conditional_root_window": AE_CONDITIONAL_ROOT_WINDOW,
+                },
+                "controller": {
+                    "epochs": CONTROLLER_EPOCHS,
+                    "learning_rate": CONTROLLER_LEARNING_RATE,
+                    "batch_size": CONTROLLER_BATCH_SIZE,
+                    "hidden_dim": CONTROLLER_HIDDEN_DIM,
+                    "num_hidden_layers": CONTROLLER_HIDDEN_LAYERS,
+                    "prior_weight": CONTROLLER_PRIOR_WEIGHT,
+                    "compatibility_score_weight": 0.0,
+                    "contact_physics_losses": "disabled",
+                    "slide_excess_losses": "disabled",
+                    "compile": "disabled",
+                    "clip_sampling": "mixed per-row random clips",
+                    "rollout_schedule": ROLLOUT_SCHEDULE,
+                    "mixed_rollout_cohort_schedule": MIXED_ROLLOUT_COHORT_SCHEDULE,
+                    "mixed_rollout_cohort_weights": MIXED_ROLLOUT_COHORT_WEIGHTS,
+                    "stop_on_final_stall": CONTROLLER_STOP_ON_FINAL_STALL,
+                    "save_live_every_epochs": CONTROLLER_SAVE_LIVE_EVERY_EPOCHS,
+                },
+                "gt_rule": {
+                    "starts_per_clip": GT_RULE_STARTS_PER_CLIP,
+                    "rollout_steps": GT_RULE_ROLLOUT_STEPS,
+                    "tolerance_p95": GT_RULE_TOLERANCE_P95,
+                },
+            },
+        },
+    )
+
+
 def evaluate_key_clips(
     args: argparse.Namespace,
     run_root: Path,
@@ -144,6 +248,68 @@ def evaluate_key_clips(
     run_command(cmd, PROJECT_ROOT, run_root / "logs" / f"eval_ae_cycle_{cycle:02d}.log")
 
 
+def evaluate_gt_diff_rule(
+    args: argparse.Namespace,
+    run_root: Path,
+    cycle: int,
+    controller_checkpoint: Path,
+    previous_p95: float | None,
+) -> tuple[dict[str, object], bool]:
+    device = torch.device(args.eval_device)
+    controller_ckpt = torch.load(controller_checkpoint, map_location="cpu", weights_only=False)
+    locomotion_cfg = tl.TrainConfig()
+    model_aware.apply_config_dict(locomotion_cfg, controller_ckpt.get("config", {}))
+    locomotion_cfg.device = str(device)
+    locomotion_cfg.use_torch_compile = False
+    tl.apply_cuda_performance_settings(locomotion_cfg, device)
+    clip_specs = tl.clip_specs_from_folders(
+        args.periodic_folder_path,
+        args.periodic_folder_path or None,
+        args.nonperiodic_folder_path or None,
+    )
+    clips = tl.load_clips_from_specs(clip_specs, locomotion_cfg)
+    controller = model_aware.load_controller(controller_checkpoint, clips, locomotion_cfg, device)
+    generated = model_aware.collect_generated_feature_batch(
+        controller,
+        clips,
+        locomotion_cfg,
+        device,
+        GT_RULE_STARTS_PER_CLIP,
+        GT_RULE_ROLLOUT_STEPS,
+    )
+    values = generated.gt_difference_sum_m.float()
+    p95 = float(torch.quantile(values, 0.95).item())
+    row: dict[str, object] = {
+        "cycle": cycle,
+        "mean_gt_diff": float(values.mean().item()),
+        "p95_gt_diff": p95,
+        "max_gt_diff": float(values.max().item()),
+        "rollout_count": int(values.numel()),
+        "starts_per_clip": GT_RULE_STARTS_PER_CLIP,
+        "rollout_steps": GT_RULE_ROLLOUT_STEPS,
+        "previous_p95_gt_diff": "" if previous_p95 is None else previous_p95,
+        "tolerance_p95": GT_RULE_TOLERANCE_P95,
+    }
+    if previous_p95 is None:
+        decision = "baseline"
+        should_stop = False
+        delta = 0.0
+    else:
+        delta = p95 - previous_p95
+        should_stop = delta > GT_RULE_TOLERANCE_P95
+        decision = "break" if should_stop else "accept"
+    row["delta_p95_gt_diff"] = delta
+    row["decision"] = decision
+    append_csv(run_root / "gt_diff_summary.csv", row)
+    write_json(run_root / "gt_rule_decision.json", row)
+    print(
+        f"GT rule cycle={cycle} mean={row['mean_gt_diff']:.6f} "
+        f"p95={p95:.6f} max={row['max_gt_diff']:.6f} decision={decision}",
+        flush=True,
+    )
+    return row, should_stop
+
+
 def train_model_aware_prior(
     args: argparse.Namespace,
     run_root: Path,
@@ -157,7 +323,7 @@ def train_model_aware_prior(
         sys.executable,
         "training/train_model_aware_transition_ae.py",
         "--folder-path",
-        args.folder_path,
+        args.periodic_folder_path,
         "--periodic-folder-path",
         args.periodic_folder_path,
         "--nonperiodic-folder-path",
@@ -171,40 +337,46 @@ def train_model_aware_prior(
         "--device",
         args.device,
         "--learning-rate",
-        str(args.ae_learning_rate),
+        str(AE_LEARNING_RATE),
         "--batch-size",
-        str(args.ae_batch_size),
+        str(AE_BATCH_SIZE),
         "--max-epochs",
-        str(args.ae_epochs_per_cycle),
+        str(AE_EPOCHS),
         "--input-noise-std",
-        str(args.ae_input_noise_std),
+        str(AE_INPUT_NOISE_STD),
         "--fake-margin",
-        str(args.fake_margin),
+        str(AE_FAKE_MARGIN),
         "--fake-weight",
-        str(args.fake_weight),
+        str(AE_FAKE_WEIGHT),
         "--real-weight",
-        str(args.real_weight),
+        str(AE_REAL_WEIGHT),
         "--compatibility-real-weight",
-        str(args.compatibility_real_weight),
+        "0",
         "--compatibility-fake-weight",
-        str(args.compatibility_fake_weight),
+        "0",
         "--fake-starts-per-clip",
-        str(args.fake_starts_per_clip),
+        str(AE_FAKE_STARTS_PER_CLIP),
         "--fake-rollout-steps",
-        str(args.fake_rollout_steps),
+        str(AE_FAKE_ROLLOUT_STEPS),
         "--fake-buffer-path",
         str(fake_buffer_path),
         "--fake-buffer-max-rows",
-        str(args.fake_buffer_max_rows),
+        str(AE_FAKE_BUFFER_MAX_ROWS),
+        "--fake-buffer-source-cycle",
+        str(cycle),
+        "--fake-replay-decay",
+        str(AE_FAKE_REPLAY_DECAY),
         "--hard-negative-keep-fraction",
-        str(args.hard_negative_keep_fraction),
+        str(AE_HARD_NEGATIVE_KEEP_FRACTION),
         "--hard-negative-mode",
-        args.hard_negative_mode,
+        AE_HARD_NEGATIVE_MODE,
         "--eval-every-epochs",
-        str(args.ae_eval_every_epochs),
+        str(AE_EVAL_EVERY_EPOCHS),
         "--stall-patience-epochs",
-        str(args.ae_stall_patience_epochs),
+        str(AE_STALL_PATIENCE_EPOCHS),
     ]
+    if AE_CONDITIONAL_ROOT_WINDOW:
+        cmd.append("--conditional-root-window")
     run_command(cmd, PROJECT_ROOT, run_root / "logs" / f"ae_cycle_{cycle:02d}.log")
     ckpt = PROJECT_ROOT / "training" / "runs" / run_name / "checkpoints" / "checkpoint_best.pt"
     if not ckpt.exists():
@@ -230,9 +402,9 @@ def train_controller(
         "--prior-checkpoint",
         str(prior_checkpoint),
         "--prior-weight",
-        str(args.prior_weight),
+        str(CONTROLLER_PRIOR_WEIGHT),
         "--compatibility-score-weight",
-        str(args.controller_compatibility_score_weight),
+        "0",
         "--resume-checkpoint",
         str(controller_checkpoint),
         "--run-name",
@@ -240,72 +412,54 @@ def train_controller(
         "--device",
         args.device,
         "--hidden-dim",
-        str(args.controller_hidden_dim),
+        str(CONTROLLER_HIDDEN_DIM),
         "--num-hidden-layers",
-        str(args.controller_num_hidden_layers),
+        str(CONTROLLER_HIDDEN_LAYERS),
         "--learning-rate",
-        str(args.controller_learning_rate),
+        str(CONTROLLER_LEARNING_RATE),
         "--batch-size",
-        str(args.controller_batch_size),
+        str(CONTROLLER_BATCH_SIZE),
         "--training-loop",
         "agents",
         "--agent-sampling",
         "random",
         "--agent-batches-per-epoch",
-        str(args.agent_batches_per_epoch),
-        "--packed-agent-rollout",
-        "--agent-batch-clips",
-        "0",
+        str(CONTROLLER_AGENT_BATCHES_PER_EPOCH),
         "--periodic-sampling-weight",
-        str(args.periodic_sampling_weight),
+        str(PERIODIC_SAMPLING_WEIGHT),
         "--nonperiodic-sampling-weight",
-        str(args.nonperiodic_sampling_weight),
+        str(NONPERIODIC_SAMPLING_WEIGHT),
         "--max-epochs",
-        str(args.controller_epochs_per_cycle),
+        str(CONTROLLER_EPOCHS),
         "--rollout-schedule",
-        args.rollout_schedule,
+        ROLLOUT_SCHEDULE,
         "--curriculum-max-epochs-per-stage",
-        str(args.curriculum_max_epochs_per_stage),
+        str(CURRICULUM_MAX_EPOCHS_PER_STAGE),
         "--curriculum-stall-patience-epochs",
-        str(args.curriculum_stall_patience_epochs),
+        str(CURRICULUM_STALL_PATIENCE_EPOCHS),
         "--curriculum-min-epochs",
-        str(args.curriculum_min_epochs),
+        str(CURRICULUM_MIN_EPOCHS),
         "--curriculum-min-delta",
-        str(args.curriculum_min_delta),
+        str(CURRICULUM_MIN_DELTA),
         "--mixed-rollout-cohorts",
         "--mixed-rollout-cohort-schedule",
-        args.mixed_rollout_cohort_schedule,
+        MIXED_ROLLOUT_COHORT_SCHEDULE,
         "--mixed-rollout-cohort-weights",
-        args.mixed_rollout_cohort_weights,
+        MIXED_ROLLOUT_COHORT_WEIGHTS,
         "--no-contact-physics-losses",
         "--no-live-viewer",
         "--no-visual-reporter",
         "--diagnostic-metrics-every-epochs",
         "0",
         "--timed-checkpoint-interval-minutes",
-        str(args.timed_checkpoint_interval_minutes),
+        str(TIMED_CHECKPOINT_INTERVAL_MINUTES),
+        "--save-live-every-epochs",
+        str(CONTROLLER_SAVE_LIVE_EVERY_EPOCHS),
     ]
-    for extra_prior in args.extra_prior_checkpoint:
-        cmd.extend(["--extra-prior-checkpoint", str(resolve_path(extra_prior))])
-    for extra_weight in args.extra_prior_weight:
-        cmd.extend(["--extra-prior-weight", str(extra_weight)])
-    if args.simple_footslide_loss_weight > 0.0:
-        cmd.extend(
-            [
-                "--simple-footslide-loss-weight",
-                str(args.simple_footslide_loss_weight),
-                "--simple-footslide-threshold-mps",
-                str(args.simple_footslide_threshold_mps),
-                "--simple-footslide-gt-margin",
-                str(args.simple_footslide_gt_margin),
-                "--turn-idle-footslide-tolerance-divisor",
-                str(args.turn_idle_footslide_tolerance_divisor),
-            ]
-        )
-    if args.compile:
-        cmd.append("--compile")
+    if CONTROLLER_STOP_ON_FINAL_STALL:
+        cmd.append("--stop-on-final-stall")
     run_command(cmd, PROJECT_ROOT, run_root / "logs" / f"controller_cycle_{cycle:02d}.log")
-    ckpt = PROJECT_ROOT / "training" / "runs" / run_name / "checkpoints" / f"checkpoint_best_k{args.expected_best_k:02d}.pt"
+    ckpt = PROJECT_ROOT / "training" / "runs" / run_name / "checkpoints" / f"checkpoint_best_k{EXPECTED_BEST_K:02d}.pt"
     if not ckpt.exists():
         ckpt = PROJECT_ROOT / "training" / "runs" / run_name / "checkpoints" / "checkpoint_best.pt"
     if not ckpt.exists():
@@ -314,84 +468,41 @@ def train_controller(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="End-to-end hard-negative AE/controller training loop.")
-    parser.add_argument("--folder-path", default="data/npz_final")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Canonical Stepper self-adversarial reconstruction-only recipe. "
+            "Only dataset/start/run controls are exposed; fragile training flags are hard-coded."
+        )
+    )
     parser.add_argument("--periodic-folder-path", required=True)
     parser.add_argument("--nonperiodic-folder-path", required=True)
     parser.add_argument("--start-controller-checkpoint", required=True)
     parser.add_argument("--start-prior-checkpoint", required=True)
-    parser.add_argument("--run-name", default="self_adversarial_locomotion")
-    parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument("--run-name", default="gtdiff_recononly_recipe")
+    parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--eval-device", default="cpu")
-    parser.add_argument(
-        "--key-clip-names",
-        default=(
-            "Idle;Walk_Loop_F;Circle_Strafe_L;Circle_Strafe_R;"
-            "Stand_Turn_045_L;Stand_Turn_045_R;Box_RL_B_Lfoot;Box_RL_B_Rfoot"
-        ),
-    )
-    parser.add_argument("--ae-epochs-per-cycle", type=int, default=80)
-    parser.add_argument("--ae-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--ae-batch-size", type=int, default=1024)
-    parser.add_argument("--ae-input-noise-std", type=float, default=0.02)
-    parser.add_argument("--ae-eval-every-epochs", type=int, default=10)
-    parser.add_argument("--ae-stall-patience-epochs", type=int, default=0)
-    parser.add_argument("--fake-margin", type=float, default=0.03)
-    parser.add_argument("--fake-weight", type=float, default=1.0)
-    parser.add_argument("--real-weight", type=float, default=1.0)
-    parser.add_argument("--compatibility-real-weight", type=float, default=0.5)
-    parser.add_argument("--compatibility-fake-weight", type=float, default=0.0)
-    parser.add_argument("--fake-starts-per-clip", type=int, default=8)
-    parser.add_argument("--fake-rollout-steps", type=int, default=32)
-    parser.add_argument("--fake-buffer-max-rows", type=int, default=200000)
-    parser.add_argument("--hard-negative-keep-fraction", type=float, default=0.65)
-    parser.add_argument(
-        "--hard-negative-mode",
-        choices=("low_energy", "low_energy_high_footslide", "low_energy_high_gtdiff"),
-        default="low_energy",
-    )
-    parser.add_argument("--controller-epochs-per-cycle", type=int, default=420)
-    parser.add_argument("--controller-learning-rate", type=float, default=5e-5)
-    parser.add_argument("--controller-batch-size", type=int, default=64)
-    parser.add_argument("--controller-hidden-dim", type=int, default=512)
-    parser.add_argument("--controller-num-hidden-layers", type=int, default=2)
-    parser.add_argument("--controller-compatibility-score-weight", type=float, default=0.0)
-    parser.add_argument("--prior-weight", type=float, default=1.0)
-    parser.add_argument("--extra-prior-checkpoint", action="append", default=[])
-    parser.add_argument("--extra-prior-weight", action="append", type=float, default=[])
-    parser.add_argument("--simple-footslide-loss-weight", type=float, default=0.0)
-    parser.add_argument("--simple-footslide-threshold-mps", type=float, default=0.0)
-    parser.add_argument("--simple-footslide-gt-margin", type=float, default=1.05)
-    parser.add_argument("--turn-idle-footslide-tolerance-divisor", type=float, default=1.0)
-    parser.add_argument("--agent-batches-per-epoch", type=int, default=1)
-    parser.add_argument("--periodic-sampling-weight", type=float, default=1.0)
-    parser.add_argument("--nonperiodic-sampling-weight", type=float, default=1.0)
-    parser.add_argument("--rollout-schedule", default="2,4,8,16,32")
-    parser.add_argument("--mixed-rollout-cohort-schedule", default="2,4,8,16,32")
-    parser.add_argument("--mixed-rollout-cohort-weights", default="5,15,20,30,40")
-    parser.add_argument("--expected-best-k", type=int, default=32)
-    parser.add_argument("--curriculum-max-epochs-per-stage", type=int, default=120)
-    parser.add_argument("--curriculum-stall-patience-epochs", type=int, default=60)
-    parser.add_argument("--curriculum-min-epochs", type=int, default=30)
-    parser.add_argument("--curriculum-min-delta", type=float, default=1e-6)
-    parser.add_argument("--timed-checkpoint-interval-minutes", type=float, default=30.0)
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--evaluate-every-cycle", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--key-clip-names", default=DEFAULT_KEY_CLIPS)
+    parser.add_argument("--no-evaluate", action="store_true")
     args = parser.parse_args()
 
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_root = PROJECT_ROOT / "training" / "runs" / f"{stamp}_{args.run_name}"
+    run_root = PROJECT_ROOT / "training" / "runs" / tl.date_prefixed_run_name(args.run_name)
     run_root.mkdir(parents=True, exist_ok=True)
-    fake_buffer = run_root / "hard_negative_buffer.pt"
-    write_json(run_root / "config.json", vars(args))
+    fake_buffer = run_root / "geometric_fake_replay_buffer.pt"
+    write_recipe_config(run_root, args)
 
     controller = resolve_path(args.start_controller_checkpoint)
     prior = resolve_path(args.start_prior_checkpoint)
     rows: list[dict[str, object]] = []
     print(f"self_adversarial run_root={run_root}", flush=True)
+    print(
+        f"recipe=GT-diff reconstruction-only geometric fake replay decay={AE_FAKE_REPLAY_DECAY:g} "
+        f"conditional_root_window={AE_CONDITIONAL_ROOT_WINDOW}",
+        flush=True,
+    )
     print(f"start controller={controller}", flush=True)
     print(f"start prior={prior}", flush=True)
+    previous_gt_p95: float | None = None
 
     for cycle in range(1, args.cycles + 1):
         cycle_start = time.perf_counter()
@@ -399,7 +510,7 @@ def main() -> None:
         prior = train_model_aware_prior(args, run_root, cycle, controller, prior, fake_buffer)
         print(f"\n=== cycle {cycle}/{args.cycles}: train controller ===", flush=True)
         controller = train_controller(args, run_root, cycle, controller, prior)
-        if args.evaluate_every_cycle:
+        if not args.no_evaluate:
             print(f"\n=== cycle {cycle}/{args.cycles}: diagnostics ===", flush=True)
             evaluate_key_clips(args, run_root, cycle, controller, prior)
         row = {
@@ -413,7 +524,12 @@ def main() -> None:
         rows.append(row)
         append_csv(run_root / "cycle_summary.csv", row)
         write_json(run_root / "latest.json", row)
+        gt_row, should_stop = evaluate_gt_diff_rule(args, run_root, cycle, controller, previous_gt_p95)
+        previous_gt_p95 = float(gt_row["p95_gt_diff"])
         print(f"cycle {cycle} done controller={controller} prior={prior}", flush=True)
+        if should_stop:
+            print(f"stopping after cycle {cycle}: GT p95 broke monotonic rule", flush=True)
+            break
 
     print(f"finished self-adversarial loop run_root={run_root}", flush=True)
 

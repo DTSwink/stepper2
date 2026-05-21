@@ -8,7 +8,6 @@ import math
 import random
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -120,7 +119,7 @@ def constraint_losses(
 
     com = cp.center_of_mass(pred_global_pos, tensors["mass_weights"])
     com_horizontal = torch.linalg.norm((com - foot_mean)[:, [0, 2]], dim=-1)
-    com_support = F.relu((com_horizontal - constraint_cfg.com_horizontal_threshold_m) / com_scale).square().mean()
+    com_balance = F.relu((com_horizontal - constraint_cfg.com_horizontal_threshold_m) / com_scale).square().mean()
     com_root_horizontal = torch.linalg.norm((com - target_root_pos)[:, [0, 2]], dim=-1)
     com_root = (
         F.relu((com_root_horizontal - constraint_cfg.com_root_horizontal_threshold_m) / com_root_scale)
@@ -162,7 +161,7 @@ def constraint_losses(
     if constraint_cfg.loss_mode == "root_warmup":
         hover = slide = penetration = both_unpinned = bad_contact_gate = zero
         total = (
-            constraint_cfg.com_weight * com_support
+            constraint_cfg.com_weight * com_balance
             + constraint_cfg.com_root_weight * com_root
             + constraint_cfg.head_foot_weight * head_foot
             + constraint_cfg.pelvis_axis_weight * pelvis_axis
@@ -174,7 +173,7 @@ def constraint_losses(
             constraint_cfg.hover_weight * hover
             + constraint_cfg.slide_weight * slide
             + constraint_cfg.penetration_weight * penetration
-            + constraint_cfg.com_weight * com_support
+            + constraint_cfg.com_weight * com_balance
             + constraint_cfg.com_root_weight * com_root
             + constraint_cfg.bone_height_floor_weight * bone_height_floor
             + constraint_cfg.both_unpinned_weight * both_unpinned
@@ -184,7 +183,7 @@ def constraint_losses(
         "hover": hover.detach(),
         "slide": slide.detach(),
         "penetration": penetration.detach(),
-        "com_support": com_support.detach(),
+        "com_balance": com_balance.detach(),
         "com_root": com_root.detach(),
         "head_foot": head_foot.detach(),
         "pelvis_axis": pelvis_axis.detach(),
@@ -309,7 +308,7 @@ def train(args: argparse.Namespace) -> None:
     cfg.update_comparison_on_exit = True
     cfg.comparison_output_path = args.comparison_output_path
     cfg.comparison_device = args.comparison_device
-    cfg.run_name = args.run_name or f"constraint_only_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    cfg.run_name = tl.date_prefixed_run_name(args.run_name or "constraint_only")
 
     constraint_cfg = ConstraintConfig(
         loss_mode=args.loss_mode,
@@ -423,7 +422,7 @@ def train(args: argparse.Namespace) -> None:
                 "hover",
                 "slide",
                 "penetration",
-                "com_support",
+                "com_balance",
                 "com_root",
                 "head_foot",
                 "pelvis_axis",
@@ -472,7 +471,7 @@ def train(args: argparse.Namespace) -> None:
                 print(
                     f"epoch={epoch:04d} K={rollout_k} loss={train_total:.8g} "
                     f"hover={mean_scalar('hover'):.3g} slide={mean_scalar('slide'):.3g} "
-                    f"pen={mean_scalar('penetration'):.3g} comFoot={mean_scalar('com_support'):.3g} "
+                    f"pen={mean_scalar('penetration'):.3g} comBalance={mean_scalar('com_balance'):.3g} "
                     f"comRoot={mean_scalar('com_root'):.3g} "
                     f"headFoot={mean_scalar('head_foot'):.3g} "
                     f"pelvisAxis={mean_scalar('pelvis_axis'):.3g} "

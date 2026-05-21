@@ -13,14 +13,14 @@ import train_locomotion as tl
 
 
 @dataclass(frozen=True)
-class SupportEnvelopeConfig:
+class ExcessEnvelopeConfig:
     margin: float = 1.05
     knn: int = 32
-    cache_dir: str = "training/runs/cache/support_envelopes"
+    cache_dir: str = "training/runs/cache/excess_envelopes"
     chunk_size: int = 4096
 
 
-def _clip_is_idle(clip: tl.MotionClip) -> bool:
+def _clip_has_hard_idle_envelope(clip: tl.MotionClip) -> bool:
     return "idle" in Path(clip.path).stem.lower()
 
 
@@ -58,12 +58,12 @@ def root_window_feature(
 
 
 @torch.no_grad()
-def clip_support_values(
+def clip_excess_reference_values(
     clip: tl.MotionClip,
     cfg: tl.TrainConfig,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return flat frame indices, root features, slide support, and vertical yaw support.
+    """Return flat frame indices, root features, slide reference, and yaw reference.
 
     Rows correspond to transitions cur -> cur+1. Frame 0 is skipped because the
     model input convention needs t-1. Non-cyclic clips stop before future-root
@@ -92,7 +92,6 @@ def clip_support_values(
         toe_indices,
         clip.fps,
     )
-    support_slide = slide_speeds.mean(dim=-1) if _clip_is_idle(clip) else slide_speeds.amin(dim=-1)
     yaw_speeds = cp.foot_vertical_yaw_speeds(
         cur_pos,
         cur_rot,
@@ -102,9 +101,16 @@ def clip_support_values(
         toe_indices,
         clip.fps,
     )
-    support_yaw = yaw_speeds.amax(dim=-1)
+    slide_reference, planted_foot, _heights = cp.planted_foot_values(
+        slide_speeds,
+        cur_pos,
+        cur_rot,
+        foot_indices,
+        toe_indices,
+    )
+    yaw_reference = yaw_speeds.gather(-1, planted_foot.unsqueeze(-1)).squeeze(-1)
     features = root_window_feature(clip, idx, cfg, device)
-    return idx, features, support_slide, support_yaw
+    return idx, features, slide_reference, yaw_reference
 
 
 def _cache_key(
@@ -112,10 +118,12 @@ def _cache_key(
     real_clip_indices: list[int],
     synthetic_clip_indices: set[int],
     cfg: tl.TrainConfig,
-    env_cfg: SupportEnvelopeConfig,
+    env_cfg: ExcessEnvelopeConfig,
 ) -> str:
     payload = {
-        "version": 4,
+        "version": 9,
+        "idle_hard_zero_envelope": True,
+        "planted_foot_rule": "lowest_foot_collider_point",
         "future_window": int(cfg.future_window),
         "fps": int(cfg.fps),
         "position_unit_scale": float(cfg.position_unit_scale),
@@ -139,7 +147,7 @@ def _cache_key(
 
 
 @torch.no_grad()
-def _knn_upper_bound(
+def _knn_situation_upper_bound(
     target_features: torch.Tensor,
     source_features: torch.Tensor,
     source_values: torch.Tensor,
@@ -147,7 +155,7 @@ def _knn_upper_bound(
     chunk_size: int,
 ) -> torch.Tensor:
     if source_features.numel() == 0:
-        raise ValueError("support envelope needs at least one real ground-truth transition")
+        raise ValueError("excess envelope needs at least one real ground-truth transition")
     k = max(1, min(int(k), int(source_features.shape[0])))
     chunks = []
     source_features_n = source_features / torch.pi
@@ -155,29 +163,31 @@ def _knn_upper_bound(
     for start in range(0, int(target_features.shape[0]), int(chunk_size)):
         chunk = target_features_n[start : start + int(chunk_size)]
         dist = torch.cdist(chunk, source_features_n)
-        nearest = torch.topk(dist, k=k, largest=False, dim=-1).indices
-        values = source_values.index_select(0, nearest.reshape(-1)).reshape(nearest.shape)
-        chunks.append(values.amax(dim=-1))
+        kth = torch.topk(dist, k=k, largest=False, dim=-1).values[:, -1]
+        near = dist <= (kth[:, None] + 1e-8)
+        values = source_values.unsqueeze(0).expand_as(dist)
+        chunks.append(torch.where(near, values, torch.full_like(values, -torch.inf)).amax(dim=-1))
     return torch.cat(chunks, dim=0)
 
 
 @torch.no_grad()
-def build_support_envelope(
+def build_excess_envelope(
     clips: list[tl.MotionClip],
     cfg: tl.TrainConfig,
     device: torch.device,
     synthetic_clip_indices: set[int] | None = None,
     real_clip_indices: list[int] | None = None,
-    env_cfg: SupportEnvelopeConfig | None = None,
+    env_cfg: ExcessEnvelopeConfig | None = None,
 ) -> dict[str, torch.Tensor | dict[str, float | int | str]]:
     synthetic_clip_indices = synthetic_clip_indices or set()
     real_clip_indices = real_clip_indices or [i for i in range(len(clips)) if i not in synthetic_clip_indices]
-    env_cfg = env_cfg or SupportEnvelopeConfig()
+    env_cfg = env_cfg or ExcessEnvelopeConfig()
     frame_count = sum(int(clip.T) for clip in clips)
     flat_slide_values = torch.zeros((frame_count,), dtype=torch.float32, device=device)
     flat_yaw_values = torch.zeros((frame_count,), dtype=torch.float32, device=device)
     flat_features = torch.zeros((frame_count, 2), dtype=torch.float32, device=device)
     valid_mask = torch.zeros((frame_count,), dtype=torch.bool, device=device)
+    idle_valid_mask = torch.zeros((frame_count,), dtype=torch.bool, device=device)
     real_valid_mask = torch.zeros((frame_count,), dtype=torch.bool, device=device)
     source_features = []
     source_slide = []
@@ -188,33 +198,35 @@ def build_support_envelope(
         offsets.append(offset)
         offset += int(clip.T)
     for ci, clip in enumerate(clips):
-        idx, features, support_slide, support_yaw = clip_support_values(clip, cfg, device)
+        idx, features, slide_reference, yaw_reference = clip_excess_reference_values(clip, cfg, device)
         if idx.numel() == 0:
             continue
         flat = idx + int(offsets[ci])
         flat_features.index_copy_(0, flat, features)
-        flat_slide_values.index_copy_(0, flat, support_slide)
-        flat_yaw_values.index_copy_(0, flat, support_yaw)
+        flat_slide_values.index_copy_(0, flat, slide_reference)
+        flat_yaw_values.index_copy_(0, flat, yaw_reference)
         valid_mask.index_fill_(0, flat, True)
+        if _clip_has_hard_idle_envelope(clip):
+            idle_valid_mask.index_fill_(0, flat, True)
         if ci in real_clip_indices:
             real_valid_mask.index_fill_(0, flat, True)
             source_features.append(features)
-            source_slide.append(support_slide)
-            source_yaw.append(support_yaw)
+            source_slide.append(slide_reference)
+            source_yaw.append(yaw_reference)
     if not source_features:
-        raise ValueError("support envelope could not find any real clip transitions")
+        raise ValueError("excess envelope could not find any real clip transitions")
     real_features = torch.cat(source_features, dim=0)
     real_slide = torch.cat(source_slide, dim=0)
     real_yaw = torch.cat(source_yaw, dim=0)
     target_features = flat_features[valid_mask]
-    slide_bound_valid = _knn_upper_bound(
+    slide_bound_valid = _knn_situation_upper_bound(
         target_features,
         real_features,
         real_slide,
         env_cfg.knn,
         env_cfg.chunk_size,
     )
-    yaw_bound_valid = _knn_upper_bound(
+    yaw_bound_valid = _knn_situation_upper_bound(
         target_features,
         real_features,
         real_yaw,
@@ -226,63 +238,64 @@ def build_support_envelope(
     yaw_bound = torch.zeros_like(flat_yaw_values)
     slide_bound[valid_mask] = slide_bound_valid * margin
     yaw_bound[valid_mask] = yaw_bound_valid * margin
-    slide_bound[real_valid_mask] = torch.maximum(
-        slide_bound[real_valid_mask],
-        flat_slide_values[real_valid_mask] * margin,
-    )
-    yaw_bound[real_valid_mask] = torch.maximum(
-        yaw_bound[real_valid_mask],
-        flat_yaw_values[real_valid_mask] * margin,
-    )
     # Invalid frames should never be queried in normal training, but use a safe,
     # permissive fallback to avoid exploding diagnostics if a bug does query them.
     slide_bound[~valid_mask] = real_slide.max() * margin
     yaw_bound[~valid_mask] = real_yaw.max() * margin
+    # Idle is a deliberate exception: the target behavior is planted feet, not
+    # permission to reproduce tiny GT capture/retarget jitter.
+    slide_bound[idle_valid_mask] = 0.0
+    yaw_bound[idle_valid_mask] = 0.0
     return {
         "slide_bound_mps": slide_bound,
-        "foot_yaw_bound_radps": yaw_bound,
+        "yaw_excess_bound_radps": yaw_bound,
         "features": flat_features,
         "valid_mask": valid_mask,
         "real_valid_mask": real_valid_mask,
         "groundtruth_slide_mps": flat_slide_values,
-        "groundtruth_foot_yaw_radps": flat_yaw_values,
+        "groundtruth_yaw_excess_radps": flat_yaw_values,
         "metadata": {
             "source_real_transitions": int(real_features.shape[0]),
             "target_transitions": int(valid_mask.sum().item()),
             "margin": float(env_cfg.margin),
             "knn": int(env_cfg.knn),
             "max_real_slide_mps": float(real_slide.max().detach().cpu()),
-            "max_real_foot_yaw_radps": float(real_yaw.max().detach().cpu()),
-            "cache_version": 4,
+            "max_real_yaw_excess_radps": float(real_yaw.max().detach().cpu()),
+            "linear_bound_reduction": "max_nearest_same_situation",
+            "angular_bound_reduction": "max_nearest_same_situation",
+            "planted_foot_rule": "lowest_foot_collider_point",
+            "idle_hard_zero_envelope": 1,
+            "idle_hard_zero_frames": int(idle_valid_mask.sum().item()),
+            "cache_version": 9,
         },
     }
 
 
-def load_or_build_support_envelope(
+def load_or_build_excess_envelope(
     clips: list[tl.MotionClip],
     cfg: tl.TrainConfig,
     device: torch.device,
     synthetic_clip_indices: set[int] | None = None,
     real_clip_indices: list[int] | None = None,
-    env_cfg: SupportEnvelopeConfig | None = None,
+    env_cfg: ExcessEnvelopeConfig | None = None,
 ) -> dict[str, torch.Tensor | dict[str, float | int | str]]:
     synthetic_clip_indices = synthetic_clip_indices or set()
     real_clip_indices = real_clip_indices or [i for i in range(len(clips)) if i not in synthetic_clip_indices]
-    env_cfg = env_cfg or SupportEnvelopeConfig()
+    env_cfg = env_cfg or ExcessEnvelopeConfig()
     cache_dir = tl.resolve_path(env_cfg.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = _cache_key(clips, real_clip_indices, synthetic_clip_indices, cfg, env_cfg)
-    cache_path = cache_dir / f"support_envelope_{key}.pt"
+    cache_path = cache_dir / f"excess_envelope_{key}.pt"
     if cache_path.exists():
         cached = torch.load(cache_path, map_location=device, weights_only=False)
         for name in (
             "slide_bound_mps",
-            "foot_yaw_bound_radps",
+            "yaw_excess_bound_radps",
             "features",
             "valid_mask",
             "real_valid_mask",
             "groundtruth_slide_mps",
-            "groundtruth_foot_yaw_radps",
+            "groundtruth_yaw_excess_radps",
         ):
             if name not in cached:
                 continue
@@ -290,7 +303,7 @@ def load_or_build_support_envelope(
         cached["metadata"]["cache_path"] = str(cache_path)
         cached["metadata"]["cache_hit"] = 1
         return cached
-    built = build_support_envelope(
+    built = build_excess_envelope(
         clips,
         cfg,
         device,

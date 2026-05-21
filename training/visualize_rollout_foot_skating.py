@@ -120,18 +120,30 @@ def foot_series(
     return slide.detach().cpu(), heights.detach().cpu()
 
 
-def summarize(label: str, pred_slide: torch.Tensor, gt_slide: torch.Tensor, contacts: torch.Tensor) -> dict[str, float | str]:
+def planted_slide(slide: torch.Tensor, heights: torch.Tensor) -> torch.Tensor:
+    planted = heights.argmin(dim=-1)
+    return slide.gather(-1, planted.unsqueeze(-1)).squeeze(-1)
+
+
+def summarize(
+    label: str,
+    pred_slide: torch.Tensor,
+    pred_height: torch.Tensor,
+    gt_slide: torch.Tensor,
+    gt_height: torch.Tensor,
+    contacts: torch.Tensor,
+) -> dict[str, float | str]:
     contact = contacts > 0.5
-    support_pred = pred_slide.mean(dim=-1) if "idle" in label.lower() else pred_slide.amin(dim=-1)
-    support_gt = gt_slide.mean(dim=-1) if "idle" in label.lower() else gt_slide.amin(dim=-1)
+    slide_excess_pred = planted_slide(pred_slide, pred_height)
+    slide_excess_gt = planted_slide(gt_slide, gt_height)
     source_contact_pred = pred_slide[contact]
     source_contact_gt = gt_slide[contact]
     return {
         "label": label,
-        "support_pred_mean": float(support_pred.mean()),
-        "support_gt_mean": float(support_gt.mean()),
-        "support_pred_p95": percentile(support_pred, 0.95),
-        "support_gt_p95": percentile(support_gt, 0.95),
+        "slide_excess_pred_mean": float(slide_excess_pred.mean()),
+        "slide_excess_gt_mean": float(slide_excess_gt.mean()),
+        "slide_excess_pred_p95": percentile(slide_excess_pred, 0.95),
+        "slide_excess_gt_p95": percentile(slide_excess_gt, 0.95),
         "source_contact_pred_p95": percentile(source_contact_pred, 0.95),
         "source_contact_gt_p95": percentile(source_contact_gt, 0.95),
         "source_contact_excess_p95": percentile(torch.relu(source_contact_pred - source_contact_gt), 0.95),
@@ -294,14 +306,16 @@ def main() -> None:
         model, cfg, _ckpt = load_model(checkpoint_path, clip_for_model, device)
         pred_pos, pred_rot = rollout_autoreg(model, clip_for_model, cfg, device, frame_count)
         pred_slide, pred_height = foot_series(pred_pos, pred_rot, clip_for_model)
-        rows.append(summarize(f"{label} [full]", pred_slide, gt_slide, source_contacts))
+        rows.append(summarize(f"{label} [full]", pred_slide, pred_height, gt_slide, gt_height, source_contacts))
         if safe_frame_count < frame_count:
             safe_slice = slice(0, safe_frame_count - 1)
             rows.append(
                 summarize(
                     f"{label} [trainable horizon]",
                     pred_slide[safe_slice],
+                    pred_height[safe_slice],
                     gt_slide[safe_slice],
+                    gt_height[safe_slice],
                     source_contacts[safe_slice],
                 )
             )
@@ -334,7 +348,7 @@ def main() -> None:
     print(f"wrote {resolve_path(args.output_html)}")
     for row in rows:
         print(
-            f"{row['label']} support_p95 pred={float(row['support_pred_p95']):.4f} gt={float(row['support_gt_p95']):.4f} "
+            f"{row['label']} slide_excess_p95 pred={float(row['slide_excess_pred_p95']):.4f} gt={float(row['slide_excess_gt_p95']):.4f} "
             f"source_contact_p95 pred={float(row['source_contact_pred_p95']):.4f} gt={float(row['source_contact_gt_p95']):.4f} "
             f"excess_p95={float(row['source_contact_excess_p95']):.4f}"
         )

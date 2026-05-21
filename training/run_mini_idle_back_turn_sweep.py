@@ -48,7 +48,7 @@ class Candidate:
     slide_weight: str = "0"
     slide_threshold: str = "0"
     yaw_weight: str = "0"
-    support_envelope: bool = False
+    excess_envelope: bool = False
     epochs: int = 100
 
 
@@ -201,9 +201,6 @@ def candidate_cmd(candidate: Candidate, run_name: str) -> list[str]:
         "agents",
         "--agent-sampling",
         "random",
-        "--agent-batch-clips",
-        "0",
-        "--packed-agent-rollout",
         "--agent-batches-per-epoch",
         "1",
         "--gradient-accumulation-batches",
@@ -215,13 +212,11 @@ def candidate_cmd(candidate: Candidate, run_name: str) -> list[str]:
         "--agent-min-cohort-steps",
         "2",
         "--no-contact-physics-losses",
-        "--simple-footslide-loss-weight",
+        "--slide-excess-loss-weight",
         candidate.slide_weight,
-        "--simple-footslide-threshold-mps",
-        candidate.slide_threshold,
-        "--turn-idle-footslide-tolerance-divisor",
+        "--turn-slide-bound-divisor",
         "20",
-        "--foot-yaw-loss-weight",
+        "--yaw-excess-loss-weight",
         candidate.yaw_weight,
         "--motion-floor-loss-weight",
         "0",
@@ -233,9 +228,9 @@ def candidate_cmd(candidate: Candidate, run_name: str) -> list[str]:
         "--no-visual-reporter",
         "--no-compile",
     ]
-    cmd.append("--support-envelope" if candidate.support_envelope else "--no-support-envelope")
-    if candidate.support_envelope:
-        cmd.extend(["--support-envelope-knn", "16", "--support-envelope-margin", "1.05", "--foot-yaw-loss-scale-radps", "0"])
+    cmd.append("--excess-envelope" if candidate.excess_envelope else "--no-excess-envelope")
+    if candidate.excess_envelope:
+        cmd.extend(["--excess-envelope-knn", "16", "--excess-envelope-margin", "1.05", "--yaw-excess-scale-radps", "0"])
     return cmd
 
 
@@ -279,7 +274,7 @@ def main() -> None:
                 "slide_weight": candidate.slide_weight,
                 "slide_threshold": candidate.slide_threshold,
                 "yaw_weight": candidate.yaw_weight,
-                "support_envelope": candidate.support_envelope,
+                "excess_envelope": candidate.excess_envelope,
                 "checkpoint_name": checkpoint.name,
                 "epoch": epoch,
                 "best_val": best_val,

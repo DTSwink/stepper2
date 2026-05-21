@@ -132,6 +132,31 @@ def foot_lowest_heights_and_points(
     return torch.stack(heights, dim=-1), torch.stack(points, dim=1)
 
 
+def lowest_foot_indices(
+    positions: torch.Tensor,
+    rotations: torch.Tensor,
+    foot_indices: tuple[int, int],
+    toe_indices: tuple[int, int],
+    cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
+) -> torch.Tensor:
+    heights, _points = foot_lowest_heights_and_points(positions, rotations, foot_indices, toe_indices, cfg)
+    return heights.argmin(dim=-1)
+
+
+def planted_foot_values(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    rotations: torch.Tensor,
+    foot_indices: tuple[int, int],
+    toe_indices: tuple[int, int],
+    cfg: ContactGeometryConfig = DEFAULT_GEOMETRY,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    heights, _points = foot_lowest_heights_and_points(positions, rotations, foot_indices, toe_indices, cfg)
+    planted = heights.argmin(dim=-1)
+    selected = values.gather(-1, planted.unsqueeze(-1)).squeeze(-1)
+    return selected, planted, heights
+
+
 def _rect_min_distance(
     a: torch.Tensor,
     b: torch.Tensor,

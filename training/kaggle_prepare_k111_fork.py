@@ -289,8 +289,7 @@ def main() -> None:
             / "checkpoint_best_k64.pt"
         ),
     )
-    parser.add_argument("--footslide-weight", default="0.10")
-    parser.add_argument("--footslide-threshold-mps", default=None)
+    parser.add_argument("--slide-excess-weight", default="0.10")
     parser.add_argument("--learning-rate", default="1e-6")
     parser.add_argument("--resume-optimizer", action="store_true")
     parser.add_argument("--kaggle-periodic-folder-path", default=None)
@@ -361,14 +360,12 @@ def main() -> None:
 
     notebook_path = kernel_dir / "stepper_k111_fork.ipynb"
     env_vars = {
-        "STEPPER_FOOTSLIDE_WEIGHT": str(args.footslide_weight),
+        "STEPPER_SLIDE_EXCESS_WEIGHT": str(args.slide_excess_weight),
         "STEPPER_LEARNING_RATE": str(args.learning_rate),
         "STEPPER_PRIOR_CHECKPOINT": kaggle_payload_path(prior_checkpoint),
         "STEPPER_RESUME_CHECKPOINT": kaggle_payload_path(resume_checkpoint),
         "STEPPER_RESUME_OPTIMIZER": "1" if args.resume_optimizer else "0",
     }
-    if args.footslide_threshold_mps is not None:
-        env_vars["STEPPER_FOOTSLIDE_THRESHOLD_MPS"] = str(args.footslide_threshold_mps)
     if extra_prior_checkpoints:
         env_vars["STEPPER_EXTRA_PRIOR_CHECKPOINTS"] = ";".join(
             kaggle_payload_path(path) for path in extra_prior_checkpoints
