@@ -230,3 +230,22 @@
   - One-step viewer metrics: mean `0.000011 m`, max frame-mean `0.000048 m`.
   - Autoregressive viewer metrics over the whole walk: mean `0.000262 m`, max `0.000660 m`.
   - Unfloored one-step rotation angle: mean `0.000354 deg`, max `0.0685 deg`.
+
+## 2026-05-22 Simple Agent IO Autoencoder
+
+- Added `train_simple_autoencoder.py` as a clean replacement experiment for the clogged AE files.
+- Feature definition is intentionally minimal:
+  - exact controller input (`current pose`, `previous pose`, pose delta, root/future root features);
+  - exact supervised controller target output (`next pose output`);
+  - AE target is the same concatenated vector.
+- No compatibility head, denoising branch, contact logic, windowing, model-aware loop, or foot-slide losses.
+- Walk_F sanity run:
+  - Run: `20260522_013146_ik_simple_ae_walkF_probe`.
+  - Feature rows: `119`; feature dim: `413`; latent dim: `32`.
+  - Best validation reconstruction at step `750`: `0.004462` normalized MSE.
+  - Synthetic diagnostic at best step:
+    - slight noise: `1.51x` clean;
+    - bad statue/no-next-motion: `5.87x` clean;
+    - bad shuffled output: `78.46x` clean;
+    - random noise: `280.45x` clean.
+- Interpretation: the plain bottleneck AE does reconstruct clean rows and its old-style bad synthetic metric separates bad rows from clean rows on the mini Walk_F test.
