@@ -53,7 +53,7 @@ class SimpleAEConfig:
     val_fraction: float = VAL_FRACTION
     seed: int = SEED
     pose_representation: str = tl.IK_POSE_REPRESENTATION
-    feature: str = "agent_input_plus_target_output"
+    feature: str = "controller_input_plus_target_output"
 
 
 class SimpleAutoencoder(nn.Module):
@@ -164,7 +164,7 @@ def feature_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, object
     input_root_start = pose_dim * 2 + velocity_dim
     input_root_end = input_dim
     return {
-        "feature": "agent_input_plus_target_output",
+        "feature": "controller_input_plus_target_output",
         "total_dim": int(input_dim + output_dim),
         "input_dim": int(input_dim),
         "output_dim": int(output_dim),
@@ -180,7 +180,7 @@ def feature_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, object
 
 
 @torch.no_grad()
-def collect_agent_features(
+def collect_controller_features(
     clips: list[tl.MotionClip],
     locomotion_cfg: tl.TrainConfig,
     device: torch.device,
@@ -198,9 +198,9 @@ def collect_agent_features(
         prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
         cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
         target_pose = tl.get_pose_from_clip(clip, target_idx, device)
-        agent_input = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, locomotion_cfg, device)
-        agent_target = tl.pose_target_output(target_pose)
-        chunks.append(torch.cat((agent_input, agent_target), dim=-1).detach().cpu())
+        controller_input = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, locomotion_cfg, device)
+        target_output = tl.pose_target_output(target_pose)
+        chunks.append(torch.cat((controller_input, target_output), dim=-1).detach().cpu())
         clip_chunks.append(torch.full((cur_idx.numel(),), clip_id, dtype=torch.long))
         idx_chunks.append(cur_idx.detach().cpu())
     if not chunks:
@@ -334,7 +334,7 @@ def checkpoint_payload(
     metadata: dict[str, object],
 ) -> dict[str, object]:
     return {
-        "kind": "simple_agent_io_autoencoder",
+        "kind": "simple_controller_io_autoencoder",
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": asdict(cfg),
@@ -349,7 +349,7 @@ def checkpoint_payload(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Simple IK agent-input plus output autoencoder.")
+    parser = argparse.ArgumentParser(description="Simple IK controller-input plus output autoencoder.")
     parser.add_argument("--npz", default=None, help="NPZ file/folder or semicolon-separated NPZ list.")
     parser.add_argument("--periodic-folder", default=None, help="Periodic NPZ folder/list.")
     parser.add_argument("--nonperiodic-folder", default=None, help="Nonperiodic NPZ folder/list.")
@@ -367,7 +367,7 @@ def main() -> None:
     locomotion_cfg = make_locomotion_cfg(device)
     specs = resolve_clip_specs(args.npz, args.periodic_folder, args.nonperiodic_folder)
     clips = load_clips(specs, locomotion_cfg)
-    raw_features, clip_ids, cur_indices, schema = collect_agent_features(clips, locomotion_cfg, device)
+    raw_features, clip_ids, cur_indices, schema = collect_controller_features(clips, locomotion_cfg, device)
     x_cpu, mean_cpu, std_cpu = normalize_features(raw_features, cfg.std_floor)
     x = x_cpu.to(device)
     mean = mean_cpu.to(device)
