@@ -38,6 +38,7 @@ USE_CUDA_GRAPH = True
 USE_CUDA_AMP = True
 RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 DEFAULT_WALK_F = PROJECT_ROOT / "ue5" / "animations_omni_only_full" / "npz_final" / "M_Neutral_Walk_Loop_F.npz"
+TB_DIR_NAME = "tb"
 
 
 StartPool = tuple[torch.Tensor, torch.Tensor]
@@ -293,6 +294,22 @@ def make_adamw(
         if device.type != "cuda":
             kwargs.pop("capturable", None)
         return torch.optim.AdamW(params, **kwargs)
+
+
+def make_summary_writer(run_dir: Path) -> tuple[SummaryWriter, Path]:
+    tb_dir = run_dir / TB_DIR_NAME
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(tb_dir), flush_secs=1), tb_dir
+
+
+def assert_tensorboard_event_file(tb_dir: Path) -> None:
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline:
+        event_files = list(tb_dir.glob("events.out.tfevents*"))
+        if any(path.stat().st_size > 0 for path in event_files):
+            return
+        time.sleep(0.05)
+    raise RuntimeError(f"TensorBoard event file was not created in {tb_dir}")
 
 
 def payload_slice(store: rollout_data.ClipStore) -> slice:
@@ -728,6 +745,7 @@ def main() -> None:
             {"path": str(path.parent), "cyclic": bool(cyclic)}
             for path, cyclic in clip_specs
         ],
+        "tensorboard_logdir": str(run_dir / TB_DIR_NAME),
         "policy": {
             "pose_representation": "ik_markers",
             "gpu_resident_rollout": True,
@@ -762,8 +780,16 @@ def main() -> None:
     }
     config_payload = {"config": asdict(cfg), "metadata": metadata}
     (run_dir / "config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
-    writer = SummaryWriter(log_dir=str(run_dir))
+    writer, tb_dir = make_summary_writer(run_dir)
+    print(f"tensorboard_logdir={tb_dir}", flush=True)
     writer.add_text("config/json", f"```json\n{json.dumps(config_payload, indent=2)}\n```", 0)
+    writer.add_text("run/id", run_id, 0)
+    writer.add_scalar("run/started", 1.0, 0)
+    writer.add_scalar("curriculum/rollout_k", int(ROLLOUT_SCHEDULE[0]), 0)
+    writer.add_scalar("train/effective_rollout_k_mean", float(ROLLOUT_SCHEDULE[0]), 0)
+    writer.add_scalar("train/effective_rollout_k_max", float(ROLLOUT_SCHEDULE[0]), 0)
+    writer.flush()
+    assert_tensorboard_event_file(tb_dir)
 
     best = float("inf")
     start = time.perf_counter()
@@ -832,6 +858,7 @@ def main() -> None:
 
     last = save_named_checkpoint(run_dir, run_id, "last", model, optimizer, TRAIN_STEPS, best, cfg, metadata)
     writer.close()
+    assert_tensorboard_event_file(tb_dir)
     print(f"saved {last}", flush=True)
 
 
