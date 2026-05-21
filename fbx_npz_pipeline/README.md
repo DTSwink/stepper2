@@ -31,12 +31,25 @@ or with the wrapper:
 .\fbx_npz_pipeline\convert_fbx_to_npz.ps1 C:\path\to\anim.fbx
 ```
 
-The default outputs are:
+The default raw outputs are:
 
 ```text
 data/npz/<clip>.npz
 data/reports/<clip>.json
 ```
+
+The wrappers then build the training artifact:
+
+```text
+data/npz_final/<clip>.npz
+```
+
+`npz_final` is deliberately a model-space artifact. After pruning, the pipeline
+bakes the motion to the fixed-offset model contract and then to the Payload42 IK
+fixed point. The final file stores authoritative `model_*` arrays in canonical
+meters plus `model_ik_payload`, so loading the NPZ and decoding it through the
+IK model reconstructs the stored model motion exactly. The FBX-style arrays are
+kept only as viewer/debug mirrors of that model motion.
 
 ## Saved Arrays
 
@@ -48,13 +61,14 @@ data/reports/<clip>.json
 - `local_translation [T, J, 3]`: local translation, including root motion.
 - `global_joint_pos [T, J, 3]`: global joint positions for losses/debugging.
 
-For game fidelity, first validate:
+For raw FBX fidelity, validate the unbaked `data/npz` file:
 
 ```text
 FBX -> NPZ -> FBX
 ```
 
-in Unreal/Cascadeur before training a model.
+in Unreal/Cascadeur. For training, validate `npz_final` with the IK round-trip
+checker instead.
 
 ## Viewing NPZ Files
 
@@ -83,18 +97,28 @@ is applied as `R_canonical = P^-1 R_source P`. Foot and hand collider axes are
 chosen from the actual bone basis and nearby anatomy instead of assuming one
 fixed Cascadeur bone-axis layout.
 
-## Foot Contact Metrics
+## Model Reconstruction
 
-Contact generation stores both height and slide diagnostics, but they are not
-the same point calculation:
+The final bake removes stale contact arrays and stale raw FBX Euler/quaternion
+arrays. This avoids two authorities disagreeing inside the same `npz_final`
+file. The active reconstruction authority is:
 
-- `contact_height_m` and `contact_lowest_point_m` come from the absolute lowest
-  point on either the foot collider or toe collider. This is the value used for
-  contact height, hovering, and penetration checks.
-- `contact_speed_mps` comes from `contact_slide_distance_m`. That slide distance
-  is the minimum 2D ground-plane displacement over every same-local-point on the
-  continuous foot sole rectangle and toe sole rectangle, then the smaller foot
-  vs toe result is used. It is not based on the lowest collider point.
+```text
+model_global_joint_pos_m
+model_global_matrix
+model_local_matrix
+model_local_rotation_6d
+model_lcl_translation_m
+model_default_lcl_translation_m
+model_ik_payload
+model_ik_*
+```
+
+Validate a final file with:
+
+```powershell
+.\.tools\python310\python.exe .\training\ik\roundtrip_check.py --npz .\data\npz_final\<clip>.npz
+```
 
 ## Rebuilding FBX Files
 

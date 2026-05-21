@@ -639,6 +639,31 @@ def clean_ik_payload(payload: torch.Tensor) -> torch.Tensor:
     return torch.cat(parts, dim=-1)
 
 
+def split_ik_payload(payload: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if payload.shape[-1] != IK_PAYLOAD_DIM:
+        raise ValueError(f"IK payload must have {IK_PAYLOAD_DIM} dims, got {payload.shape[-1]}")
+    ee_pos: list[torch.Tensor] = []
+    ee_rot6: list[torch.Tensor] = []
+    pole: list[torch.Tensor] = []
+    toe: list[torch.Tensor] = []
+    for spec in IK_PAYLOAD_SLICES:
+        pos_slice = spec["pos"]
+        rot_slice = spec["rot6"]
+        pole_slice = spec["pole"]
+        toe_slice = spec["toe_float"]
+        assert isinstance(pos_slice, slice)
+        assert isinstance(rot_slice, slice)
+        assert isinstance(pole_slice, slice)
+        ee_pos.append(payload[:, pos_slice])
+        ee_rot6.append(payload[:, rot_slice])
+        pole.append(payload[:, pole_slice].squeeze(-1))
+        if toe_slice is not None:
+            assert isinstance(toe_slice, slice)
+            toe.append(payload[:, toe_slice].squeeze(-1))
+    toe_tensor = torch.stack(toe, dim=1) if toe else payload.new_empty((payload.shape[0], 0))
+    return torch.stack(ee_pos, dim=1), torch.stack(ee_rot6, dim=1), torch.stack(pole, dim=1), toe_tensor
+
+
 class MotionClip:
     def __init__(self, path: Path, cfg: TrainConfig, cyclic_animation: bool | None = None):
         arrays = np.load(path)
@@ -685,26 +710,46 @@ class MotionClip:
             parents_body.append(full_to_body.get(parent, -1))
         self.parents_body = torch.tensor(parents_body, dtype=torch.long)
 
-        global_pos_full = canonicalize_positions(
-            torch.tensor(arrays["global_joint_pos"], dtype=torch.float32) * cfg.position_unit_scale,
-            self.source_up_axis,
+        has_model_space = all(
+            key in arrays.files
+            for key in (
+                "model_global_joint_pos_m",
+                "model_global_matrix",
+                "model_local_matrix",
+                "model_lcl_translation_m",
+                "model_default_lcl_translation_m",
+            )
         )
-        global_rot_full = canonicalize_rotations(
-            torch.tensor(arrays["global_matrix"][:, :, :3, :3], dtype=torch.float32),
-            self.source_up_axis,
-        )
-        local_rot_full = canonicalize_rotations(
-            torch.tensor(arrays["local_matrix"][:, :, :3, :3], dtype=torch.float32),
-            self.source_up_axis,
-        )
-        lcl_translation_full = canonicalize_positions(
-            torch.tensor(arrays["fbx_lcl_translation"], dtype=torch.float32) * cfg.position_unit_scale,
-            self.source_up_axis,
-        )
-        default_lcl_translation_full = (
-            torch.tensor(arrays["default_lcl_translation"], dtype=torch.float32) * cfg.position_unit_scale
-        )
-        default_lcl_translation_full = canonicalize_positions(default_lcl_translation_full, self.source_up_axis)
+        model_local_rot6_full = None
+        if has_model_space:
+            global_pos_full = torch.tensor(arrays["model_global_joint_pos_m"], dtype=torch.float32)
+            global_rot_full = torch.tensor(arrays["model_global_matrix"][:, :, :3, :3], dtype=torch.float32)
+            local_rot_full = torch.tensor(arrays["model_local_matrix"][:, :, :3, :3], dtype=torch.float32)
+            lcl_translation_full = torch.tensor(arrays["model_lcl_translation_m"], dtype=torch.float32)
+            default_lcl_translation_full = torch.tensor(arrays["model_default_lcl_translation_m"], dtype=torch.float32)
+            if "model_local_rotation_6d" in arrays.files:
+                model_local_rot6_full = torch.tensor(arrays["model_local_rotation_6d"], dtype=torch.float32)
+        else:
+            global_pos_full = canonicalize_positions(
+                torch.tensor(arrays["global_joint_pos"], dtype=torch.float32) * cfg.position_unit_scale,
+                self.source_up_axis,
+            )
+            global_rot_full = canonicalize_rotations(
+                torch.tensor(arrays["global_matrix"][:, :, :3, :3], dtype=torch.float32),
+                self.source_up_axis,
+            )
+            local_rot_full = canonicalize_rotations(
+                torch.tensor(arrays["local_matrix"][:, :, :3, :3], dtype=torch.float32),
+                self.source_up_axis,
+            )
+            lcl_translation_full = canonicalize_positions(
+                torch.tensor(arrays["fbx_lcl_translation"], dtype=torch.float32) * cfg.position_unit_scale,
+                self.source_up_axis,
+            )
+            default_lcl_translation_full = (
+                torch.tensor(arrays["default_lcl_translation"], dtype=torch.float32) * cfg.position_unit_scale
+            )
+            default_lcl_translation_full = canonicalize_positions(default_lcl_translation_full, self.source_up_axis)
 
         root_index = self.bone_names.index("root")
         self.root_pos = global_pos_full[:, root_index]
@@ -718,7 +763,10 @@ class MotionClip:
         self.global_pos = global_pos_full.index_select(1, keep)
         self.global_rot = global_rot_full.index_select(1, keep)
         self.local_rot = local_rot_full.index_select(1, keep)
-        self.local_rot6 = rotmat_to_6d(self.local_rot)
+        if model_local_rot6_full is not None:
+            self.local_rot6 = model_local_rot6_full.index_select(1, keep)
+        else:
+            self.local_rot6 = rotmat_to_6d(self.local_rot)
         self.local_offsets = default_lcl_translation_full.index_select(0, keep)
         self.pelvis_local_pos = lcl_translation_full[:, self.keep_full[self.pelvis]]
         self.pelvis_rot_mat = self.local_rot[:, self.pelvis]
@@ -899,6 +947,34 @@ class MotionClip:
             self.ik_toe_offsets = torch.stack(toe_offset_chunks, dim=0)
             self.ik_toe_axis = torch.stack(toe_axis_chunks, dim=0)
             self.ik_marker_pos = self.root_relative_pos.index_select(1, self.ik_marker_indices_tensor)
+            if "model_ik_payload" in arrays.files:
+                required = (
+                    "model_ik_rest_axis",
+                    "model_ik_rest_pole",
+                    "model_ik_limb_lengths",
+                    "model_ik_local_pole_axis",
+                    "model_ik_toe_offsets",
+                    "model_ik_toe_axis",
+                )
+                missing = [key for key in required if key not in arrays.files]
+                if missing:
+                    raise ValueError(f"{path} is missing model IK metadata: {missing}")
+                model_payload = torch.tensor(arrays["model_ik_payload"], dtype=torch.float32)
+                if model_payload.shape != (self.T, IK_PAYLOAD_DIM):
+                    raise ValueError(
+                        f"{path} model_ik_payload shape {tuple(model_payload.shape)} "
+                        f"does not match {(self.T, IK_PAYLOAD_DIM)}"
+                    )
+                self.ik_payload = model_payload
+                self.ik_ee_pos_root, self.ik_ee_rot6_root, self.ik_pole_float, self.ik_toe_float = split_ik_payload(
+                    self.ik_payload
+                )
+                self.ik_rest_axis = torch.tensor(arrays["model_ik_rest_axis"], dtype=torch.float32)
+                self.ik_rest_pole = torch.tensor(arrays["model_ik_rest_pole"], dtype=torch.float32)
+                self.ik_limb_lengths = torch.tensor(arrays["model_ik_limb_lengths"], dtype=torch.float32)
+                self.ik_local_pole_axis = torch.tensor(arrays["model_ik_local_pole_axis"], dtype=torch.float32)
+                self.ik_toe_offsets = torch.tensor(arrays["model_ik_toe_offsets"], dtype=torch.float32)
+                self.ik_toe_axis = torch.tensor(arrays["model_ik_toe_axis"], dtype=torch.float32)
 
         self.J = len(self.body_names)
         self.Jn = len(self.non_pelvis)

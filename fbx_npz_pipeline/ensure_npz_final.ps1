@@ -11,7 +11,8 @@ $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Python = Join-Path $ProjectRoot ".tools\python310\python.exe"
 $Converter = Join-Path $PSScriptRoot "fbx_to_npz.py"
 $Pruner = Join-Path $PSScriptRoot "prune_npz_skeleton.py"
-$Contacts = Join-Path $PSScriptRoot "add_foot_contacts.py"
+$ModelBake = Join-Path $PSScriptRoot "make_model_reconstructable_npz.py"
+$IkBake = Join-Path $PSScriptRoot "bake_ik_reconstructable_npz.py"
 
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Local Python was not found at $Python"
@@ -50,8 +51,10 @@ if (Test-Path -LiteralPath $FinalDir) {
 }
 
 if ($FinalFiles.Count -gt 0 -and -not $Force) {
-    Write-Output "Refreshing foot contacts -> $FinalDir"
-    & $Python $Contacts $FinalDir --report (Join-Path $ReportDir "contacts")
+    Write-Output "Refreshing model-reconstructable NPZs -> $FinalDir"
+    & $Python $ModelBake $FinalDir -o $FinalDir --report (Join-Path $ReportDir "model_reconstructable")
+    Write-Output "Refreshing Payload42 IK fixed-point NPZs -> $FinalDir"
+    & $Python $IkBake $FinalDir -o $FinalDir --report (Join-Path $ReportDir "ik_reconstructable")
     Write-Output "Using existing npz_final: $FinalDir"
     Write-Output "NPZ_FINAL_DIR=$FinalDir"
     return
@@ -69,7 +72,10 @@ foreach ($Fbx in $FbxFiles) {
 Write-Output "Pruning raw NPZ folder -> $FinalDir"
 & $Python $Pruner $RawDir -o $FinalDir --report (Join-Path $ReportDir "pruned")
 
-Write-Output "Adding foot contacts -> $FinalDir"
-& $Python $Contacts $FinalDir --report (Join-Path $ReportDir "contacts")
+Write-Output "Baking model-reconstructable NPZs -> $FinalDir"
+& $Python $ModelBake $FinalDir -o $FinalDir --report (Join-Path $ReportDir "model_reconstructable")
+
+Write-Output "Baking Payload42 IK fixed-point NPZs -> $FinalDir"
+& $Python $IkBake $FinalDir -o $FinalDir --report (Join-Path $ReportDir "ik_reconstructable")
 
 Write-Output "NPZ_FINAL_DIR=$FinalDir"

@@ -29,13 +29,23 @@ def max_pos(pos: torch.Tensor, gt: torch.Tensor, bone: int) -> float:
 
 
 def max_rot(rot: torch.Tensor, gt: torch.Tensor, bone: int) -> float:
-    err = tl.geodesic_angles(rot[:, bone], gt[:, bone]).max()
+    err = exact_geodesic_angles(rot[:, bone], gt[:, bone]).max()
     return float((err * 180.0 / math.pi).detach().cpu())
 
 
 def frame0_rot(rot: torch.Tensor, gt: torch.Tensor, bone: int) -> float:
-    err = tl.geodesic_angles(rot[:1, bone], gt[:1, bone])[0]
+    err = exact_geodesic_angles(rot[:1, bone], gt[:1, bone])[0]
     return float((err * 180.0 / math.pi).detach().cpu())
+
+
+def exact_geodesic_angles(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    equal = (pred - target).abs().amax(dim=(-1, -2)) <= 1e-7
+    pred_clean = tl.rotation_6d_to_matrix(tl.rotmat_to_6d(pred))
+    target_clean = tl.rotation_6d_to_matrix(tl.rotmat_to_6d(target))
+    delta = pred_clean @ target_clean.transpose(-1, -2)
+    trace = delta.diagonal(dim1=-1, dim2=-2).sum(dim=-1)
+    cos = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    return torch.where(equal, torch.zeros_like(cos), torch.acos(cos))
 
 
 def main() -> None:
