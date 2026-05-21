@@ -210,3 +210,23 @@
   - Checkpoints:
     - `training/runs/20260521_233943_ik_walkF_payload42_staged/checkpoints/20260521_233943_ik_walkF_payload42_staged_best.pt`
     - `training/runs/20260521_233943_ik_walkF_payload42_staged/checkpoints/20260521_233943_ik_walkF_payload42_staged_last.pt`
+
+## 2026-05-22 K1 Reconstruction Fix
+
+- User-visible issue: the staged Payload42 controller learned the walk shape but did not reconstruct even one step tightly enough in the HTML viewer.
+- Diagnosis:
+  - Long K=1 run with the previous absolute-output trainer plateaued around `0.00176 m` best mean joint error.
+  - GT IK target payload still decoded to near-zero position error, so the representation was not the blocker.
+  - Deterministic residual one-step fitting reached effectively zero, while fp16 autocast plateaued at millimeter scale.
+- Trainer changes:
+  - IK supervised controller now predicts residuals from the current pose (`predict_residual=True`, zero-initialized output).
+  - Supervised loss now applies the same residual convention as rollout/evaluation.
+  - AMP is disabled for this IK supervised path because residual deltas need fp32 precision.
+  - Tiny datasets now use a true full batch when the requested batch covers the whole start pool, instead of sampling rows with replacement.
+  - Added hardcoded per-stage LR decays and graph recapture at decay points.
+- Verification run:
+  - Run: `20260522_011428_ik_walkF_k1_residual_fixed`.
+  - Best checkpoint: `training/runs/20260522_011428_ik_walkF_k1_residual_fixed/checkpoints/20260522_011428_ik_walkF_k1_residual_fixed_best.pt`.
+  - One-step viewer metrics: mean `0.000011 m`, max frame-mean `0.000048 m`.
+  - Autoregressive viewer metrics over the whole walk: mean `0.000262 m`, max `0.000660 m`.
+  - Unfloored one-step rotation angle: mean `0.000354 deg`, max `0.0685 deg`.

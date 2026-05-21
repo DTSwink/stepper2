@@ -35,7 +35,8 @@ NUM_HIDDEN_LAYERS = 2
 ROOT_LOOKAHEAD_STEPS = 1
 VALIDATION_ROWS = 2048
 USE_CUDA_GRAPH = True
-USE_CUDA_AMP = True
+USE_CUDA_AMP = False
+LR_STAGE_DECAYS = ((0.60, 1.0 / 3.0), (0.85, 0.1))
 RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 DEFAULT_WALK_F = PROJECT_ROOT / "ue5" / "animations_omni_only_full" / "npz_final" / "M_Neutral_Walk_Loop_F.npz"
 TB_DIR_NAME = "tb"
@@ -48,8 +49,8 @@ def make_cfg(device: torch.device) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     cfg.pose_representation = "ik_markers"
     cfg.cyclic_animation = True
-    cfg.predict_residual = False
-    cfg.zero_init_output = False
+    cfg.predict_residual = True
+    cfg.zero_init_output = True
     cfg.hidden_dim = HIDDEN_DIM
     cfg.num_hidden_layers = NUM_HIDDEN_LAYERS
     cfg.learning_rate = LEARNING_RATE
@@ -224,7 +225,17 @@ def sample_start_pool(
     pool_max_starts: torch.Tensor,
     batch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = torch.randint(0, pool_clip_ids.numel(), (max(1, int(batch_size)),), device=pool_clip_ids.device)
+    batch_size = max(1, int(batch_size))
+    total_rows = int(pool_max_starts.sum().detach().cpu())
+    if batch_size == total_rows:
+        clip_chunks: list[torch.Tensor] = []
+        start_chunks: list[torch.Tensor] = []
+        for clip_id, max_start in zip(pool_clip_ids.tolist(), pool_max_starts.tolist()):
+            starts = torch.arange(1, int(max_start) + 1, dtype=torch.long, device=pool_clip_ids.device)
+            clip_chunks.append(torch.full_like(starts, int(clip_id)))
+            start_chunks.append(starts)
+        return torch.cat(clip_chunks, dim=0), torch.cat(start_chunks, dim=0)
+    rows = torch.randint(0, pool_clip_ids.numel(), (batch_size,), device=pool_clip_ids.device)
     clip_ids = pool_clip_ids.index_select(0, rows)
     max_starts = pool_max_starts.index_select(0, rows)
     starts = (torch.rand(rows.shape[0], device=pool_clip_ids.device) * max_starts.float()).floor().long() + 1
@@ -296,6 +307,20 @@ def make_adamw(
         return torch.optim.AdamW(params, **kwargs)
 
 
+def stage_learning_rate(base_lr: float, stage_step: int, stage_steps: int) -> float:
+    progress = float(max(0, int(stage_step) - 1)) / float(max(1, int(stage_steps) - 1))
+    lr = float(base_lr)
+    for threshold, multiplier in LR_STAGE_DECAYS:
+        if progress >= float(threshold):
+            lr = float(base_lr) * float(multiplier)
+    return lr
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
 def make_summary_writer(run_dir: Path) -> tuple[SummaryWriter, Path]:
     tb_dir = run_dir / TB_DIR_NAME
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -346,11 +371,20 @@ def predicted_state_from_raw(
     return vec, pelvis_pos, payload
 
 
-def model_forward(model: torch.nn.Module, inp: torch.Tensor) -> torch.Tensor:
+def model_forward(
+    model: torch.nn.Module,
+    inp: torch.Tensor,
+    cur_vec: torch.Tensor,
+    cfg: tl.TrainConfig,
+) -> torch.Tensor:
     if USE_CUDA_AMP and inp.is_cuda:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
-            return model(inp).float()
-    return model(inp)
+            raw = model(inp).float()
+    else:
+        raw = model(inp)
+    if cfg.predict_residual:
+        raw = cur_vec + raw
+    return raw
 
 
 def build_ik_input(
@@ -402,7 +436,7 @@ def supervised_rollout_loss(
             cur_markers,
             cfg,
         )
-        raw = model_forward(model, inp)
+        raw = model_forward(model, inp, cur_vec, cfg)
         target_idx = cur_idx + 1
         target = store.get_target_output(clip_ids, target_idx)
         row_loss = (raw - target).square().mean(dim=-1)
@@ -457,7 +491,7 @@ def supervised_rollout_loss_static(
             cur_markers,
             cfg,
         )
-        raw = model_forward(model, inp)
+        raw = model_forward(model, inp, cur_vec, cfg)
         active = effective_k > step
         target_idx = torch.where(active, cur_idx + 1, cur_idx)
         target = store.get_target_output(clip_ids, target_idx)
@@ -753,6 +787,7 @@ def main() -> None:
             "mixed_rollout_at_max": True,
             "training_step": "staged_cuda_graph_static_masked" if USE_CUDA_GRAPH and device.type == "cuda" else "staged_eager",
             "cuda_amp": bool(USE_CUDA_AMP and device.type == "cuda"),
+            "stage_lr_decays": [(float(t), float(m)) for t, m in LR_STAGE_DECAYS],
             "cyclic": True,
             "checkpoint_naming": "YYYYMMDD_HHMMSS_ik_<label>_<tag>.pt",
             "ik_payload_dim": int(clips[0].ik_payload_dim),
@@ -794,10 +829,18 @@ def main() -> None:
     best = float("inf")
     start = time.perf_counter()
     current_stage_k = -1
+    current_lr = None
     stepper: EagerSupervisedStep | CudaGraphSupervisedStep | None = None
     for step in range(1, TRAIN_STEPS + 1):
         stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(step)
-        if stage_k != current_stage_k:
+        stage_step = step - stage_start + 1
+        stage_steps = stage_end - stage_start + 1
+        lr = stage_learning_rate(LEARNING_RATE, stage_step, stage_steps)
+        lr_changed = current_lr is None or abs(float(lr) - float(current_lr)) > 1e-16
+        if lr_changed:
+            set_optimizer_lr(optimizer, lr)
+            current_lr = float(lr)
+        if stage_k != current_stage_k or lr_changed:
             cache = stage_cache[int(stage_k)]
             stepper = make_supervised_stepper(
                 model,
@@ -812,7 +855,7 @@ def main() -> None:
             print(
                 f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} "
                 f"K={stage_k} steps={stage_start}-{stage_end} "
-                f"batch={int(cache['batch_size'])} stepper={stepper.kind}",
+                f"batch={int(cache['batch_size'])} lr={float(current_lr):.3g} stepper={stepper.kind}",
                 flush=True,
             )
         assert stepper is not None
@@ -841,7 +884,7 @@ def main() -> None:
                 f"K={stage_k} "
                 f"rollout_mean_m={mean_err:.6f} rollout_max_m={max_err:.6f} best_m={best_to_log:.6f} "
                 f"effK_mean={rollout_stats['effective_k_mean']:.2f} effK_max={rollout_stats['effective_k_max']:.0f} "
-                f"elapsed_s={elapsed:.1f}",
+                f"lr={float(current_lr):.3g} elapsed_s={elapsed:.1f}",
                 flush=True,
             )
             writer.add_scalar("train/loss", float(loss.detach().cpu()), step)
