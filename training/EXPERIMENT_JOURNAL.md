@@ -985,6 +985,77 @@ Full scratch run:
 - Best checkpoint: `C:\Users\singerie\Documents\Cursor\stepper\training\runs\20260521_093649_walkF_supervised_cachedgt_scratch\checkpoints\checkpoint_best_k32.pt`
 - This run is added to the existing TensorBoard compare folder without flushing older runs.
 
+## Idle Recovery One-Planted Loss Lab
+
+Goal:
+
+- Solve the foot-sliding issue in a contained fast idle-recovery lab.
+- Start from walk-forward poses, target idle, keep the simple conditional-root AE as stabilizer.
+- Validate first on the two selected walk-forward starts, then on random full-dataset starts.
+- Desired behavior: one foot may move, but both feet should not move together; at least one foot is always planted.
+
+Contained runner:
+
+`C:\Users\singerie\Documents\Cursor\stepper\training\idle_recovery_slide_lab.py`
+
+Important metric contract:
+
+| Metric | Pass line |
+| --- | ---: |
+| final joint RMSE to idle | `<= 0.075 m` |
+| both-feet-moving rate | `<= 0.05` |
+| both-feet-low-and-moving rate | `<= 0.02` |
+| planted-foot availability | `>= 0.90` |
+| left solo / right solo motion | each `>= 0.05` |
+
+What worked:
+
+- K32 can hit either target recovery or clean feet, but it kept trading one for the other on random full-dataset starts.
+- K64 is the natural horizon for the strict one-planted rule; it gives the controller enough time to move one foot, settle it, then move the other.
+- The useful new loss term is not another threshold flag. It is a smooth one-foot rule:
+  - penalize `left_speed * right_speed`, so one foot can move fast only when the other is slow;
+  - add a contact-aware version of the same product, so "both feet low and moving" is punished harder than airborne swing.
+- The final polish used mixed fixed+random init batches so the two hand-picked walk starts and random starts had to pass together.
+
+Best run:
+
+`C:\Users\singerie\Documents\Cursor\stepper\training\runs\20260521_143000_idle_recovery_k64_mixed_polish_v18`
+
+Best checkpoint:
+
+`C:\Users\singerie\Documents\Cursor\stepper\training\runs\20260521_143000_idle_recovery_k64_mixed_polish_v18\checkpoints\checkpoint_best.pt`
+
+Recipe at the successful checkpoint:
+
+- Rollout K: `64`
+- Init mix: half fixed two walk-forward starts, half random full-dataset starts
+- AE stabilizer: `0.3`
+- Slide loss: `6`
+- both-fast loss: `2`
+- speed-product loss: `0.08`
+- both-ground-product loss: `1.5`
+- foot-plan loss: `25`
+- target loss: `0.2`
+- terminal target loss: `70`
+- target foot global weight: `0.5`
+
+Independent reload check for the saved best checkpoint:
+
+| Eval batch | success | final RMSE | both-moving | both-low-moving | planted | solo left/right |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed two walk starts | `1` | `0.07446` | `0.008` | `0.008` | `1.000` | `0.070 / 0.281` |
+| random seed 1234 | `1` | `0.07198` | `0.012` | `0.009` | `0.997` | `0.124 / 0.114` |
+| random seed 2345 | `1` | `0.07480` | `0.014` | `0.010` | `0.994` | `0.140 / 0.127` |
+| random seed 3456 | `1` | `0.06953` | `0.017` | `0.013` | `1.000` | `0.082 / 0.114` |
+| random seed 4567 | `1` | `0.07163` | `0.018` | `0.015` | `0.999` | `0.100 / 0.131` |
+| random seed 5678 | close miss | `0.07577` | `0.028` | `0.022` | `0.997` | `0.123 / 0.208` |
+
+Read:
+
+- This is the first checkpoint that passes the official fixed+random metric contract and visibly follows the one-foot-at-a-time rule.
+- The extra random seed 5678 miss is tiny, but it is still a miss; do not call this exhaustive full-dataset proof.
+- The failed hard-seed polish run `20260521_144000_idle_recovery_k64_hardseed_polish_v19` made target recovery worse. Keep `v18` as the answer checkpoint for now.
+
 ## Fresh Context Instructions
 
 If this file is read by a new Codex context:
@@ -1010,3 +1081,4 @@ If this file is read by a new Codex context:
 19. New idle exception: idle envelope bounds are hard-coded to linear `0` and angular `0`; this is an intentional planted-idle rule, not a GT-jitter allowance.
 20. Planted-foot selector changed: the planted foot is now the foot with the lowest custom foot/toe collider point. Linear / foot-slide and angular / yaw both use that same planted foot for envelope building, training loss, viewer diagnostics, and slide/yaw analysis.
 21. Walk-forward supervised scratch baseline is `20260521_093649_walkF_supervised_cachedgt_scratch`; it trained from scratch to K32 with best supervised loss `0.073163`. Fixed GT rotation matrices are cached on clip load and fetched during supervised loss.
+22. Idle recovery one-planted lab success checkpoint is `20260521_143000_idle_recovery_k64_mixed_polish_v18\checkpoints\checkpoint_best.pt`. It uses K64 plus smooth speed-product and contact-aware speed-product losses. It passes the official fixed+random validation; an extra random seed 5678 is a tiny close miss, so treat it as a strong contained solution, not exhaustive proof.
