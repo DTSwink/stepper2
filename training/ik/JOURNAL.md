@@ -13,8 +13,8 @@
   - Generic K32 rollout optimizer step: mean `5083.87 ms` over 3 measured iterations after warmup.
   - Conclusion: single-motion supervised IK runs should start from the supervised rollout path. The generic K-rollout path is roughly 4000x slower for this sanity check and should only be used after a specific rollout-loss need is proven.
 - Course correction: the fast GPU-resident row layout is not a one-clip trick. The IK path now treats it as mandatory for full-dataset work too.
-  - `train_ae_prior.py` forces IK markers, random per-row agents, no legacy contact-physics fallback, and dense multi-clip tensors.
-  - Its agent sampler now samples independent starts for ordinary real batches, not only synthetic/mixed-cohort batches.
+  - `train_ae_prior.py` forces IK markers, random per-row rollout starts, no legacy contact-physics fallback, and dense multi-clip tensors.
+  - Its row sampler now samples independent starts for ordinary real batches, not only synthetic/mixed-cohort batches.
   - `train.py` and `perf_audit.py` accept periodic/nonperiodic dataset folders so the next full-dataset run stays on the same row layout from the first step.
 - Updated performance audit:
   - Single Walk_F, batch 119, K8 rollout state/backward step: mean `357.47 ms`.
@@ -28,7 +28,7 @@
   - Requested empty NPZ folders raise instead of falling back to Walk_F.
   - Missing paths and non-`.npz` files raise.
   - Mixed skeletons raise if either bone names or parent topology differs.
-- Removed the `training_loop`/`agent_sampling` switch from the IK AE-prior entrypoint; it now always builds row-independent agents.
+- Removed the `training_loop`/row-sampling switch from the IK AE-prior entrypoint; it now always builds row-independent rollout batches.
 - Performance audit on full local dataset (`15` periodic + `214` nonperiodic clips, batch `512`):
   - Before position-only FK: K8 rollout state/backward step `586.34 ms`.
   - After position-only FK: K8 `207.82 ms`, K32 `767.82 ms`.
@@ -231,7 +231,7 @@
   - Autoregressive viewer metrics over the whole walk: mean `0.000262 m`, max `0.000660 m`.
   - Unfloored one-step rotation angle: mean `0.000354 deg`, max `0.0685 deg`.
 
-## 2026-05-22 Simple Agent IO Autoencoder
+## 2026-05-22 Simple Controller IO Autoencoder
 
 - Added `train_simple_autoencoder.py` as a clean replacement experiment for the clogged AE files.
 - Feature definition is intentionally minimal:
@@ -249,3 +249,14 @@
     - bad shuffled output: `78.46x` clean;
     - random noise: `280.45x` clean.
 - Interpretation: the plain bottleneck AE does reconstruct clean rows and its old-style bad synthetic metric separates bad rows from clean rows on the mini Walk_F test.
+
+## 2026-05-22 Simple AE Controller Rewrite
+
+- Rewrote `train_simple_ae_controller.py` so the pure-AE controller trainer no longer imports rollout/storage helpers from the older training files.
+- The file now owns its small local clip store, root-feature cache, per-row valid start pools, fractal mixed-K sampler, rollout loss, validation, optimizer setup, and checkpoint policy.
+- Kept `ik_core.py` as the shared IK representation/math layer and `train_simple_autoencoder.py` as the AE definition/checkpoint format.
+- Checkpoint policy now writes `init` before training, `latest` at every log point, `best` on any validation improvement, and `last` at clean completion.
+- Sanity check on Walk_F:
+  - local controller input vs `ik_core.build_input` max abs delta: `5.96e-08`;
+  - one small K=2 pure-AE loss/validation pass completed;
+  - one K=1 FK diagnostic pass completed.
