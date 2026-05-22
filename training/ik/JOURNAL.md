@@ -357,3 +357,36 @@
 - Current recommendation:
   - use K16 foot-delta as the anti-slide winner for inspection;
   - keep full K32 as a cleaner overall rollout candidate, but not the best slide candidate.
+
+## 2026-05-22 Overnight Full-Dataset AE Envelope Setup
+
+- Pushed the contained IK work before starting overnight changes:
+  - `9913f59 Save IK AE training framework`;
+  - `5c694d9 Add IK full AE envelope runner`;
+  - `768770c Make IK full curriculum stall-only`.
+- Rechecked the suspicious one-motion results with vanilla AE:
+  - CircleL foot-delta AR joint error avg `0.2193`, upper-body speed ratio `0.36x`;
+  - CircleL vanilla AR joint error avg `0.0087`, upper-body speed ratio `1.00x`;
+  - TurnL vanilla/foot-delta were close, but CircleL makes vanilla the safer full-dataset reenactment baseline.
+- Added `training/ik/excess_envelope.py`:
+  - IK-local geometry envelope;
+  - situation feature is `[yaw_delta/pi, bend_angle/pi, horizontal_foot_distance_xz_m]`;
+  - horizontal foot distance uses world `X/Z` only, not vertical `Y`;
+  - GT self-values are included in the bound before margin so GT envelope excess is exactly zero.
+- Added `training/ik/train_full_ae_envelope.py`:
+  - full-dataset vanilla AE baseline;
+  - stall-only K curriculum for controller training;
+  - envelope weight calibration from baseline means;
+  - refined continuation from baseline;
+  - final random-init continuation from refined baseline.
+- Smoke checks:
+  - full-dataset envelope rows: `10687`;
+  - GT linear excess mean/p95/max: `0.0/0.0/0.0`;
+  - GT angular excess mean/p95/max: `0.0/0.0/0.0`.
+- First overnight attempt used a safety max-stage timer and advanced K8 by cap; stopped it because that was too close to a fixed stage length.
+- Restarted the real overnight run with stall-only labels:
+  - baseline label `full_vanilla_ae_controller_baseline_stall`;
+  - refined label `full_vanilla_ae_controller_refined_stall`;
+  - final label `full_vanilla_ae_controller_random_init_stall`;
+  - stdout log `training/runs/overnight_ik_ae_envelope_stall_20260522_075753.out.log`;
+  - stderr log `training/runs/overnight_ik_ae_envelope_stall_20260522_075753.err.log`.
