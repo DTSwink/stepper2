@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -30,13 +31,43 @@ SIMPLE_CONTROLLER_AE_KIND = "simple_controller_io_autoencoder"
 LEGACY_SIMPLE_AE_KIND = "simple_" + "ag" + "ent_io_autoencoder"
 
 BATCH_SIZE = 4096
-ROLLOUT_SCHEDULE = (1, 2, 4, 8, 16, 32)
-ROLLOUT_STAGE_STEPS = (1000, 1000, 1500, 2000, 2500, 4000)
+ROLLOUT_SCHEDULE = (1, 2, 8, 16, 32)
+ROLLOUT_STAGE_STEPS = (3000, 1000, 1500, 1500, 2500)
 ROLLOUT_K = 32
-LEARNING_RATE = 3e-4
-LR_STAGE_DECAYS = ((0.70, 0.3), (0.90, 0.1))
+LEARNING_RATE = 1e-4
+STAGE_LEARNING_RATES = {
+    1: 1e-4,
+    2: 8e-5,
+    8: 5e-5,
+    16: 2e-5,
+    32: 1e-5,
+}
 LOG_EVERY = 250
 VALIDATION_ROWS = 256
+RUN_FK_DIAGNOSTIC = False
+AE_SCORE_OUTPUT_ONLY = True
+NAN_METRIC = float("nan")
+
+
+def refresh_tensorboard_async() -> None:
+    script = PROJECT_ROOT / "training" / "ik" / "launch_tensorboard_latest.ps1"
+    if not script.exists():
+        return
+    kwargs = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            cwd=str(PROJECT_ROOT),
+            **kwargs,
+        )
+    except Exception as exc:
+        print(f"tensorboard refresh skipped: {exc}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -447,13 +478,8 @@ def stage_for_step(step: int) -> tuple[int, int, int, int]:
     return len(ROLLOUT_SCHEDULE) - 1, int(ROLLOUT_SCHEDULE[-1]), start, start
 
 
-def stage_learning_rate(base_lr: float, stage_step: int, stage_steps: int) -> float:
-    progress = float(max(0, int(stage_step) - 1)) / float(max(1, int(stage_steps) - 1))
-    lr = float(base_lr)
-    for threshold, multiplier in LR_STAGE_DECAYS:
-        if progress >= float(threshold):
-            lr = float(base_lr) * float(multiplier)
-    return lr
+def stage_learning_rate(rollout_k: int) -> float:
+    return float(STAGE_LEARNING_RATES.get(int(rollout_k), LEARNING_RATE))
 
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
@@ -461,14 +487,17 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = float(lr)
 
 
-def make_adamw(params, lr: float, device: torch.device) -> torch.optim.Optimizer:
+def make_adamw(params, lr: float, device: torch.device, capturable: bool = False) -> torch.optim.Optimizer:
     kwargs = {"lr": lr, "weight_decay": 0.0}
     if device.type == "cuda":
         kwargs["fused"] = True
+        if capturable:
+            kwargs["capturable"] = True
     try:
         return torch.optim.AdamW(params, **kwargs)
     except (RuntimeError, TypeError):
         kwargs.pop("fused", None)
+        kwargs.pop("capturable", None)
         return torch.optim.AdamW(params, **kwargs)
 
 
@@ -482,22 +511,53 @@ def target_state(store: SimpleClipStore, clip_ids: torch.Tensor, idx: torch.Tens
     return vec, vec[:, :3], vec[:, payload_slice(store)]
 
 
+def fast_clean_6d(d6: torch.Tensor) -> torch.Tensor:
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = torch.nn.functional.normalize(a1, dim=-1, eps=1e-8)
+    b2 = torch.nn.functional.normalize(a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1, dim=-1, eps=1e-8)
+    return torch.cat((b1, b2), dim=-1)
+
+
+def fast_clean_ik_payload(payload: torch.Tensor) -> torch.Tensor:
+    parts: list[torch.Tensor] = []
+    for spec in tl.IK_PAYLOAD_SLICES:
+        pos_slice = spec["pos"]
+        rot_slice = spec["rot6"]
+        pole_slice = spec["pole"]
+        toe_slice = spec["toe_float"]
+        assert isinstance(pos_slice, slice)
+        assert isinstance(rot_slice, slice)
+        assert isinstance(pole_slice, slice)
+        parts.append(payload[:, pos_slice])
+        parts.append(fast_clean_6d(payload[:, rot_slice]))
+        parts.append(payload[:, pole_slice])
+        if toe_slice is not None:
+            assert isinstance(toe_slice, slice)
+            parts.append(payload[:, toe_slice])
+    return torch.cat(parts, dim=-1)
+
+
 def clean_output_vector(raw: torch.Tensor, store: SimpleClipStore) -> torch.Tensor:
     b = raw.shape[0]
     cursor = 0
     pelvis_pos = raw[:, cursor : cursor + 3]
     cursor += 3
-    pelvis_rot6 = tl.clean_6d(raw[:, cursor : cursor + 6])
+    pelvis_rot6 = fast_clean_6d(raw[:, cursor : cursor + 6])
     cursor += 6
     core_dim = store.Jcore * 6
-    core_rot6 = tl.clean_6d(raw[:, cursor : cursor + core_dim].reshape(-1, 6)).reshape(b, store.Jcore, 6)
+    core_rot6 = fast_clean_6d(raw[:, cursor : cursor + core_dim].reshape(-1, 6)).reshape(b, store.Jcore, 6)
     cursor += core_dim
-    payload = tl.clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim])
+    payload = fast_clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim])
     return torch.cat((pelvis_pos, pelvis_rot6, core_rot6.reshape(b, -1), payload), dim=-1)
 
 
 def predicted_state_from_raw(raw: torch.Tensor, store: SimpleClipStore) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     vec = clean_output_vector(raw, store)
+    return vec, vec[:, :3], vec[:, payload_slice(store)]
+
+
+def predicted_state_from_vector(vec: torch.Tensor, store: SimpleClipStore) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return vec, vec[:, :3], vec[:, payload_slice(store)]
 
 
@@ -532,9 +592,12 @@ def ae_score_rows(
     controller_input: torch.Tensor,
     predicted_output: torch.Tensor,
 ) -> torch.Tensor:
+    input_dim = int(controller_input.shape[-1])
     feature = torch.cat((controller_input, predicted_output), dim=-1)
     x = (feature - mean) / std
     recon = ae(x)
+    if AE_SCORE_OUTPUT_ONLY:
+        return (recon[:, input_dim:] - x[:, input_dim:]).square().mean(dim=-1)
     return (recon - x).square().mean(dim=-1)
 
 
@@ -563,7 +626,8 @@ def pure_ae_rollout_loss(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
-        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, raw) * row_weight).sum()
+        pred_vec = clean_output_vector(raw, store)
+        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight).sum()
         if step + 1 >= max_k:
             break
 
@@ -571,16 +635,198 @@ def pure_ae_rollout_loss(
         rows = continuing.nonzero(as_tuple=False).flatten()
         if rows.numel() == 0:
             break
-        raw = raw.index_select(0, rows)
+        pred_vec = pred_vec.index_select(0, rows)
         clip_ids = clip_ids.index_select(0, rows)
         prev_vec = cur_vec.index_select(0, rows)
         prev_pelvis = cur_pelvis.index_select(0, rows)
         prev_payload = cur_payload.index_select(0, rows)
-        cur_vec, cur_pelvis, cur_payload = predicted_state_from_raw(raw, store)
+        cur_vec, cur_pelvis, cur_payload = predicted_state_from_vector(pred_vec, store)
         cur_idx = cur_idx.index_select(0, rows) + 1
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
     return total_loss
+
+
+def pure_ae_rollout_loss_static(
+    model: torch.nn.Module,
+    ae: SimpleAutoencoder,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    store: SimpleClipStore,
+    rollout_k: int,
+    batch_size: int,
+    effective_k: torch.Tensor,
+    clip_ids: torch.Tensor,
+    starts: torch.Tensor,
+) -> torch.Tensor:
+    max_k = max(1, int(rollout_k))
+    cur_idx = starts
+    prev_vec, prev_pelvis, prev_payload = target_state(store, clip_ids, cur_idx - 1)
+    cur_vec, cur_pelvis, cur_payload = target_state(store, clip_ids, cur_idx)
+    row_weight = (1.0 / effective_k.float()) / float(max(1, int(batch_size)))
+    total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
+
+    for step in range(max_k):
+        inp = build_controller_input(
+            store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
+        )
+        raw = model_forward(model, inp, cur_vec, store.cfg)
+        pred_vec = clean_output_vector(raw, store)
+        active = effective_k > step
+        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight * active.float()).sum()
+        if step + 1 >= max_k:
+            break
+
+        continuing = effective_k > (step + 1)
+        next_vec, next_pelvis, next_payload = predicted_state_from_vector(pred_vec, store)
+        mask = continuing[:, None]
+        prev_vec = torch.where(mask, cur_vec, prev_vec)
+        prev_pelvis = torch.where(mask, cur_pelvis, prev_pelvis)
+        prev_payload = torch.where(mask, cur_payload, prev_payload)
+        cur_vec = torch.where(mask, next_vec, cur_vec)
+        cur_pelvis = torch.where(mask, next_pelvis, cur_pelvis)
+        cur_payload = torch.where(mask, next_payload, cur_payload)
+        cur_idx = torch.where(continuing, cur_idx + 1, cur_idx)
+    return total_loss
+
+
+class CudaGraphPureAEStep:
+    kind = "cuda_graph_static_masked"
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        ae: SimpleAutoencoder,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        store: SimpleClipStore,
+        rollout_k: int,
+        batch_size: int,
+        start_pools: dict[int, StartPool],
+    ):
+        if store.device.type != "cuda":
+            raise RuntimeError("CudaGraphPureAEStep requires CUDA")
+        self.model = model
+        self.optimizer = optimizer
+        self.ae = ae
+        self.mean = mean
+        self.std = std
+        self.store = store
+        self.rollout_k = int(rollout_k)
+        self.batch_size = int(batch_size)
+        self.start_pools = start_pools
+        self.effective_k = torch.empty((self.batch_size,), dtype=torch.long, device=store.device)
+        self.clip_ids = torch.empty_like(self.effective_k)
+        self.starts = torch.empty_like(self.effective_k)
+        self.loss = torch.zeros((), dtype=torch.float32, device=store.device)
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture()
+
+    def _sample_into_static_buffers(self) -> None:
+        effective_k = sample_effective_rollout_k(self.batch_size, self.rollout_k, self.store.device)
+        clip_ids, starts = sample_rollout_rows(self.start_pools, effective_k)
+        self.effective_k.copy_(effective_k)
+        self.clip_ids.copy_(clip_ids)
+        self.starts.copy_(starts)
+
+    def _loss(self) -> torch.Tensor:
+        return pure_ae_rollout_loss_static(
+            self.model,
+            self.ae,
+            self.mean,
+            self.std,
+            self.store,
+            self.rollout_k,
+            self.batch_size,
+            self.effective_k,
+            self.clip_ids,
+            self.starts,
+        )
+
+    def _capture(self) -> None:
+        self._sample_into_static_buffers()
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(2):
+                self._sample_into_static_buffers()
+                self.optimizer.zero_grad(set_to_none=False)
+                loss = self._loss()
+                loss.backward()
+                self.optimizer.step()
+                del loss
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        self.optimizer.zero_grad(set_to_none=False)
+        with torch.cuda.graph(self.graph):
+            self.optimizer.zero_grad(set_to_none=False)
+            self.loss = self._loss()
+            self.loss.backward()
+            self.optimizer.step()
+
+    def step(self) -> torch.Tensor:
+        self._sample_into_static_buffers()
+        self.graph.replay()
+        return self.loss.detach()
+
+
+class EagerPureAEStep:
+    kind = "eager"
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        ae: SimpleAutoencoder,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+        store: SimpleClipStore,
+        rollout_k: int,
+        batch_size: int,
+        start_pools: dict[int, StartPool],
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.ae = ae
+        self.mean = mean
+        self.std = std
+        self.store = store
+        self.rollout_k = int(rollout_k)
+        self.batch_size = int(batch_size)
+        self.start_pools = start_pools
+
+    def step(self) -> torch.Tensor:
+        loss = pure_ae_rollout_loss(
+            self.model,
+            self.ae,
+            self.mean,
+            self.std,
+            self.store,
+            self.rollout_k,
+            self.batch_size,
+            self.start_pools,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+        return loss.detach()
+
+
+def make_pure_ae_stepper(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    ae: SimpleAutoencoder,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    store: SimpleClipStore,
+    rollout_k: int,
+    batch_size: int,
+    start_pools: dict[int, StartPool],
+) -> CudaGraphPureAEStep | EagerPureAEStep:
+    if store.device.type == "cuda":
+        return CudaGraphPureAEStep(model, optimizer, ae, mean, std, store, rollout_k, batch_size, start_pools)
+    return EagerPureAEStep(model, optimizer, ae, mean, std, store, rollout_k, batch_size, start_pools)
 
 
 def validation_rows(pool: StartPool, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -611,7 +857,7 @@ def validation_ae_score(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
-        score = ae_score_rows(ae, mean, std, inp, raw)
+        score = ae_score_rows(ae, mean, std, inp, clean_output_vector(raw, store))
         total += float(score.sum().detach().cpu())
         count += int(score.numel())
         if step + 1 >= int(rollout_k):
@@ -733,7 +979,7 @@ def main() -> None:
 
     store = SimpleClipStore(clips, cfg, device)
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
-    optimizer = make_adamw(model.parameters(), LEARNING_RATE, device)
+    optimizer = make_adamw(model.parameters(), LEARNING_RATE, device, capturable=bool(device.type == "cuda"))
 
     stage_cache: dict[int, dict[str, object]] = {}
     for stage_k in ROLLOUT_SCHEDULE:
@@ -761,10 +1007,12 @@ def main() -> None:
         "simple_ae_checkpoint": str(ae_path),
         "tensorboard_logdir": str(run_dir / "tb"),
         "policy": {
-            "loss": "pure_simple_ae_reconstruction",
-            "supervised_loss_weight": 0.0,
+            "loss": "simple_ae_output_reconstruction",
+            "ae_score_output_only": bool(AE_SCORE_OUTPUT_ONLY),
             "mixed_rollout_at_max": True,
             "pose_representation": tl.IK_POSE_REPRESENTATION,
+            "test_set": False,
+            "checkpoint_selection": "latest_stage_last",
         },
         "rollout_schedule": [int(k) for k in ROLLOUT_SCHEDULE],
         "rollout_stage_steps": [int(n) for n in ROLLOUT_STAGE_STEPS],
@@ -774,30 +1022,32 @@ def main() -> None:
         "input_dim": int(input_dim),
         "output_dim": int(output_dim),
         "start_pool_rows": {str(k): v["pool_rows"] for k, v in stage_cache.items()},
+        "stage_learning_rates": {str(k): float(stage_learning_rate(k)) for k in ROLLOUT_SCHEDULE},
     }
     config_payload = {"config": asdict(cfg), "metadata": metadata}
     (run_dir / "config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
     writer = SummaryWriter(log_dir=str(run_dir / "tb"), flush_secs=1)
     writer.add_text("config/json", f"```json\n{json.dumps(config_payload, indent=2)}\n```", 0)
+    writer.flush()
+    refresh_tensorboard_async()
 
-    print(f"pure_ae_controller run={run_id} ae={ae_path} tensorboard_logdir={run_dir / 'tb'}", flush=True)
-    best = float("inf")
-    init_path = save_controller_checkpoint(run_dir, run_id, "init", model, optimizer, 0, best, 0, cfg, metadata)
+    print(f"simple_ae_controller run={run_id} ae={ae_path} tensorboard_logdir={run_dir / 'tb'}", flush=True)
+    last_loss = float("inf")
+    init_path = save_controller_checkpoint(run_dir, run_id, "init", model, optimizer, 0, last_loss, 0, cfg, metadata)
     print(f"saved initial checkpoint {init_path}", flush=True)
 
     start = time.perf_counter()
     total_steps = sum(int(x) for x in ROLLOUT_STAGE_STEPS)
-    for step in range(1, total_steps + 1):
-        _stage_idx, stage_k, stage_start, stage_end = stage_for_step(step)
-        stage_step = step - stage_start + 1
-        stage_steps = stage_end - stage_start + 1
-        lr = stage_learning_rate(LEARNING_RATE, stage_step, stage_steps)
+    step = 0
+    for stage_idx, stage_k in enumerate(ROLLOUT_SCHEDULE):
+        stage_steps = int(ROLLOUT_STAGE_STEPS[stage_idx])
+        lr = stage_learning_rate(int(stage_k))
         set_optimizer_lr(optimizer, lr)
         cache = stage_cache[int(stage_k)]
-
         model.train()
-        loss = pure_ae_rollout_loss(
+        stepper = make_pure_ae_stepper(
             model,
+            optimizer,
             ae,
             mean,
             std,
@@ -806,42 +1056,54 @@ def main() -> None:
             int(cache["batch_size"]),
             cache["start_pools"],
         )
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        print(
+            f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} K={stage_k} "
+            f"steps={stage_steps} batch={int(cache['batch_size'])} lr={lr:.3g} stepper={stepper.kind}",
+            flush=True,
+        )
+        for stage_step in range(1, stage_steps + 1):
+            step += 1
+            loss = stepper.step()
+            last_loss = float(loss.detach().cpu())
+            if stage_step == 1 or stage_step % LOG_EVERY == 0 or stage_step == stage_steps:
+                model.eval()
+                mean_err = NAN_METRIC
+                max_err = NAN_METRIC
+                if RUN_FK_DIAGNOSTIC:
+                    mean_err, max_err = rollout_joint_error(model, store, int(stage_k), cache["max_pool"])
+                latest = save_controller_checkpoint(
+                    run_dir, run_id, "latest", model, optimizer, step, last_loss, int(stage_k), cfg, metadata
+                )
+                elapsed = time.perf_counter() - start
+                stats = cache["rollout_stats"]
+                gt_text = (
+                    f"gt_mean_m={mean_err:.6f} gt_max_m={max_err:.6f}"
+                    if RUN_FK_DIAGNOSTIC
+                    else "gt_diag=off"
+                )
+                print(
+                    f"step={step:05d} K={stage_k} train_loss={last_loss:.6g} "
+                    f"{gt_text} effK_mean={stats['effective_k_mean']:.2f} lr={lr:.3g} elapsed_s={elapsed:.1f}",
+                    flush=True,
+                )
+                writer.add_scalar("loss/train_ae", last_loss, step)
+                if RUN_FK_DIAGNOSTIC:
+                    writer.add_scalar("eval/rollout_mean_m", mean_err, step)
+                    writer.add_scalar("eval/rollout_max_m", max_err, step)
+                writer.add_scalar("curriculum/rollout_k", int(stage_k), step)
+                writer.add_scalar("train/effective_rollout_k_mean", stats["effective_k_mean"], step)
+                writer.add_scalar("train/effective_rollout_k_max", stats["effective_k_max"], step)
+                writer.add_scalar("time/elapsed_s", elapsed, step)
+                writer.flush()
+                print(f"checkpoint_latest={latest}", flush=True)
+                model.train()
+        stage_path = save_controller_checkpoint(
+            run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, last_loss, int(stage_k), cfg, metadata
+        )
+        print(f"saved stage checkpoint {stage_path}", flush=True)
+        del stepper
 
-        if step == 1 or step == stage_start or step % LOG_EVERY == 0 or step == total_steps:
-            model.eval()
-            val_ae = validation_ae_score(model, ae, mean, std, store, int(stage_k), cache["max_pool"])
-            mean_err, max_err = rollout_joint_error(model, store, int(stage_k), cache["max_pool"])
-            if val_ae < best:
-                best = val_ae
-                save_controller_checkpoint(run_dir, run_id, "best", model, optimizer, step, best, int(stage_k), cfg, metadata)
-            latest = save_controller_checkpoint(
-                run_dir, run_id, "latest", model, optimizer, step, best, int(stage_k), cfg, metadata
-            )
-            elapsed = time.perf_counter() - start
-            stats = cache["rollout_stats"]
-            print(
-                f"step={step:05d} K={stage_k} ae_loss={float(loss.detach().cpu()):.6g} "
-                f"val_ae={val_ae:.6g} best_ae={best:.6g} "
-                f"gt_mean_m={mean_err:.6f} gt_max_m={max_err:.6f} "
-                f"effK_mean={stats['effective_k_mean']:.2f} lr={lr:.3g} elapsed_s={elapsed:.1f}",
-                flush=True,
-            )
-            writer.add_scalar("loss/train_ae", float(loss.detach().cpu()), step)
-            writer.add_scalar("loss/val_ae", val_ae, step)
-            writer.add_scalar("loss/best_ae", best, step)
-            writer.add_scalar("eval/rollout_mean_m", mean_err, step)
-            writer.add_scalar("eval/rollout_max_m", max_err, step)
-            writer.add_scalar("curriculum/rollout_k", int(stage_k), step)
-            writer.add_scalar("train/effective_rollout_k_mean", stats["effective_k_mean"], step)
-            writer.add_scalar("train/effective_rollout_k_max", stats["effective_k_max"], step)
-            writer.add_scalar("time/elapsed_s", elapsed, step)
-            writer.flush()
-            print(f"checkpoint_latest={latest}", flush=True)
-
-    last = save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, total_steps, best, ROLLOUT_K, cfg, metadata)
+    last = save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, total_steps, last_loss, ROLLOUT_K, cfg, metadata)
     writer.close()
     print(f"saved {last}", flush=True)
 

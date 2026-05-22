@@ -1,0 +1,778 @@
+{
+  "baseline_current": {
+    "checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_041619_ik_walkF_ae_output_only_pure\\checkpoints\\20260522_041619_ik_walkF_ae_output_only_pure_last.pt",
+    "metric": {
+      "foot_l": {
+        "gt_interval": [
+          91,
+          104
+        ],
+        "pred_interval": [
+          0,
+          13
+        ],
+        "gt_scored_interval": [
+          91,
+          104
+        ],
+        "pred_scored_interval": [
+          0,
+          13
+        ],
+        "gt_slide_m_per_frame": 0.004418267402797937,
+        "pred_slide_m_per_frame": 0.009592842310667038,
+        "slide_ratio": 2.1711773951463913,
+        "gt_rot_deg_per_frame": 2.663616895675659,
+        "pred_rot_deg_per_frame": 3.7849581241607666,
+        "rot_ratio": 1.4209844254650839
+      },
+      "foot_r": {
+        "gt_interval": [
+          76,
+          89
+        ],
+        "pred_interval": [
+          46,
+          59
+        ],
+        "gt_scored_interval": [
+          76,
+          89
+        ],
+        "pred_scored_interval": [
+          46,
+          59
+        ],
+        "gt_slide_m_per_frame": 0.004604874644428492,
+        "pred_slide_m_per_frame": 0.00635085953399539,
+        "slide_ratio": 1.379160134506461,
+        "gt_rot_deg_per_frame": 2.65702486038208,
+        "pred_rot_deg_per_frame": 3.198038339614868,
+        "rot_ratio": 1.2036162654326803
+      },
+      "mean_slide_ratio": 1.775168764826426,
+      "mean_rot_ratio": 1.312300345448882,
+      "score": 1.543734555137654
+    },
+    "metric_version": "height_window_full_interval_v2"
+  },
+  "option1_tight_ae": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_044438_ik_ik_foot_audit_opt1_tight_ae\\checkpoints\\20260522_044438_ik_ik_foot_audit_opt1_tight_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_044438_ik_ik_foot_audit_opt1_tight_controller\\checkpoints\\20260522_044438_ik_ik_foot_audit_opt1_tight_controller_last.pt",
+    "metric": {
+      "foot_l": {
+        "gt_interval": [
+          91,
+          104
+        ],
+        "pred_interval": [
+          92,
+          105
+        ],
+        "gt_scored_interval": [
+          91,
+          104
+        ],
+        "pred_scored_interval": [
+          92,
+          105
+        ],
+        "gt_slide_m_per_frame": 0.004418267402797937,
+        "pred_slide_m_per_frame": 0.008106144145131111,
+        "slide_ratio": 1.8346884437093527,
+        "gt_rot_deg_per_frame": 2.663616895675659,
+        "pred_rot_deg_per_frame": 3.1118316650390625,
+        "rot_ratio": 1.1682729862883334
+      },
+      "foot_r": {
+        "gt_interval": [
+          76,
+          89
+        ],
+        "pred_interval": [
+          46,
+          59
+        ],
+        "gt_scored_interval": [
+          76,
+          89
+        ],
+        "pred_scored_interval": [
+          46,
+          59
+        ],
+        "gt_slide_m_per_frame": 0.004604874644428492,
+        "pred_slide_m_per_frame": 0.00832329224795103,
+        "slide_ratio": 1.807495945198315,
+        "gt_rot_deg_per_frame": 2.65702486038208,
+        "pred_rot_deg_per_frame": 3.5009450912475586,
+        "rot_ratio": 1.3176184925662016
+      },
+      "mean_slide_ratio": 1.8210921944538339,
+      "mean_rot_ratio": 1.2429457394272676,
+      "score": 1.5320189669405506
+    },
+    "metric_version": "height_window_full_interval_v2"
+  },
+  "option1_wide_ae": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_045310_ik_foot_audit_opt1_wide_ae\\checkpoints\\20260522_045310_ik_foot_audit_opt1_wide_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_045311_ik_foot_audit_opt1_wide_controller\\checkpoints\\20260522_045311_ik_foot_audit_opt1_wide_controller_last.pt",
+    "metric": {
+      "foot_l": {
+        "gt_interval": [
+          91,
+          104
+        ],
+        "pred_interval": [
+          0,
+          13
+        ],
+        "gt_scored_interval": [
+          91,
+          104
+        ],
+        "pred_scored_interval": [
+          0,
+          13
+        ],
+        "gt_slide_m_per_frame": 0.004418267402797937,
+        "pred_slide_m_per_frame": 0.037061985582113266,
+        "slide_ratio": 8.38835276439882,
+        "gt_rot_deg_per_frame": 2.663616895675659,
+        "pred_rot_deg_per_frame": 3.657179832458496,
+        "rot_ratio": 1.3730127025383685
+      },
+      "foot_r": {
+        "gt_interval": [
+          76,
+          89
+        ],
+        "pred_interval": [
+          48,
+          61
+        ],
+        "gt_scored_interval": [
+          76,
+          89
+        ],
+        "pred_scored_interval": [
+          48,
+          61
+        ],
+        "gt_slide_m_per_frame": 0.004604874644428492,
+        "pred_slide_m_per_frame": 0.06655854731798172,
+        "slide_ratio": 14.453932507915699,
+        "gt_rot_deg_per_frame": 2.65702486038208,
+        "pred_rot_deg_per_frame": 0.4310152530670166,
+        "rot_ratio": 0.16221724512018176
+      },
+      "mean_slide_ratio": 11.42114263615726,
+      "mean_rot_ratio": 0.7676149738292751,
+      "score": 6.0943788049932675
+    },
+    "metric_version": "height_window_full_interval_v2"
+  },
+  "option2_corrupt_ae": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_050413_ik_foot_audit_opt2_corrupt_ae\\checkpoints\\20260522_050413_ik_foot_audit_opt2_corrupt_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_050413_ik_foot_audit_opt2_corrupt_controller\\checkpoints\\20260522_050413_ik_foot_audit_opt2_corrupt_controller_last.pt",
+    "metric": {
+      "foot_l": {
+        "gt_interval": [
+          91,
+          104
+        ],
+        "pred_interval": [
+          0,
+          13
+        ],
+        "gt_scored_interval": [
+          91,
+          104
+        ],
+        "pred_scored_interval": [
+          0,
+          13
+        ],
+        "gt_slide_m_per_frame": 0.004418267402797937,
+        "pred_slide_m_per_frame": 0.035573117434978485,
+        "slide_ratio": 8.05137267437712,
+        "gt_rot_deg_per_frame": 2.663616895675659,
+        "pred_rot_deg_per_frame": 4.222579479217529,
+        "rot_ratio": 1.585280332946086
+      },
+      "foot_r": {
+        "gt_interval": [
+          76,
+          89
+        ],
+        "pred_interval": [
+          23,
+          36
+        ],
+        "gt_scored_interval": [
+          76,
+          89
+        ],
+        "pred_scored_interval": [
+          23,
+          36
+        ],
+        "gt_slide_m_per_frame": 0.004604874644428492,
+        "pred_slide_m_per_frame": 0.06638243794441223,
+        "slide_ratio": 14.41568838898348,
+        "gt_rot_deg_per_frame": 2.65702486038208,
+        "pred_rot_deg_per_frame": 0.3624042570590973,
+        "rot_ratio": 0.1363947558273819
+      },
+      "mean_slide_ratio": 11.2335305316803,
+      "mean_rot_ratio": 0.860837544386734,
+      "score": 6.047184038033517
+    },
+    "metric_version": "height_window_full_interval_v2"
+  },
+  "option3_score_footx3": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_013146_ik_simple_ae_walkF_probe\\checkpoints\\20260522_013146_ik_simple_ae_walkF_probe_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_054545_ik_foot_audit_opt3_score_footx3_controller\\checkpoints\\20260522_054545_ik_foot_audit_opt3_score_footx3_controller_last.pt",
+    "score_profile": "foot_x3",
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            1,
+            14
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            1,
+            14
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.03937220573425293,
+          "slide_ratio": 8.911231970550235,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 1.8301681280136108,
+          "rot_ratio": 0.687098858317373
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            107,
+            120
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            107,
+            120
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.06645321100950241,
+          "slide_ratio": 14.431057551133378,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 0.5798707604408264,
+          "rot_ratio": 0.21824062284364212
+        },
+        "mean_slide_ratio": 11.671144760841806,
+        "mean_rot_ratio": 0.4526697405805076,
+        "score": 6.061907250711156
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.006005364470183849,
+        "pos_p95_m": 0.018205104395747185,
+        "pos_max_m": 0.05852507799863815,
+        "pos_end_m": 0.0031246196012943983,
+        "rot_mean_deg": 1.089486837387085,
+        "rot_p95_deg": 3.736548900604248,
+        "rot_max_deg": 45.7035026550293,
+        "rot_end_deg": 0.6148793697357178,
+        "ee_pos_mean_m": 0.008505063131451607,
+        "foot_pos_mean_m": 0.009852890856564045,
+        "foot_rot_mean_deg": 1.3546018600463867,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option3_weighted_ae_footx3": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_055449_ik_foot_audit_opt3_weighted_footx3_ae\\checkpoints\\20260522_055449_ik_foot_audit_opt3_weighted_footx3_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_055449_ik_foot_audit_opt3_weighted_footx3_controller\\checkpoints\\20260522_055449_ik_foot_audit_opt3_weighted_footx3_controller_last.pt",
+    "ae_weight_profile": "foot_x3",
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            0,
+            13
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            0,
+            13
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.034141190350055695,
+          "slide_ratio": 7.727280229448143,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 3.7696053981781006,
+          "rot_ratio": 1.415220561296933
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            57,
+            70
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            57,
+            70
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.06557097285985947,
+          "slide_ratio": 14.23946967572609,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 1.1042912006378174,
+          "rot_ratio": 0.41561191884332627
+        },
+        "mean_slide_ratio": 10.983374952587116,
+        "mean_rot_ratio": 0.9154162400701297,
+        "score": 5.949395596328623
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.01273059006780386,
+        "pos_p95_m": 0.04668843373656273,
+        "pos_max_m": 0.10297930240631104,
+        "pos_end_m": 0.012558065354824066,
+        "rot_mean_deg": 2.0036346912384033,
+        "rot_p95_deg": 6.883076190948486,
+        "rot_max_deg": 59.120826721191406,
+        "rot_end_deg": 1.8427214622497559,
+        "ee_pos_mean_m": 0.02544954977929592,
+        "foot_pos_mean_m": 0.031323112547397614,
+        "foot_rot_mean_deg": 2.908675193786621,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option4_output_only_ae_k16": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_061449_ik_foot_audit_opt4_output_only_ae\\checkpoints\\20260522_061449_ik_foot_audit_opt4_output_only_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_061449_ik_foot_audit_opt4_output_only_controller_k16\\checkpoints\\20260522_061449_ik_foot_audit_opt4_output_only_controller_k16_last.pt",
+    "ae_training_loss": "target_output_only",
+    "stopped_after_k": 16,
+    "elapsed_s": 370.7830280000344,
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            0,
+            13
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            0,
+            13
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.03462480753660202,
+          "slide_ratio": 7.836738789208484,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 3.5864763259887695,
+          "rot_ratio": 1.346468529994444
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            32,
+            45
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            32,
+            45
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.06504562497138977,
+          "slide_ratio": 14.125384509671608,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 0.6786776781082153,
+          "rot_ratio": 0.2554276733453753
+        },
+        "mean_slide_ratio": 10.981061649440047,
+        "mean_rot_ratio": 0.8009481016699097,
+        "score": 5.891004875554978
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.013232465833425522,
+        "pos_p95_m": 0.052867382764816284,
+        "pos_max_m": 0.09595533460378647,
+        "pos_end_m": 0.01615678332746029,
+        "rot_mean_deg": 2.3771588802337646,
+        "rot_p95_deg": 8.896484375,
+        "rot_max_deg": 52.173824310302734,
+        "rot_end_deg": 2.955101251602173,
+        "ee_pos_mean_m": 0.026272494345903397,
+        "foot_pos_mean_m": 0.031108416616916656,
+        "foot_rot_mean_deg": 3.7542717456817627,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option5_topk10_baseae_k16": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_013146_ik_simple_ae_walkF_probe\\checkpoints\\20260522_013146_ik_simple_ae_walkF_probe_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_062234_ik_foot_audit_opt5_topk10_baseae_controller_k16\\checkpoints\\20260522_062234_ik_foot_audit_opt5_topk10_baseae_controller_k16_last.pt",
+    "score_topk_fraction": 0.1,
+    "stopped_after_k": 16,
+    "elapsed_s": 187.26127199968323,
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            31,
+            44
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            31,
+            44
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.06903932243585587,
+          "slide_ratio": 15.625881401414416,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 0.5326467752456665,
+          "rot_ratio": 0.19997124065041422
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            13,
+            26
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            13,
+            26
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.06721307337284088,
+          "slide_ratio": 14.596070156689935,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 1.1939796209335327,
+          "rot_ratio": 0.44936712438657367
+        },
+        "mean_slide_ratio": 15.110975779052175,
+        "mean_rot_ratio": 0.32466918251849397,
+        "score": 7.717822480785335
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.009106202982366085,
+        "pos_p95_m": 0.028889723122119904,
+        "pos_max_m": 0.07312381267547607,
+        "pos_end_m": 0.009231198579072952,
+        "rot_mean_deg": 1.7642886638641357,
+        "rot_p95_deg": 5.832431316375732,
+        "rot_max_deg": 45.28084182739258,
+        "rot_end_deg": 1.7827651500701904,
+        "ee_pos_mean_m": 0.014878452755510807,
+        "foot_pos_mean_m": 0.01680697128176689,
+        "foot_rot_mean_deg": 2.511532783508301,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option6_mid_bottleneck_latent16_k16": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_062715_ik_foot_audit_opt6_mid_latent16_ae\\checkpoints\\20260522_062715_ik_foot_audit_opt6_mid_latent16_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_062715_ik_foot_audit_opt6_mid_latent16_controller_k16\\checkpoints\\20260522_062715_ik_foot_audit_opt6_mid_latent16_controller_k16_last.pt",
+    "latent_dim": 16,
+    "hidden_dim": 512,
+    "stopped_after_k": 16,
+    "elapsed_s": 300.78147860011086,
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            1,
+            14
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            1,
+            14
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.03460455685853958,
+          "slide_ratio": 7.832155391189247,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 2.1477174758911133,
+          "rot_ratio": 0.8063162083773756
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            107,
+            120
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            107,
+            120
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.06775276362895966,
+          "slide_ratio": 14.713269928191153,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 0.6366273164749146,
+          "rot_ratio": 0.23960156563358898
+        },
+        "mean_slide_ratio": 11.2727126596902,
+        "mean_rot_ratio": 0.5229588870054823,
+        "score": 5.897835773347841
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.0073873624205589294,
+        "pos_p95_m": 0.027208568528294563,
+        "pos_max_m": 0.07394447922706604,
+        "pos_end_m": 0.00499342568218708,
+        "rot_mean_deg": 1.3505280017852783,
+        "rot_p95_deg": 4.8014421463012695,
+        "rot_max_deg": 57.53028106689453,
+        "rot_end_deg": 0.8674142360687256,
+        "ee_pos_mean_m": 0.013571389950811863,
+        "foot_pos_mean_m": 0.017071902751922607,
+        "foot_rot_mean_deg": 1.8917083740234375,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option7_foot_delta_ae_k16": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_063419_ik_foot_audit_opt7_foot_delta_ae\\checkpoints\\20260522_063419_ik_foot_audit_opt7_foot_delta_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_063420_ik_foot_audit_opt7_foot_delta_controller_k16\\checkpoints\\20260522_063420_ik_foot_audit_opt7_foot_delta_controller_k16_last.pt",
+    "ae_feature": "target_output_plus_foot_delta",
+    "derived_weight": 2.0,
+    "stopped_after_k": 16,
+    "elapsed_s": 170.55618030019104,
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            0,
+            13
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            0,
+            13
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.00833805836737156,
+          "slide_ratio": 1.887178300274753,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 3.914341926574707,
+          "rot_ratio": 1.4695589042589348
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            16,
+            29
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            16,
+            29
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.00529920170083642,
+          "slide_ratio": 1.1507808811360383,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 2.833941698074341,
+          "rot_ratio": 1.0665845624292805
+        },
+        "mean_slide_ratio": 1.5189795907053956,
+        "mean_rot_ratio": 1.2680717333441076,
+        "score": 1.3935256620247516
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.0033917599357664585,
+        "pos_p95_m": 0.0069763013161718845,
+        "pos_max_m": 0.04192580655217171,
+        "pos_end_m": 0.004177825525403023,
+        "rot_mean_deg": 0.8193446397781372,
+        "rot_p95_deg": 2.4949848651885986,
+        "rot_max_deg": 48.424808502197266,
+        "rot_end_deg": 1.1025902032852173,
+        "ee_pos_mean_m": 0.0029175919480621815,
+        "foot_pos_mean_m": 0.002546433825045824,
+        "foot_rot_mean_deg": 1.0639127492904663,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  },
+  "option7_foot_delta_ae_full": {
+    "ae_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_063419_ik_foot_audit_opt7_foot_delta_ae\\checkpoints\\20260522_063419_ik_foot_audit_opt7_foot_delta_ae_best.pt",
+    "controller_checkpoint": "C:\\Users\\singerie\\Documents\\Cursor\\stepper\\training\\runs\\20260522_063829_ik_foot_audit_opt7_foot_delta_controller_full\\checkpoints\\20260522_063829_ik_foot_audit_opt7_foot_delta_controller_full_last.pt",
+    "ae_feature": "target_output_plus_foot_delta",
+    "derived_weight": 2.0,
+    "stopped_after_k": 32,
+    "elapsed_s": 386.5716397999786,
+    "metric": {
+      "foot_pin": {
+        "foot_l": {
+          "gt_interval": [
+            91,
+            104
+          ],
+          "pred_interval": [
+            0,
+            13
+          ],
+          "gt_scored_interval": [
+            91,
+            104
+          ],
+          "pred_scored_interval": [
+            0,
+            13
+          ],
+          "gt_slide_m_per_frame": 0.004418267402797937,
+          "pred_slide_m_per_frame": 0.008154827170073986,
+          "slide_ratio": 1.845707021922171,
+          "gt_rot_deg_per_frame": 2.663616895675659,
+          "pred_rot_deg_per_frame": 3.6762890815734863,
+          "rot_ratio": 1.3801868758010527
+        },
+        "foot_r": {
+          "gt_interval": [
+            76,
+            89
+          ],
+          "pred_interval": [
+            15,
+            28
+          ],
+          "gt_scored_interval": [
+            76,
+            89
+          ],
+          "pred_scored_interval": [
+            15,
+            28
+          ],
+          "gt_slide_m_per_frame": 0.004604874644428492,
+          "pred_slide_m_per_frame": 0.0072728232480585575,
+          "slide_ratio": 1.5793748602598896,
+          "gt_rot_deg_per_frame": 2.65702486038208,
+          "pred_rot_deg_per_frame": 3.5150463581085205,
+          "rot_ratio": 1.3229256566320033
+        },
+        "mean_slide_ratio": 1.7125409410910302,
+        "mean_rot_ratio": 1.351556266216528,
+        "score": 1.532048603653779
+      },
+      "one_step": {
+        "frames_evaluated": 119,
+        "pos_mean_m": 0.0029295068234205246,
+        "pos_p95_m": 0.006283813156187534,
+        "pos_max_m": 0.04175776243209839,
+        "pos_end_m": 0.0035895584151148796,
+        "rot_mean_deg": 0.7308790683746338,
+        "rot_p95_deg": 2.221987247467041,
+        "rot_max_deg": 45.01255798339844,
+        "rot_end_deg": 1.0785893201828003,
+        "ee_pos_mean_m": 0.0024972043465822935,
+        "foot_pos_mean_m": 0.002151784487068653,
+        "foot_rot_mean_deg": 0.9328052997589111,
+        "body_count": 25
+      }
+    },
+    "metric_version": "height_window_full_interval_plus_onestep_v3"
+  }
+}

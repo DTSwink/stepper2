@@ -260,3 +260,100 @@
   - local controller input vs `ik_core.build_input` max abs delta: `5.96e-08`;
   - one small K=2 pure-AE loss/validation pass completed;
   - one K=1 FK diagnostic pass completed.
+
+## 2026-05-22 Simple AE Controller Speed Audit
+
+- Audited `train_simple_ae_controller.py` on the real full local split:
+  - periodic: `ue5/animations_omni_only_full/npz_final` (`15` clips);
+  - nonperiodic: `ue5/animations_transitions_only_full_trimmed/npz_final` (`211` clips);
+  - total frames: `12616`, controller input dim `302`, output dim `111`.
+- Baseline measured full-dataset training step times:
+  - K1: `32.5 ms`;
+  - K8: `103.9 ms`;
+  - K32 mixed: `696.2 ms`.
+- Critical diagnostic issue:
+  - FK rollout diagnostic was not training-critical and was extremely slow on the 226-clip set.
+  - K8 diagnostic with 256 validation rows took `128.0 s`; K32 logs would stall training badly.
+  - Default pure-AE controller training now skips this FK diagnostic. AE validation remains on.
+- Hot-path optimization:
+  - Replaced the rollout-state projection with a local fast 6D cleaner in the pure-AE controller trainer.
+  - On normal nondegenerate 6D rows, it matched the old cleaner exactly in the audit (`max delta 0.0` on real zero-init controller outputs).
+- After the local optimization and FK diagnostic removal:
+  - K1: `30.1 ms`;
+  - K8: `77.1 ms`;
+  - K32 mixed: `249.7 ms`;
+  - K32 AE validation: `0.069 s`.
+- Tested `torch.compile` on the controller and AE:
+  - first compile/warmup included a `47 s` compile hit;
+  - measured K32 mixed step was slightly slower (`440.9 ms` vs `414.7 ms` in that paired run);
+  - not adopted.
+
+## 2026-05-22 Walk_F Pure-AE Controller Speed Fix
+
+- Problem run:
+  - `20260522_023223_ik_walkF_simple_ae_controller_fast`.
+  - Long staged run reached K32 mixed at step `8001` after `798.2 s`.
+  - At step `8500`, K32 mixed `ae_loss=0.620046` after `1185.2 s`.
+  - It was stopped; latest checkpoint is preserved.
+- Diagnosis:
+  - Tiny Walk_F batch has only `119` valid rows.
+  - Eager K32 mixed pure-AE rollout stayed around `0.7 s/step`; larger replacement-sampled batches did not help.
+  - CUDA graph replay on a static masked K32 pure-AE step reduced this to about `118 ms/step`.
+  - The old LR reset to `3e-4` at each harder K was also wasteful; K32 often improved, then got pushed upward.
+- Compressed schedule experiments:
+  - `(K1 80, K2 80, K32 420)` with K32 LR `1e-5`: K32 probe `0.0689` in `19.9 s`.
+  - `(K1 80, K2 80, K32 420)` with K32 LR `3e-5`: K32 probe `0.1243` in `19.5 s`.
+  - `(K1 80, K2 80, K8 160, K32 360)` with K32 LR `3e-5`: K32 probe `0.3284` in `20.6 s`.
+  - `(K1 80, K2 80, K8 160, K16 220, K32 320)` with K16 LR `5e-5`, K32 LR `2e-5`: K32 probe `0.2308` at `19.9 s`; later `0.3796` at `25.7 s`.
+- Adopted local trainer changes:
+  - CUDA graph static masked stepper for pure-AE controller training on CUDA.
+  - Removed fake validation/test-set loss logging and fake global best checkpointing.
+  - Checkpoints now use `init`, `latest`, `stage_K*`, and `last`.
+  - Walk_F schedule is now `K=(1,2,8,16,32)` with steps `(80,80,160,220,240)` and LR `{1:1e-4, 2:1e-4, 8:1e-4, 16:5e-5, 32:2e-5}`.
+- Verification run:
+  - Run: `20260522_030813_ik_walkF_simple_ae_controller_graph_quick`.
+  - Completed in `15.4 s`.
+  - Final K32 mixed `loss/train_ae=0.20057`.
+  - Final checkpoint: `training/runs/20260522_030813_ik_walkF_simple_ae_controller_graph_quick/checkpoints/20260522_030813_ik_walkF_simple_ae_controller_graph_quick_last.pt`.
+- Carry-over caveat:
+  - CUDA graph static masking is a general performance fix.
+  - The compressed schedule/LR is proven only on Walk_F and may need re-expansion or retuning for the full dataset.
+
+## 2026-05-22 Pure-AE Repro And TensorBoard Fix
+
+- Stopped the foot-harshness option sweep after visual suspicion that bad audit variants might be confused with the earlier simple-AE result.
+- Reproduced the known pure simple-AE controller path with the original AE checkpoint:
+  - original checkpoint: `20260522_041619_ik_walkF_ae_output_only_pure_last.pt`;
+  - fresh repro run: `20260522_051508_ik_walkF_ae_output_only_pure_repro`;
+  - fresh repro final `loss/train_ae=0.004774`;
+  - IK viewer repro one-step joint error: start `0.000000`, avg `0.003234`, end `0.002549`;
+  - IK viewer autoregressive joint error: start `0.000000`, avg `0.037866`, end `0.039689`.
+- The generic `training/visualize_model.py` is not valid for these IK simple-AE checkpoints because it imports the non-IK trainer and tries to build the old `569 -> 155` model shape. Use `training/ik/visualize.py` or the model viewer IK path for these checkpoints.
+- TensorBoard issue:
+  - the server process was still watching an old static `logdir_spec` ending before the `04:16` pure-AE run, so newer runs could not appear;
+  - `launch_tensorboard_latest.ps1` now reports the true `/data/runs` count;
+  - `train_simple_ae_controller.py` and the foot-harshness audit trainer now refresh TensorBoard after creating a new event file, so future runs should not be invisible behind a stale TensorBoard process.
+
+## 2026-05-22 Foot Harshness AE Audit
+
+- Built a foot-pin metric that compares predicted foot slide/rotation against GT over the selected pinned interval, plus a separate teacher-forced one-step reconstruction metric to catch hover/drift failures without phase sensitivity.
+- Rejected variants:
+  - denoising corruption examples: one-step and slide degraded badly after rollout training;
+  - output-only AE and score weighting/top-k scoring: often reduced rotation by freezing, but created hover/slide failures;
+  - tighter/wider bottlenecks: did not beat the clean simple-AE baseline on slide.
+- Best current variant is the foot-delta AE:
+  - no contact labels and no extra temporal window beyond the existing controller row;
+  - augments the AE row with the derived next-foot displacement in the current-root frame, then scores output reconstruction plus that derived foot-delta reconstruction.
+- K16 checkpoint:
+  - run `20260522_063420_ik_foot_audit_opt7_foot_delta_controller_k16`;
+  - foot slide ratio `1.519` vs clean final `1.775` and clean K16 `1.729`;
+  - one-step position `0.00339 m`, rotation `0.819 deg`, foot position `0.00255 m`;
+  - viewer export: `training/runs/model_comparisons/foot_delta_ae_k16_063420.html`.
+- Full K32 promotion:
+  - run `20260522_063829_ik_foot_audit_opt7_foot_delta_controller_full`;
+  - one-step improves to `0.00293 m`, `0.731 deg`, foot position `0.00215 m`;
+  - foot slide ratio is worse than K16 at `1.713`, but still better than clean final;
+  - viewer export: `training/runs/model_comparisons/foot_delta_ae_full_063829.html`.
+- Current recommendation:
+  - use K16 foot-delta as the anti-slide winner for inspection;
+  - keep full K32 as a cleaner overall rollout candidate, but not the best slide candidate.
