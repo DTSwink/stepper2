@@ -18,15 +18,18 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-import contact_physics as cp
-import excess_envelope as ee
 try:
+    from . import contact_physics as cp
+    from . import excess_envelope as ee
     from . import ik_core as tl
     from . import transition_autoencoder as tae
+    from . import window_transition_autoencoder as wae
 except ImportError:
+    import contact_physics as cp
+    import excess_envelope as ee
     import ik_core as tl
     import transition_autoencoder as tae
-import window_transition_autoencoder as wae
+    import window_transition_autoencoder as wae
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

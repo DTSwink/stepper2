@@ -16,10 +16,11 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import contact_physics as cp
 try:
+    from . import contact_physics as cp
     from . import ik_core as tl
 except ImportError:
+    import contact_physics as cp
     import ik_core as tl
 
 

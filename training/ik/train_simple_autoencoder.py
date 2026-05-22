@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,6 +39,27 @@ STD_FLOOR = 1e-4
 VAL_FRACTION = 0.1
 SEED = 1234
 LOG_EVERY = 250
+
+
+def refresh_tensorboard_async() -> None:
+    script = PROJECT_ROOT / "training" / "ik" / "launch_tensorboard_latest.ps1"
+    if not script.exists():
+        return
+    kwargs = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+    }
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            cwd=str(PROJECT_ROOT),
+            **kwargs,
+        )
+    except Exception as exc:
+        print(f"tensorboard refresh skipped: {exc}", flush=True)
 
 
 @dataclass
@@ -398,6 +420,9 @@ def main() -> None:
     }
     (run_dir / "config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
     writer.add_text("config/json", f"```json\n{json.dumps(config_payload, indent=2)}\n```", 0)
+    writer.add_scalar("run/started", 1.0, 0)
+    writer.flush()
+    refresh_tensorboard_async()
 
     print(
         f"simple_ae run={run_id} rows={x.shape[0]} dim={x.shape[1]} "

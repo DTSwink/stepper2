@@ -15,53 +15,7 @@ if (-not (Test-Path -LiteralPath $runsRoot)) {
 }
 
 $resolvedRunsRoot = (Resolve-Path -LiteralPath $runsRoot).Path
-
-# TensorBoard watches only the current full-dataset IK controller sequence.
-# Older probes, AE diagnostics, and archived crashes stay on disk but do not
-# spam the card grid.
-$wantedLabels = @(
-    "full_vanilla_ae_controller_baseline_stall",
-    "full_vanilla_ae_controller_refined_stall",
-    "full_vanilla_ae_controller_random_init_stall"
-)
-
-$candidateRuns = Get-ChildItem -LiteralPath $resolvedRunsRoot -Directory |
-    Where-Object {
-        $_.Name -like "*_ik_full_vanilla_ae_controller_*" -and
-        $_.Name -notlike "*_crashed*" -and
-        ($wantedLabels -contains ($_.Name -replace "^\d{8}_\d{6}_ik_", ""))
-    }
-
-$ikRuns = $candidateRuns |
-    Group-Object {
-        $_.Name -replace "^\d{8}_\d{6}_ik_", ""
-    } |
-    ForEach-Object {
-        $_.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    } |
-    Where-Object {
-        $tbSlim = Join-Path $_.FullName "tb_slim"
-        $tbMain = Join-Path $_.FullName "tb"
-        (Get-ChildItem -LiteralPath $tbSlim -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1) -or
-        (Get-ChildItem -LiteralPath $tbMain -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1)
-    } |
-    Sort-Object Name
-
-if ($ikRuns.Count -lt 1) {
-    throw "No full-dataset IK controller TensorBoard runs found under: $resolvedRunsRoot"
-}
-
-$logdirSpec = ($ikRuns | ForEach-Object {
-    $runName = $_.Name.Replace(",", "_").Replace(":", "_")
-    $tbSlim = Join-Path $_.FullName "tb_slim"
-    $tbMain = Join-Path $_.FullName "tb"
-    $tbDir = if (Get-ChildItem -LiteralPath $tbSlim -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1) {
-        $tbSlim
-    } else {
-        $tbMain
-    }
-    "${runName}:$tbDir"
-}) -join ","
+$maxRuns = 80
 
 # Remove the old copied mirror if it exists. Deleting this directory is safe:
 # old launcher versions created it under training/runs and copied event files
@@ -72,6 +26,37 @@ if (Test-Path -LiteralPath $stackRoot) {
         throw "Refusing to clear unexpected TensorBoard stack path: $resolvedStackRoot"
     }
     Remove-Item -LiteralPath $stackRoot -Recurse -Force
+}
+New-Item -ItemType Directory -Path $stackRoot | Out-Null
+
+$eventRuns = Get-ChildItem -LiteralPath $resolvedRunsRoot -Directory |
+    Where-Object {
+        $_.Name -notin @("cache", "model_comparisons", "tensorboard_stack") -and
+        $_.Name -notlike "_crashed*"
+    } |
+    ForEach-Object {
+        $latestEvent = Get-ChildItem -LiteralPath $_.FullName -Recurse -Filter "events.out.tfevents*" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($null -ne $latestEvent) {
+            [PSCustomObject]@{
+                Name = $_.Name
+                TbDir = $latestEvent.DirectoryName
+                LastWriteTime = $latestEvent.LastWriteTime
+            }
+        }
+    } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First $maxRuns
+
+if ($eventRuns.Count -lt 1) {
+    throw "No TensorBoard event files found under: $resolvedRunsRoot"
+}
+
+foreach ($run in $eventRuns) {
+    $safeName = $run.Name.Replace(",", "_").Replace(":", "_")
+    $linkPath = Join-Path $stackRoot $safeName
+    New-Item -ItemType Junction -Path $linkPath -Target $run.TbDir | Out-Null
 }
 
 $listeners = Get-NetTCPConnection -LocalPort 6006 -State Listen -ErrorAction SilentlyContinue |
@@ -88,13 +73,13 @@ if (Test-Path -LiteralPath $tbInfo) {
 
 Start-Process -FilePath $pythonExe -ArgumentList @(
     "-m", "tensorboard.main",
-    "--logdir_spec", $logdirSpec,
+    "--logdir", $stackRoot,
     "--host", "127.0.0.1",
     "--port", "6006",
     "--reload_interval", "2"
 ) -WindowStyle Hidden
 
-$deadline = (Get-Date).AddSeconds(20)
+$deadline = (Get-Date).AddSeconds(60)
 do {
     Start-Sleep -Milliseconds 500
     try {

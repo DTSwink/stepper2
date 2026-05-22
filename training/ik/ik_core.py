@@ -32,8 +32,12 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import body_mass
-import contact_physics as cp
+try:
+    from . import body_mass
+    from . import contact_physics as cp
+except ImportError:
+    import body_mass
+    import contact_physics as cp
 
 
 @dataclass

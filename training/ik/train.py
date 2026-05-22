@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -321,6 +323,15 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = float(lr)
 
 
+def release_stepper(stepper: object | None, device: torch.device) -> None:
+    if stepper is None:
+        return
+    del stepper
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def make_summary_writer(run_dir: Path) -> tuple[SummaryWriter, Path]:
     tb_dir = run_dir / TB_DIR_NAME
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -335,6 +346,29 @@ def assert_tensorboard_event_file(tb_dir: Path) -> None:
             return
         time.sleep(0.05)
     raise RuntimeError(f"TensorBoard event file was not created in {tb_dir}")
+
+
+def refresh_tensorboard_async() -> None:
+    script = PROJECT_ROOT / "training" / "ik" / "launch_tensorboard_latest.ps1"
+    if not script.exists():
+        return
+    try:
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+    except Exception as exc:
+        print(f"tensorboard refresh skipped: {exc}", flush=True)
 
 
 def payload_slice(store: rollout_data.ClipStore) -> slice:
@@ -636,8 +670,9 @@ def make_supervised_stepper(
     rollout_k: int,
     batch_size: int,
     start_pools: dict[int, StartPool],
+    use_cuda_graph: bool = USE_CUDA_GRAPH,
 ) -> EagerSupervisedStep | CudaGraphSupervisedStep:
-    if USE_CUDA_GRAPH and store.device.type == "cuda":
+    if bool(use_cuda_graph) and store.device.type == "cuda":
         return CudaGraphSupervisedStep(model, optimizer, store, cfg, rollout_k, batch_size, start_pools)
     return EagerSupervisedStep(model, optimizer, store, cfg, rollout_k, batch_size, start_pools)
 
@@ -721,12 +756,100 @@ def save_named_checkpoint(
     return path
 
 
+def write_readable_config(
+    run_dir: Path,
+    args: argparse.Namespace,
+    cfg: tl.TrainConfig,
+    metadata: dict,
+    *,
+    init_checkpoint: Path | None,
+    train_steps: int,
+    start_step: int,
+) -> None:
+    important = {
+        "run_label": str(args.run_label),
+        "mode": "supervised",
+        "init_checkpoint": str(init_checkpoint or ""),
+        "start_step": int(start_step),
+        "train_steps": int(train_steps),
+        "npz": str(args.npz or ""),
+        "periodic_folder": str(args.periodic_folder or ""),
+        "nonperiodic_folder": str(args.nonperiodic_folder or ""),
+        "batch_size": int(metadata["batch_size"]),
+        "clip_id_count": int(metadata["clip_id_count"]),
+        "row_count": int(metadata["row_count"]),
+        "rollout_schedule": metadata["rollout_schedule"],
+        "rollout_stage_steps": metadata["rollout_stage_steps"],
+        "learning_rate": float(LEARNING_RATE),
+        "hidden_dim": int(HIDDEN_DIM),
+        "num_hidden_layers": int(NUM_HIDDEN_LAYERS),
+        "use_cuda_graph": bool(USE_CUDA_GRAPH),
+        "effective_use_cuda_graph": bool(metadata.get("effective_use_cuda_graph", USE_CUDA_GRAPH)),
+        "cuda_amp": bool(USE_CUDA_AMP),
+        "checkpoint_policy": "init, latest every logged step, best at K32, last",
+    }
+    full = {
+        "important": important,
+        "args": vars(args),
+        "training_constants": {
+            "BATCH_SIZE": BATCH_SIZE,
+            "MAX_ROLLOUT_K": MAX_ROLLOUT_K,
+            "ROLLOUT_K": ROLLOUT_K,
+            "ROLLOUT_SCHEDULE": ROLLOUT_SCHEDULE,
+            "ROLLOUT_STAGE_STEPS": ROLLOUT_STAGE_STEPS,
+            "TRAIN_STEPS": TRAIN_STEPS,
+            "LEARNING_RATE": LEARNING_RATE,
+            "HIDDEN_DIM": HIDDEN_DIM,
+            "NUM_HIDDEN_LAYERS": NUM_HIDDEN_LAYERS,
+            "ROOT_LOOKAHEAD_STEPS": ROOT_LOOKAHEAD_STEPS,
+            "VALIDATION_ROWS": VALIDATION_ROWS,
+            "USE_CUDA_GRAPH": USE_CUDA_GRAPH,
+            "effective_use_cuda_graph": bool(metadata.get("effective_use_cuda_graph", USE_CUDA_GRAPH)),
+            "USE_CUDA_AMP": USE_CUDA_AMP,
+            "LR_STAGE_DECAYS": LR_STAGE_DECAYS,
+        },
+        "metadata": metadata,
+        "train_config": asdict(cfg),
+    }
+    (run_dir / "config_readable.json").write_text(json.dumps(full, indent=2), encoding="utf-8")
+
+
+def load_init_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint: Path,
+    load_optimizer: bool,
+) -> tuple[int, float, int, dict]:
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    if load_optimizer and "optimizer" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        except Exception as exc:
+            print(f"optimizer state not loaded from {checkpoint}: {exc}", flush=True)
+    return (
+        int(ckpt.get("epoch", 0)),
+        float(ckpt.get("best_val", float("inf"))),
+        int(ckpt.get("rollout_k", 0)),
+        dict(ckpt.get("metadata", {})),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Contained IK supervised rollout trainer with per-row random sampling.")
     parser.add_argument("--npz", default=None, help="NPZ file, NPZ folder, or semicolon-separated NPZ list.")
     parser.add_argument("--periodic-folder", default=None, help="Periodic NPZ folder/list; clips are sampled cyclically.")
     parser.add_argument("--nonperiodic-folder", default=None, help="Nonperiodic NPZ folder/list; clips are not sampled cyclically.")
     parser.add_argument("--run-label", default="walkF_supervised")
+    parser.add_argument("--init-checkpoint", default="", help="Optional controller checkpoint to initialize from.")
+    parser.add_argument("--train-steps", type=int, default=TRAIN_STEPS, help="Override supervised training step count.")
+    parser.add_argument("--load-optimizer", action="store_true", help="Also load optimizer state from --init-checkpoint.")
+    parser.add_argument(
+        "--resume-step-from-checkpoint",
+        action="store_true",
+        help="Continue the schedule from the checkpoint epoch instead of using it only as initialization.",
+    )
+    parser.add_argument("--disable-cuda-graph", action="store_true", help="Use eager supervised updates instead of CUDA graph replay.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -743,14 +866,29 @@ def main() -> None:
     clip_specs = resolve_clip_specs(args.npz, args.periodic_folder, args.nonperiodic_folder)
     clips = load_clips(clip_specs, cfg)
     input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
+    use_cuda_graph = bool(USE_CUDA_GRAPH and not args.disable_cuda_graph)
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
     optimizer = make_adamw(
         model.parameters(),
         LEARNING_RATE,
         device,
         weight_decay=0.0,
-        capturable=bool(USE_CUDA_GRAPH and device.type == "cuda"),
+        capturable=bool(use_cuda_graph and device.type == "cuda"),
     )
+    base_step = 0
+    init_best = float("inf")
+    init_rollout_k = 0
+    init_metadata: dict = {}
+    init_checkpoint = resolve_path(args.init_checkpoint) if args.init_checkpoint else None
+    if init_checkpoint is not None:
+        base_step, init_best, init_rollout_k, init_metadata = load_init_checkpoint(
+            model,
+            optimizer,
+            init_checkpoint,
+            bool(args.load_optimizer),
+        )
+        print(f"loaded init checkpoint {init_checkpoint} epoch={base_step} K={init_rollout_k}", flush=True)
+    start_step = int(base_step) if bool(args.resume_step_from_checkpoint) else 0
     store = rollout_data.ClipStore(clips, cfg, device)
     stage_cache: dict[int, dict[str, object]] = {}
     for stage_k in ROLLOUT_SCHEDULE:
@@ -773,6 +911,7 @@ def main() -> None:
     run_id = ik_run_id(args.run_label)
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    train_steps = max(1, int(args.train_steps))
     metadata = {
         "npz_paths": [str(path) for path, _cyclic in clip_specs],
         "npz_folders": [
@@ -785,7 +924,7 @@ def main() -> None:
             "gpu_resident_rollout": True,
             "random_clip_per_row": True,
             "mixed_rollout_at_max": True,
-            "training_step": "staged_cuda_graph_static_masked" if USE_CUDA_GRAPH and device.type == "cuda" else "staged_eager",
+            "training_step": "staged_cuda_graph_static_masked" if use_cuda_graph and device.type == "cuda" else "staged_eager",
             "cuda_amp": bool(USE_CUDA_AMP and device.type == "cuda"),
             "stage_lr_decays": [(float(t), float(m)) for t, m in LR_STAGE_DECAYS],
             "cyclic": True,
@@ -812,9 +951,26 @@ def main() -> None:
         "clip_id_count": len(clips),
         "input_dim": input_dim,
         "output_dim": output_dim,
+        "init_checkpoint": str(init_checkpoint or ""),
+        "source_epoch": int(base_step),
+        "source_rollout_k": int(init_rollout_k),
+        "resume_step_from_checkpoint": bool(args.resume_step_from_checkpoint),
+        "start_step": int(start_step),
+        "train_steps": int(train_steps),
+        "effective_use_cuda_graph": bool(use_cuda_graph),
+        "source_metadata": init_metadata,
     }
     config_payload = {"config": asdict(cfg), "metadata": metadata}
     (run_dir / "config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
+    write_readable_config(
+        run_dir,
+        args,
+        cfg,
+        metadata,
+        init_checkpoint=init_checkpoint,
+        train_steps=train_steps,
+        start_step=start_step,
+    )
     writer, tb_dir = make_summary_writer(run_dir)
     print(f"tensorboard_logdir={tb_dir}", flush=True)
     writer.add_text("config/json", f"```json\n{json.dumps(config_payload, indent=2)}\n```", 0)
@@ -825,13 +981,17 @@ def main() -> None:
     writer.add_scalar("train/effective_rollout_k_max", float(ROLLOUT_SCHEDULE[0]), 0)
     writer.flush()
     assert_tensorboard_event_file(tb_dir)
+    refresh_tensorboard_async()
 
-    best = float("inf")
+    best = init_best
+    save_named_checkpoint(run_dir, run_id, "init", model, optimizer, start_step, best, cfg, metadata)
     start = time.perf_counter()
     current_stage_k = -1
     current_lr = None
     stepper: EagerSupervisedStep | CudaGraphSupervisedStep | None = None
-    for step in range(1, TRAIN_STEPS + 1):
+    if start_step >= train_steps:
+        print(f"checkpoint already at step={start_step}, train_steps={train_steps}; writing last checkpoint", flush=True)
+    for step in range(start_step + 1, train_steps + 1):
         stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(step)
         stage_step = step - stage_start + 1
         stage_steps = stage_end - stage_start + 1
@@ -841,6 +1001,8 @@ def main() -> None:
             set_optimizer_lr(optimizer, lr)
             current_lr = float(lr)
         if stage_k != current_stage_k or lr_changed:
+            release_stepper(stepper, device)
+            stepper = None
             cache = stage_cache[int(stage_k)]
             stepper = make_supervised_stepper(
                 model,
@@ -850,6 +1012,7 @@ def main() -> None:
                 int(stage_k),
                 int(cache["batch_size"]),
                 cache["start_pools"],
+                use_cuda_graph=use_cuda_graph,
             )
             current_stage_k = int(stage_k)
             print(
@@ -861,7 +1024,7 @@ def main() -> None:
         assert stepper is not None
         loss = stepper.step()
 
-        if step == 1 or step == stage_start or step % 250 == 0 or step == TRAIN_STEPS:
+        if step == 1 or step == stage_start or step % 250 == 0 or step == train_steps:
             cache = stage_cache[int(stage_k)]
             model.eval()
             mean_err, max_err = rollout_joint_error(
@@ -876,6 +1039,7 @@ def main() -> None:
             if int(stage_k) == int(ROLLOUT_K) and mean_err < best:
                 best = mean_err
                 save_named_checkpoint(run_dir, run_id, "best", model, optimizer, step, best, cfg, metadata)
+            save_named_checkpoint(run_dir, run_id, "latest", model, optimizer, step, best, cfg, metadata)
             elapsed = time.perf_counter() - start
             rollout_stats = cache["rollout_stats"]
             best_to_log = best if best < float("inf") else mean_err
@@ -887,7 +1051,9 @@ def main() -> None:
                 f"lr={float(current_lr):.3g} elapsed_s={elapsed:.1f}",
                 flush=True,
             )
-            writer.add_scalar("train/loss", float(loss.detach().cpu()), step)
+            loss_value = float(loss.detach().cpu())
+            writer.add_scalar("train/loss", loss_value, step)
+            writer.add_scalar("loss/supervised", loss_value, step)
             writer.add_scalar("eval/rollout_mean_m", mean_err, step)
             writer.add_scalar("eval/rollout_max_m", max_err, step)
             writer.add_scalar("eval/best_m", best_to_log, step)
@@ -899,9 +1065,10 @@ def main() -> None:
             writer.add_scalar("time/elapsed_s", elapsed, step)
             writer.flush()
 
-    last = save_named_checkpoint(run_dir, run_id, "last", model, optimizer, TRAIN_STEPS, best, cfg, metadata)
+    last = save_named_checkpoint(run_dir, run_id, "last", model, optimizer, train_steps, best, cfg, metadata)
     writer.close()
     assert_tensorboard_event_file(tb_dir)
+    refresh_tensorboard_async()
     print(f"saved {last}", flush=True)
 
 
