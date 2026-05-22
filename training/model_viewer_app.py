@@ -38,7 +38,7 @@ if str(IK_DIR) not in sys.path:
 import train_locomotion as tl
 import ik_core as ik_tl
 import contact_physics as cp
-import transition_autoencoder as tae
+from ik import transition_autoencoder as tae
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
     FootContactConfig,
@@ -318,14 +318,14 @@ def newest_checkpoint(policy: str = "last") -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
     policy = normalize_checkpoint_policy(policy)
-    patterns = ["checkpoint_best*.pt"] if policy == "best" else ["checkpoint*.pt"]
-    fallback_patterns = ["checkpoint*.pt"] if policy == "best" else []
+    patterns = ["*best*.pt", "checkpoint_best*.pt"] if policy == "best" else ["*last*.pt", "checkpoint*.pt"]
+    fallback_patterns = ["*.pt"] if policy == "best" else ["*best*.pt", "*.pt"]
     candidates: list[Path] = []
     for pattern in patterns + fallback_patterns:
         candidates.extend(checkpoint_candidates(pattern))
     candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
     for path in candidates:
-        if is_locomotion_checkpoint(path):
+        if is_locomotion_checkpoint(path) and checkpoint_uses_ik(path):
             return path
     return None
 
@@ -409,7 +409,7 @@ class Actor:
     kind: str
     name: str
     color: str
-    ik_mode: bool = False
+    ik_mode: bool = True
     visible: bool = True
     offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     npz_path: Path | None = None
@@ -475,7 +475,7 @@ class Actor:
         return int(self.clip.pelvis) if self.clip is not None else 0
 
     def backend(self):
-        return ik_tl if self.ik_mode else tl
+        return ik_tl
 
     def has_initial_pelvis_offset(self) -> bool:
         return bool(np.linalg.norm(self.initial_pelvis_offset) > 1e-7)
@@ -526,12 +526,15 @@ class Actor:
         out[: min(2, values.shape[0])] = values[:2].astype(np.float32)
         return out
 
-    def load_npz(self, path: Path, cfg: tl.TrainConfig | None = None) -> None:
+    def load_npz(self, path: Path, cfg: object | None = None) -> None:
         self.npz_path = path
         self.source_npz_path = path if self.kind == "model" else None
-        self.cfg = cfg or tl.TrainConfig()
+        self.ik_mode = True
+        self.cfg = cfg or ik_tl.TrainConfig()
+        if hasattr(self.cfg, "pose_representation"):
+            self.cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
         self.cfg.use_torch_compile = False
-        self.clip = tl.MotionClip(path, self.cfg)
+        self.clip = ik_tl.MotionClip(path, self.cfg)
         self.clip_tensors = None
         self.source_contacts = self.load_source_contacts(path)
         self.status = f"{self.clip.T} frames, {self.clip.J} bones"
@@ -548,16 +551,16 @@ class Actor:
             return None
         return contacts[:, :2].copy()
 
-    def load_checkpoint(self, checkpoint_path: Path, source_npz_path: Path, device: torch.device, ik_mode: bool = False) -> None:
+    def load_checkpoint(self, checkpoint_path: Path, source_npz_path: Path, device: torch.device) -> None:
         self.checkpoint_path = checkpoint_path
         self.source_npz_path = source_npz_path
         self.device = device
-        self.ik_mode = bool(ik_mode)
+        self.ik_mode = True
         backend = self.backend()
         self.checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self.cfg = backend.TrainConfig()
         apply_config_dict_generic(self.cfg, self.checkpoint.get("config", {}))
-        if self.ik_mode and hasattr(self.cfg, "pose_representation"):
+        if hasattr(self.cfg, "pose_representation"):
             self.cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
         self.cfg.device = str(device)
         self.cfg.use_torch_compile = False
@@ -576,8 +579,7 @@ class Actor:
         self.model.eval()
         self.clip_tensors = self.clip.tensors(device)
         self.reset_generation()
-        mode = "IK " if self.ik_mode else ""
-        self.status = f"on-demand {mode}model, source {source_npz_path.name}"
+        self.status = f"on-demand IK model, source {source_npz_path.name}"
 
     def reset_generation(self) -> None:
         with self.generation_lock:
@@ -897,17 +899,22 @@ class Actor:
     def next_pose_from_prediction(
         self, pred_pose: dict[str, torch.Tensor], canon_pos: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        pose = {
-            "pelvis_pos": pred_pose["pelvis_pos"],
-            "pelvis_rot6": pred_pose["pelvis_rot6"],
-            "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
-            "canon_pos": canon_pos,
-            "contacts": pred_pose["contacts"],
-        }
-        if "core_nonpelvis_rot6" in pred_pose:
-            pose["core_nonpelvis_rot6"] = pred_pose["core_nonpelvis_rot6"]
-        if "ik_marker_pos" in pred_pose:
-            pose["ik_marker_pos"] = pred_pose["ik_marker_pos"]
+        backend = self.backend()
+        if hasattr(backend, "next_pose_from_prediction"):
+            pose = backend.next_pose_from_prediction(pred_pose, canon_pos)
+        else:
+            pose = {
+                "pelvis_pos": pred_pose["pelvis_pos"],
+                "pelvis_rot6": pred_pose["pelvis_rot6"],
+                "nonpelvis_rot6": pred_pose["nonpelvis_rot6"],
+                "canon_pos": canon_pos,
+            }
+            if "core_nonpelvis_rot6" in pred_pose:
+                pose["core_nonpelvis_rot6"] = pred_pose["core_nonpelvis_rot6"]
+            if "ik_payload" in pred_pose:
+                pose["ik_payload"] = pred_pose["ik_payload"]
+        if "contacts" in pred_pose:
+            pose["contacts"] = pred_pose["contacts"]
         return pose
 
     def _generate_to_locked(self, frame: int) -> None:
@@ -973,12 +980,12 @@ class Actor:
         assert self.clip is not None and self.cfg is not None and self.device is not None
         assert self.prev_pose is not None and self.cur_pose is not None and self.cur_idx is not None
         backend = self.backend()
-        current = backend.body_pose_vector(self.cur_pose, self.cfg.use_contact_state, self.cfg.zero_contact_state)
-        previous = backend.body_pose_vector(self.prev_pose, self.cfg.use_contact_state, self.cfg.zero_contact_state)
+        current = backend.body_pose_vector(self.cur_pose)
+        previous = backend.body_pose_vector(self.prev_pose)
         pelvis_vel = (self.cur_pose["pelvis_pos"] - self.prev_pose["pelvis_pos"]) / self.cfg.pose_delta_scale_final
-        if "ik_marker_pos" in self.cur_pose:
+        if "ik_payload" in self.cur_pose:
             joint_vel = (
-                self.cur_pose["ik_marker_pos"] - self.prev_pose["ik_marker_pos"]
+                self.cur_pose["ik_payload"] - self.prev_pose["ik_payload"]
             ).reshape(self.cur_idx.shape[0], -1) / self.cfg.pose_delta_scale_final
         else:
             joint_vel = (self.cur_pose["canon_pos"] - self.prev_pose["canon_pos"]).reshape(self.cur_idx.shape[0], -1) / self.cfg.pose_delta_scale_final
@@ -1232,7 +1239,7 @@ class ModelViewerApp(tk.Tk):
         self.show_foot_height_var = tk.BooleanVar(value=False)
         self.show_foot_contact_var = tk.BooleanVar(value=False)
         self.foot_contact_from_source_var = tk.BooleanVar(value=False)
-        self.ik_mode_var = tk.BooleanVar(value=False)
+        self.ik_mode_var = tk.BooleanVar(value=True)
         self.controller_detected_on_startup = self.poll_controller().connected
         self.controller_enabled_var = tk.BooleanVar(value=self.controller_detected_on_startup)
         self.show_trajectory_var = tk.BooleanVar(value=True)
@@ -1392,7 +1399,6 @@ class ModelViewerApp(tk.Tk):
         open_controls = ttk.Frame(toolbar, style="Toolbar.TFrame")
         open_controls.pack(side=tk.LEFT, padx=(0, 6), anchor=tk.N)
         ttk.Button(open_controls, text="Open File...", command=self.open_file).pack(anchor=tk.W)
-        ttk.Checkbutton(open_controls, text="IK", variable=self.ik_mode_var, command=self.on_ik_mode_toggle).pack(anchor=tk.W)
         ttk.Button(toolbar, text="Play/Pause", command=self.toggle_play).pack(side=tk.LEFT, padx=3, anchor=tk.N)
         ttk.Button(toolbar, text="Stop", command=self.stop_playback).pack(side=tk.LEFT, padx=3, anchor=tk.N)
         ttk.Label(toolbar, text="Speed", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 4), anchor=tk.N, pady=(6, 0))
@@ -2265,14 +2271,13 @@ class ModelViewerApp(tk.Tk):
         return actor
 
     def add_checkpoint_actor(self, path: Path, source_npz_path: Path | None = None) -> Actor:
-        ik_mode = checkpoint_uses_ik(path)
-        self.ik_mode_var.set(ik_mode)
+        self.ik_mode_var.set(True)
         actor = Actor(
             actor_id=self.next_actor_id,
             kind="model",
             name=actor_basename(path),
             color=PRED_ORANGE,
-            ik_mode=ik_mode,
+            ik_mode=True,
             checkpoint_path=path,
             status="needs source NPZ",
         )
@@ -2411,30 +2416,12 @@ class ModelViewerApp(tk.Tk):
         if device_name == "cuda" and not torch.cuda.is_available():
             device_name = "cpu"
             self.device_var.set("cpu")
-        actor.load_checkpoint(actor.checkpoint_path, source_npz_path, torch.device(device_name), ik_mode=actor.ik_mode)
-        self.ik_mode_var.set(bool(actor.ik_mode))
+        actor.load_checkpoint(actor.checkpoint_path, source_npz_path, torch.device(device_name))
+        self.ik_mode_var.set(True)
         self.frame = 0.0
 
     def on_ik_mode_toggle(self) -> None:
-        actor = self.selected_actor()
-        if actor is None or actor.kind != "model" or actor.checkpoint_path is None:
-            return
-        if actor.source_npz_path is None:
-            actor.ik_mode = bool(self.ik_mode_var.get())
-            return
-        actor.ik_mode = bool(self.ik_mode_var.get())
-        try:
-            self.load_model_source(actor, actor.source_npz_path, clear_random=False)
-        except Exception as exc:
-            actor.ik_mode = not actor.ik_mode
-            self.ik_mode_var.set(bool(actor.ik_mode))
-            messagebox.showerror("IK mode failed", str(exc))
-            return
-        self.refresh_tree(select_id=actor.actor_id)
-        self.update_timeline()
-        self.update_bounds()
-        self.invalidate_shadow_cache()
-        self.draw()
+        self.ik_mode_var.set(True)
 
     def selected_actor(self) -> Actor | None:
         if self.selected_actor_id is None:
@@ -2580,7 +2567,7 @@ class ModelViewerApp(tk.Tk):
                 var.set(0.0)
             self.root_yaw_var.set(0.0)
             self.root_yaw_affect_velocity_var.set(False)
-            self.ik_mode_var.set(False)
+            self.ik_mode_var.set(True)
             self.source_button.state(["disabled"])
             self.status_var.set("No actor selected.")
             self.loading_inspector = False
@@ -2593,7 +2580,7 @@ class ModelViewerApp(tk.Tk):
             var.set(float(actor.initial_pelvis_offset[i] if actor.kind == "model" else 0.0))
         self.root_yaw_var.set(float(actor.initial_root_yaw))
         self.root_yaw_affect_velocity_var.set(bool(actor.initial_root_yaw_affect_velocity))
-        self.ik_mode_var.set(bool(actor.ik_mode))
+        self.ik_mode_var.set(True)
         if actor.kind == "model":
             self.source_button.state(["!disabled"])
             checkpoint = actor.checkpoint_path.name if actor.checkpoint_path else "checkpoint"
@@ -4443,8 +4430,10 @@ class ModelViewerApp(tk.Tk):
                 model.eval()
                 for param in model.parameters():
                     param.requires_grad_(False)
-                loco_cfg = tl.TrainConfig()
-                apply_config_dict(loco_cfg, ckpt.get("locomotion_config", {}))
+                loco_cfg = ik_tl.TrainConfig()
+                apply_config_dict_generic(loco_cfg, ckpt.get("locomotion_config", {}))
+                if hasattr(loco_cfg, "pose_representation"):
+                    loco_cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
                 loco_cfg.use_torch_compile = False
                 self.ae_prior_info = {
                     "path": path,
@@ -4500,7 +4489,7 @@ class ModelViewerApp(tk.Tk):
         self,
         actor: Actor,
         idx: torch.Tensor,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         assert actor.clip is not None
@@ -4517,7 +4506,7 @@ class ModelViewerApp(tk.Tk):
                 frame_idx = torch.tensor([frame], dtype=torch.long, device=device)
                 if not actor.clip.cyclic_animation:
                     frame_idx = torch.clamp(frame_idx, min=0, max=actor.clip.T - 1)
-                root_pos, root_rot, root_yaw, root_heading = tl.root_state(actor.clip, frame_idx, cfg, device)
+                root_pos, root_rot, root_yaw, root_heading = ik_tl.root_state(actor.clip, frame_idx, cfg, device)
             positions.append(root_pos[0])
             rotations.append(root_rot[0])
             yaws.append(root_yaw.reshape(-1)[0])
@@ -4534,7 +4523,7 @@ class ModelViewerApp(tk.Tk):
         actor: Actor,
         prev_idx: torch.Tensor,
         cur_idx: torch.Tensor,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> torch.Tensor:
         prev_pos, _prev_rot, prev_yaw, prev_heading = self.ae_root_state_for_actor(actor, prev_idx, cfg, device)
@@ -4542,14 +4531,14 @@ class ModelViewerApp(tk.Tk):
         delta_local = torch.matmul((cur_pos - prev_pos).unsqueeze(1), prev_heading).squeeze(1)
         dx = delta_local[:, 0] / cfg.max_speed_scale_final
         dz = delta_local[:, 2] / cfg.max_speed_scale_final
-        dyaw = tl.wrap_angle(cur_yaw - prev_yaw) / cfg.max_turn_rate_scale_final
+        dyaw = ik_tl.wrap_angle(cur_yaw - prev_yaw) / cfg.max_turn_rate_scale_final
         return torch.stack((dx, dz, dyaw), dim=-1)
 
     def ae_future_root_features(
         self,
         actor: Actor,
         cur_idx: torch.Tensor,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> torch.Tensor:
         feats: list[torch.Tensor] = []
@@ -4563,7 +4552,7 @@ class ModelViewerApp(tk.Tk):
             scale_k = max(1e-6, float(k) * float(cfg.max_speed_scale_final))
             dx = torch.clamp(fut_local[:, 0] / scale_k, -2.0, 2.0)
             dz = torch.clamp(fut_local[:, 2] / scale_k, -2.0, 2.0)
-            dyaw = tl.wrap_angle(fut_yaw - cur_yaw)
+            dyaw = ik_tl.wrap_angle(fut_yaw - cur_yaw)
             feats.append(torch.stack((dx, dz, torch.cos(dyaw), torch.sin(dyaw)), dim=-1))
         return torch.cat(feats, dim=-1)
 
@@ -4573,7 +4562,7 @@ class ModelViewerApp(tk.Tk):
         cur_idx: torch.Tensor,
         cur_pose: dict[str, torch.Tensor],
         next_pose: dict[str, torch.Tensor],
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> torch.Tensor:
         assert actor.clip is not None
@@ -4581,8 +4570,8 @@ class ModelViewerApp(tk.Tk):
         next_root_pos, next_root_rot, _next_yaw, _next_heading = self.ae_root_state_for_actor(
             actor, cur_idx + 1, cfg, device
         )
-        cur_pos, cur_rot, _cur_canon = tl.fk_from_pose(actor.clip, cur_root_pos, cur_root_rot, cur_pose, device)
-        next_pos, next_rot, _next_canon = tl.fk_from_pose(actor.clip, next_root_pos, next_root_rot, next_pose, device)
+        cur_pos, cur_rot, _cur_canon = ik_tl.fk_from_pose(actor.clip, cur_root_pos, cur_root_rot, cur_pose, device)
+        next_pos, next_rot, _next_canon = ik_tl.fk_from_pose(actor.clip, next_root_pos, next_root_rot, next_pose, device)
         foot_indices = tuple(int(x) for x in actor.clip.foot_indices_tensor.tolist())
         toe_indices = tuple(int(x) for x in actor.clip.toe_indices_tensor.tolist())
         slide = cp.foot_slide_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, actor.clip.fps)
@@ -4595,7 +4584,7 @@ class ModelViewerApp(tk.Tk):
         self,
         actor: Actor,
         cur_idx: torch.Tensor,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> torch.Tensor:
         steps = max(0, int(getattr(cfg, "root_lookahead_steps", 0)))
@@ -4619,20 +4608,27 @@ class ModelViewerApp(tk.Tk):
         prev_pose: dict[str, torch.Tensor],
         cur_pose: dict[str, torch.Tensor],
         next_pose: dict[str, torch.Tensor],
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> torch.Tensor:
         assert actor.clip is not None
-        current = tl.body_pose_vector(cur_pose, cfg.use_contact_state, cfg.zero_contact_state)
-        previous = tl.body_pose_vector(prev_pose, cfg.use_contact_state, cfg.zero_contact_state)
+        current = ik_tl.body_pose_vector(cur_pose)
+        previous = ik_tl.body_pose_vector(prev_pose)
         pelvis_vel = (cur_pose["pelvis_pos"] - prev_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
-        joint_vel = (cur_pose["canon_pos"] - prev_pose["canon_pos"]).reshape(cur_idx.shape[0], -1) / cfg.pose_delta_scale_final
+        if "ik_payload" in cur_pose:
+            joint_vel = (cur_pose["ik_payload"] - prev_pose["ik_payload"]).reshape(cur_idx.shape[0], -1)
+        else:
+            joint_vel = (cur_pose["canon_pos"] - prev_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
+        joint_vel = joint_vel / cfg.pose_delta_scale_final
         root_feat = self.ae_root_delta_feature(actor, prev_idx, cur_idx, cfg, device)
         future_feat = self.ae_future_root_features(actor, cur_idx, cfg, device)
         model_input = torch.cat((current, previous, pelvis_vel, joint_vel, root_feat, future_feat), dim=-1)
-        next_output = tl.pose_target_output(next_pose)
+        next_output = ik_tl.pose_target_output(next_pose)
         pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
-        joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
+        if "ik_payload" in next_pose:
+            joint_next_vel = (next_pose["ik_payload"] - cur_pose["ik_payload"]).reshape(cur_idx.shape[0], -1)
+        else:
+            joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
         joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
         parts = [
             model_input,
@@ -4651,7 +4647,7 @@ class ModelViewerApp(tk.Tk):
         self,
         actor: Actor,
         frame: int,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> dict[str, torch.Tensor] | None:
         if actor.clip is None:
@@ -4681,26 +4677,62 @@ class ModelViewerApp(tk.Tk):
         if frame < len(actor.generated_contacts):
             contacts_np[: min(2, len(actor.generated_contacts[frame]))] = actor.generated_contacts[frame][:2]
         contacts = torch.as_tensor(contacts_np, dtype=torch.float32, device=device).view(1, 2)
-        return {
+        pose = {
             "pelvis_pos": pelvis_pos,
-            "pelvis_rot6": tl.rotmat_to_6d(local_rotations[:, pelvis]),
-            "nonpelvis_rot6": tl.rotmat_to_6d(local_rotations.index_select(1, non_pelvis_idx)),
+            "pelvis_rot6": ik_tl.rotmat_to_6d(local_rotations[:, pelvis]),
+            "nonpelvis_rot6": ik_tl.rotmat_to_6d(local_rotations.index_select(1, non_pelvis_idx)),
             "canon_pos": canon_pos,
             "contacts": contacts,
         }
+        if ik_tl.uses_ik_markers(getattr(actor.clip, "pose_representation", "")):
+            root_local_pos = ik_tl.root_relative_positions(positions, root_pos, root_rot)
+            core_indices = torch.tensor(actor.clip.core_non_pelvis, dtype=torch.long, device=device)
+            pose["core_nonpelvis_rot6"] = ik_tl.rotmat_to_6d(local_rotations.index_select(1, core_indices))
+            payload_chunks: list[torch.Tensor] = []
+            for limb_i, spec in enumerate(actor.clip.ik_limb_specs):
+                start = int(spec["start"])
+                mid = int(spec["mid"])
+                end = int(spec["end"])
+                ee_pos = root_local_pos[:, end]
+                ee_rot_root = rotations[:, end] @ root_inv
+                payload_chunks.append(ee_pos)
+                payload_chunks.append(ik_tl.rotmat_to_6d(ee_rot_root))
+                rest_axis = actor.clip.ik_rest_axis[limb_i].to(dtype=torch.float32, device=device)
+                rest_pole = actor.clip.ik_rest_pole[limb_i].to(dtype=torch.float32, device=device)
+                pole_float = ik_tl.encode_pole_float(
+                    root_local_pos[:, start],
+                    root_local_pos[:, mid],
+                    root_local_pos[:, end],
+                    rest_axis,
+                    rest_pole,
+                ).unsqueeze(-1)
+                payload_chunks.append(pole_float)
+                toe = spec.get("toe")
+                if toe is not None:
+                    toe_i = int(toe)
+                    axis = actor.clip.ik_toe_axis[limb_i].to(dtype=torch.float32, device=device).view(1, 3)
+                    ref = ik_tl.stable_perpendicular(axis)
+                    rotated_ref = torch.matmul(ref.unsqueeze(1), local_rotations[:, toe_i]).squeeze(1)
+                    rotated_ref = ik_tl.project_to_plane(rotated_ref, axis)
+                    sin_v = (torch.cross(ref, rotated_ref, dim=-1) * axis).sum(dim=-1)
+                    cos_v = (ref * rotated_ref).sum(dim=-1)
+                    toe_float = (torch.atan2(sin_v, cos_v) / ik_tl.IK_TOE_ALPHA).unsqueeze(-1)
+                    payload_chunks.append(toe_float)
+            pose["ik_payload"] = ik_tl.clean_ik_payload(torch.cat(payload_chunks, dim=-1))
+        return pose
 
     def ae_pose_for_actor_frame(
         self,
         actor: Actor,
         frame: int,
-        cfg: tl.TrainConfig,
+        cfg: object,
         device: torch.device,
     ) -> dict[str, torch.Tensor] | None:
         if actor.clip is None:
             return None
         if actor.kind == "npz":
             idx = torch.tensor([frame], dtype=torch.long, device=device)
-            return tl.get_pose_from_clip(actor.clip, idx, device)
+            return ik_tl.get_pose_from_clip(actor.clip, idx, device)
         if actor.kind == "model":
             return self.ae_pose_from_generated_frame(actor, frame, cfg, device)
         return None
@@ -4724,7 +4756,7 @@ class ModelViewerApp(tk.Tk):
             return float(cached) if cached is not None else None
 
         cfg = prior["locomotion_config"]
-        if not isinstance(cfg, tl.TrainConfig):
+        if not isinstance(cfg, ik_tl.TrainConfig):
             return None
         device = torch.device("cpu")
         prev = cur - 1
@@ -4786,7 +4818,7 @@ class ModelViewerApp(tk.Tk):
             return None
         return self.apply_actor_world_transform(actor, pose[0], pose[1])
 
-    def foot_loss_config_for_actor(self, actor: Actor) -> tl.TrainConfig:
+    def foot_loss_config_for_actor(self, actor: Actor) -> object:
         if actor.kind == "model" and actor.cfg is not None:
             return actor.cfg
         actor_path = actor.npz_path or actor.source_npz_path
@@ -4803,7 +4835,7 @@ class ModelViewerApp(tk.Tk):
         for other in self.actors:
             if other.kind == "model" and other.cfg is not None:
                 return other.cfg
-        return actor.cfg or tl.TrainConfig()
+        return actor.cfg or ik_tl.TrainConfig()
 
     def training_foot_metrics(
         self,

@@ -24,12 +24,15 @@ except RuntimeError:
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 FBX_PIPELINE_DIR = PROJECT_ROOT / "fbx_npz_pipeline"
+IK_DIR = THIS_DIR / "ik"
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 if str(FBX_PIPELINE_DIR) not in sys.path:
     sys.path.insert(0, str(FBX_PIPELINE_DIR))
+if str(IK_DIR) not in sys.path:
+    sys.path.insert(0, str(IK_DIR))
 
-import train_locomotion as tl
+import ik_core as tl
 
 
 APP_ICON = PROJECT_ROOT / "training" / "assets" / "stepper_trimmer.ico"
@@ -59,6 +62,7 @@ class MotionData:
     path: Path
     clip: tl.MotionClip
     positions: np.ndarray
+    root_positions: np.ndarray
     parents: list[int]
     names: list[str]
     root_index: int
@@ -70,7 +74,7 @@ class MotionData:
 
     @property
     def root_path(self) -> np.ndarray:
-        return self.positions[:, self.root_index, :]
+        return self.root_positions
 
     @property
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
@@ -569,19 +573,38 @@ class NpzTrimmerApp(tk.Tk):
             return None
         return paths[index]
 
+    def decoded_positions_from_clip(self, clip: tl.MotionClip, batch_size: int = 512) -> np.ndarray:
+        """Decode through ik_core so previewed motion matches the 42-dim IK NPZ payload."""
+
+        device = torch.device("cpu")
+        chunks: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, int(clip.T), batch_size):
+                end = min(int(clip.T), start + batch_size)
+                idx = torch.arange(start, end, dtype=torch.long, device=device)
+                pose = tl.get_pose_from_clip(clip, idx, device)
+                root_pos = clip.root_pos.index_select(0, idx)
+                root_rot = clip.root_rot.index_select(0, idx)
+                pos, _rot, _canon = tl.fk_from_pose(clip, root_pos, root_rot, pose, device)
+                chunks.append(pos.detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(chunks, axis=0) if chunks else np.empty((0, 0, 3), dtype=np.float32)
+
     def load_motion(self, path: Path, from_source: bool) -> bool:
         camera_state = self.capture_camera_state()
         self.stop_playback()
         try:
             cfg = tl.TrainConfig()
+            cfg.pose_representation = tl.IK_POSE_REPRESENTATION
             cfg.use_torch_compile = False
             clip = tl.MotionClip(path, cfg)
-            positions = clip.global_pos.detach().cpu().numpy().astype(np.float32)
-            root_index = clip.body_names.index("root") if "root" in clip.body_names else 0
+            positions = self.decoded_positions_from_clip(clip)
+            root_positions = clip.root_pos.detach().cpu().numpy().astype(np.float32)
+            root_index = int(clip.pelvis)
             motion = MotionData(
                 path=path,
                 clip=clip,
                 positions=positions,
+                root_positions=root_positions,
                 parents=[int(parent) for parent in clip.parents_body_list],
                 names=list(clip.body_names),
                 root_index=root_index,

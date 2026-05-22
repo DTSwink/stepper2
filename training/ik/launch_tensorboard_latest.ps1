@@ -16,24 +16,50 @@ if (-not (Test-Path -LiteralPath $runsRoot)) {
 
 $resolvedRunsRoot = (Resolve-Path -LiteralPath $runsRoot).Path
 
-# TensorBoard must watch the real tb folders, not copied event files.
-# It also must not recursively scan all of training/runs, because that tree
-# contains archives and large nested run dumps. --logdir_spec gives live,
-# top-level IK runs without the stale mirror or the deep crawl.
-$ikRuns = Get-ChildItem -LiteralPath $resolvedRunsRoot -Directory |
+# TensorBoard watches only the current full-dataset IK controller sequence.
+# Older probes, AE diagnostics, and archived crashes stay on disk but do not
+# spam the card grid.
+$wantedLabels = @(
+    "full_vanilla_ae_controller_baseline_stall",
+    "full_vanilla_ae_controller_refined_stall",
+    "full_vanilla_ae_controller_random_init_stall"
+)
+
+$candidateRuns = Get-ChildItem -LiteralPath $resolvedRunsRoot -Directory |
     Where-Object {
-        $_.Name -like "*_ik_*" -and
-        (Get-ChildItem -LiteralPath (Join-Path $_.FullName "tb") -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $_.Name -like "*_ik_full_vanilla_ae_controller_*" -and
+        $_.Name -notlike "*_crashed*" -and
+        ($wantedLabels -contains ($_.Name -replace "^\d{8}_\d{6}_ik_", ""))
+    }
+
+$ikRuns = $candidateRuns |
+    Group-Object {
+        $_.Name -replace "^\d{8}_\d{6}_ik_", ""
+    } |
+    ForEach-Object {
+        $_.Group | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    } |
+    Where-Object {
+        $tbSlim = Join-Path $_.FullName "tb_slim"
+        $tbMain = Join-Path $_.FullName "tb"
+        (Get-ChildItem -LiteralPath $tbSlim -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1) -or
+        (Get-ChildItem -LiteralPath $tbMain -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1)
     } |
     Sort-Object Name
 
 if ($ikRuns.Count -lt 1) {
-    throw "No top-level IK TensorBoard runs found under: $resolvedRunsRoot"
+    throw "No full-dataset IK controller TensorBoard runs found under: $resolvedRunsRoot"
 }
 
 $logdirSpec = ($ikRuns | ForEach-Object {
     $runName = $_.Name.Replace(",", "_").Replace(":", "_")
-    $tbDir = Join-Path $_.FullName "tb"
+    $tbSlim = Join-Path $_.FullName "tb_slim"
+    $tbMain = Join-Path $_.FullName "tb"
+    $tbDir = if (Get-ChildItem -LiteralPath $tbSlim -Filter "events.out.tfevents*" -ErrorAction SilentlyContinue | Select-Object -First 1) {
+        $tbSlim
+    } else {
+        $tbMain
+    }
     "${runName}:$tbDir"
 }) -join ","
 

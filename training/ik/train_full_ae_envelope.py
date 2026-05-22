@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -14,13 +16,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 try:
     from .bootstrap import PROJECT_ROOT, ensure_paths
-    from .naming import checkpoint_path, ik_run_id
+    from .naming import checkpoint_path, clean_label, ik_run_id
     from . import excess_envelope as env
     from . import ik_core as tl
     from . import train_simple_ae_controller as ctl
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
-    from naming import checkpoint_path, ik_run_id
+    from naming import checkpoint_path, clean_label, ik_run_id
     import excess_envelope as env
     import ik_core as tl
     import train_simple_ae_controller as ctl
@@ -29,10 +31,12 @@ ensure_paths()
 
 
 RUNS_DIR = PROJECT_ROOT / "training" / "runs"
+CRASHED_RUNS_DIR = RUNS_DIR / "_crashed_ik"
 PERIODIC_FOLDER = PROJECT_ROOT / "ue5" / "animations_omni_only_full" / "npz_final"
 NONPERIODIC_FOLDER = PROJECT_ROOT / "ue5" / "animations_transitions_only_full_trimmed" / "npz_final"
 SCHEDULE = (1, 2, 8, 16, 32)
 LOG_EVERY_STEPS = 100
+ENVELOPE_BATCH_SIZE = 1024
 MIN_STAGE_SECONDS = {1: 45.0, 2: 45.0, 8: 90.0, 16: 120.0, 32: 180.0}
 STALL_PATIENCE_LOGS = {1: 8, 2: 8, 8: 10, 16: 10, 32: 24}
 FINAL_STALL_PATIENCE_LOGS = 36
@@ -42,8 +46,71 @@ EVAL_BATCHES = 32
 
 
 def latest_checkpoint_for_label(label: str, tag: str = "best") -> Path | None:
-    matches = sorted(RUNS_DIR.glob(f"*_ik_{label}/checkpoints/*_{tag}.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    matches = sorted(
+        RUNS_DIR.glob(f"*_ik_{clean_label(label)}/checkpoints/*_{tag}.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     return matches[0] if matches else None
+
+
+def run_dirs_for_label(label: str) -> list[Path]:
+    pattern = f"*_ik_{clean_label(label)}"
+    return sorted((p for p in RUNS_DIR.glob(pattern) if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def checkpoint_in_run(run_dir: Path, tag: str) -> Path | None:
+    matches = sorted((run_dir / "checkpoints").glob(f"*_{tag}.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def archive_run_dir(run_dir: Path, reason: str) -> None:
+    CRASHED_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    target = CRASHED_RUNS_DIR / run_dir.name
+    if target.exists():
+        target = CRASHED_RUNS_DIR / f"{run_dir.name}_{int(time.time())}"
+    status = {
+        "state": "archived",
+        "reason": reason,
+        "source": str(run_dir),
+        "archived_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    (run_dir / "run_status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+    shutil.move(str(run_dir), str(target))
+    print(f"archived incomplete run {run_dir.name} -> {target.name}: {reason}", flush=True)
+
+
+def clean_controller_run_state(label: str) -> Path | None:
+    """Return a resume checkpoint and move no-progress crashed runs out of TensorBoard."""
+    run_dirs = run_dirs_for_label(label)
+    completed = next((checkpoint_in_run(run_dir, "last") for run_dir in run_dirs if checkpoint_in_run(run_dir, "last") is not None), None)
+    if completed is not None:
+        for run_dir in run_dirs:
+            if checkpoint_in_run(run_dir, "last") is None:
+                archive_run_dir(run_dir, "superseded incomplete run; completed checkpoint already exists")
+        return completed
+
+    resume: Path | None = None
+    for run_dir in run_dirs:
+        last = checkpoint_in_run(run_dir, "last")
+        if last is not None:
+            continue
+        latest = checkpoint_in_run(run_dir, "latest")
+        if latest is not None and resume is None:
+            resume = latest
+            continue
+        if latest is None:
+            archive_run_dir(run_dir, "no latest/last checkpoint; restarting this phase cleanly")
+    return completed or resume
+
+
+def write_run_status(run_dir: Path, payload: dict) -> None:
+    data = {
+        **payload,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "pid": os.getpid(),
+    }
+    (run_dir / "run_status.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def make_device() -> torch.device:
@@ -154,7 +221,6 @@ def rollout_loss(
 
     for step in range(max_k):
         active = effective_k > step
-        active_f = active.float()
         inp = ctl.build_controller_input(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
@@ -162,6 +228,7 @@ def rollout_loss(
         pred_vec = ctl.clean_output_vector(raw, store)
         ae_rows = ctl.ae_score_rows(ae, mean, std, inp, pred_vec)
         step_rows = ae_rows
+        active_f = active.float()
         ae_total = ae_total + (ae_rows * row_weight * active_f).sum()
         if envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0):
             cur_pose = pose_from_vec(cur_vec, store)
@@ -192,6 +259,9 @@ def rollout_loss(
             break
 
         continuing = effective_k > (step + 1)
+        rows = continuing.nonzero(as_tuple=False).flatten()
+        if rows.numel() == 0:
+            break
         if envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0):
             assert pred_pose is not None and pred_canon is not None
             next_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
@@ -200,14 +270,16 @@ def rollout_loss(
             next_payload = next_vec[:, ctl.payload_slice(store)]
         else:
             next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
-        mask = continuing[:, None]
-        prev_vec = torch.where(mask, cur_vec, prev_vec)
-        prev_pelvis = torch.where(mask, cur_pelvis, prev_pelvis)
-        prev_payload = torch.where(mask, cur_payload, prev_payload)
-        cur_vec = torch.where(mask, next_vec, cur_vec)
-        cur_pelvis = torch.where(mask, next_pelvis, cur_pelvis)
-        cur_payload = torch.where(mask, next_payload, cur_payload)
-        cur_idx = torch.where(continuing, cur_idx + 1, cur_idx)
+        clip_ids = clip_ids.index_select(0, rows)
+        prev_vec = cur_vec.index_select(0, rows)
+        prev_pelvis = cur_pelvis.index_select(0, rows)
+        prev_payload = cur_payload.index_select(0, rows)
+        cur_vec = next_vec.index_select(0, rows)
+        cur_pelvis = next_pelvis.index_select(0, rows)
+        cur_payload = next_payload.index_select(0, rows)
+        cur_idx = cur_idx.index_select(0, rows) + 1
+        effective_k = effective_k.index_select(0, rows)
+        row_weight = row_weight.index_select(0, rows)
 
     return total_loss, {
         "ae": ae_total,
@@ -287,7 +359,7 @@ def estimate_loss_means(
     rollout_k = int(ctl.ROLLOUT_K)
     values = ctl.rollout_values_for(rollout_k)
     start_pools = ctl.build_start_pools(store, values)
-    batch_size = min(int(ctl.BATCH_SIZE), int(start_pools[rollout_k].row_count))
+    batch_size = min(int(ctl.BATCH_SIZE), ENVELOPE_BATCH_SIZE, int(start_pools[rollout_k].row_count))
     sums = {"ae": 0.0, "linear": 0.0, "angular": 0.0}
     model_was_training = model.training
     model.eval()
@@ -362,6 +434,31 @@ def make_stage_stepper(
     )
 
 
+def log_loss_scalars(
+    writer: SummaryWriter,
+    step: int,
+    total_loss: float,
+    parts: dict[str, float] | None,
+    linear_weight: float,
+    angular_weight: float,
+    has_envelope_loss: bool,
+) -> None:
+    writer.add_scalar("loss/controller_total", total_loss, step)
+    if not parts:
+        return
+
+    writer.add_scalar("loss/ae_score", parts.get("ae", total_loss), step)
+    if not has_envelope_loss:
+        return
+
+    linear = float(parts.get("linear", 0.0))
+    angular = float(parts.get("angular", 0.0))
+    writer.add_scalar("footslide/linear_excess", linear, step)
+    writer.add_scalar("footslide/angular_excess", angular, step)
+    writer.add_scalar("footslide/linear_weighted_loss", linear * float(linear_weight), step)
+    writer.add_scalar("footslide/angular_weighted_loss", angular * float(angular_weight), step)
+
+
 def train_controller_adaptive(
     label: str,
     ae_path: Path,
@@ -373,16 +470,20 @@ def train_controller_adaptive(
     random_init_pose: bool = False,
     start_at_k32: bool = False,
 ) -> Path:
-    existing = latest_checkpoint_for_label(label, "last")
-    if existing is not None:
-        print(f"reuse controller {existing}", flush=True)
-        return existing
+    controller_state = clean_controller_run_state(label)
+    if controller_state is not None:
+        if controller_state.name.endswith("_last.pt"):
+            print(f"reuse controller {controller_state}", flush=True)
+            return controller_state
+        init_checkpoint = controller_state
+        print(f"resume partial controller from {controller_state}", flush=True)
     ae, mean, std, ae_ckpt = ctl.load_simple_ae(ae_path, device)
     cfg, store = load_store_from_ae(ae_ckpt, device)
     input_dim, output_dim = tl.make_batch_dims(store.prototype, cfg)
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
     optimizer = ctl.make_adamw(model.parameters(), ctl.LEARNING_RATE, device, capturable=bool(device.type == "cuda" and envelope is None and not random_init_pose))
     base_step = 0
+    loaded_k = 0
     prior_metadata: dict = {}
     if init_checkpoint is not None:
         base_step, _best, loaded_k, prior_metadata = load_controller_checkpoint(model, optimizer, init_checkpoint)
@@ -415,10 +516,18 @@ def train_controller_adaptive(
     ctl.refresh_tensorboard_async()
 
     step = int(base_step)
+    writer.add_scalar("curriculum/rollout_k", 32 if start_at_k32 else 0, step)
+    writer.flush()
+    ctl.refresh_tensorboard_async()
+    write_run_status(run_dir, {"state": "running", "label": label, "init_checkpoint": str(init_checkpoint or "")})
     best_global = math.inf
     init_tag = "init_from_checkpoint" if init_checkpoint is not None else "init"
     ctl.save_controller_checkpoint(run_dir, run_id, init_tag, model, optimizer, step, best_global, 0, cfg, metadata)
-    schedule = (32,) if start_at_k32 else SCHEDULE
+    if start_at_k32:
+        schedule = (32,)
+    else:
+        min_stage = max(1, int(loaded_k or 1))
+        schedule = tuple(k for k in SCHEDULE if int(k) >= min_stage) or (int(SCHEDULE[-1]),)
     t0 = time.perf_counter()
     last_loss = math.inf
     final_path: Path | None = None
@@ -428,6 +537,8 @@ def train_controller_adaptive(
         start_pools = ctl.build_start_pools(store, rollout_values)
         max_pool = start_pools[int(stage_k)]
         batch_size = min(int(ctl.BATCH_SIZE), int(max_pool.row_count))
+        if envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0):
+            batch_size = min(batch_size, ENVELOPE_BATCH_SIZE)
         stepper = make_stage_stepper(
             model,
             optimizer,
@@ -447,15 +558,15 @@ def train_controller_adaptive(
         stage_logs = 0
         stalls = 0
         best_stage = math.inf
+        has_envelope_loss = envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0)
         print(f"{label}: stage K={stage_k} batch={batch_size} stepper={getattr(stepper, 'kind', 'unknown')}", flush=True)
         while True:
-            block_parts: list[dict[str, float]] = []
             for _ in range(LOG_EVERY_STEPS):
                 step += 1
                 loss = stepper.step()  # type: ignore[attr-defined]
                 last_loss = float(loss.detach().cpu())
-                if hasattr(stepper, "last_parts"):
-                    block_parts.append(dict(getattr(stepper, "last_parts")))
+                parts = dict(getattr(stepper, "last_parts")) if hasattr(stepper, "last_parts") else None
+                log_loss_scalars(writer, step, last_loss, parts, linear_weight, angular_weight, has_envelope_loss)
             stage_logs += 1
             improved = last_loss < best_stage * (1.0 - MIN_DELTA_FRACTION)
             if improved or not math.isfinite(best_stage):
@@ -465,22 +576,11 @@ def train_controller_adaptive(
                 stalls += 1
             best_global = min(best_global, last_loss)
             stats = ctl.rollout_stat_summary(batch_size, int(stage_k))
-            writer.add_scalar("loss/train_total", last_loss, step)
-            writer.add_scalar("loss/train_ae", last_loss, step)
             writer.add_scalar("curriculum/rollout_k", int(stage_k), step)
             writer.add_scalar("curriculum/effective_rollout_k_mean", float(stats["effective_k_mean"]), step)
             writer.add_scalar("curriculum/effective_rollout_k_max", float(stats["effective_k_max"]), step)
             writer.add_scalar("curriculum/stalls", stalls, step)
             writer.add_scalar("time/elapsed_s", time.perf_counter() - t0, step)
-            if block_parts:
-                raw_ae = sum(p.get("ae", 0.0) for p in block_parts) / len(block_parts)
-                raw_linear = sum(p.get("linear", 0.0) for p in block_parts) / len(block_parts)
-                raw_angular = sum(p.get("angular", 0.0) for p in block_parts) / len(block_parts)
-                writer.add_scalar("monitor/raw_ae_loss", raw_ae, step)
-                writer.add_scalar("monitor/raw_linear_excess", raw_linear, step)
-                writer.add_scalar("monitor/raw_angular_excess", raw_angular, step)
-                writer.add_scalar("loss/weighted_linear_excess", raw_linear * float(linear_weight), step)
-                writer.add_scalar("loss/weighted_angular_excess", raw_angular * float(angular_weight), step)
             writer.flush()
             final_path = ctl.save_controller_checkpoint(run_dir, run_id, "latest", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
             elapsed_stage = time.perf_counter() - stage_start
@@ -501,8 +601,9 @@ def train_controller_adaptive(
         final_path = ctl.save_controller_checkpoint(run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
         final_path = ctl.save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
         del stepper
-    writer.close()
     assert final_path is not None
+    writer.close()
+    write_run_status(run_dir, {"state": "complete", "label": label, "last_checkpoint": str(final_path)})
     return final_path
 
 
@@ -542,9 +643,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Full IK vanilla AE baseline, envelope refinement, and random-init run.")
     parser.add_argument("--phase", choices=("all", "baseline", "refine", "final"), default="all")
     parser.add_argument("--ae-label", default="full_vanilla_ae_all")
-    parser.add_argument("--baseline-label", default="full_vanilla_ae_controller_baseline")
-    parser.add_argument("--refined-label", default="full_vanilla_ae_controller_refined")
-    parser.add_argument("--final-label", default="full_vanilla_ae_controller_random_init")
+    parser.add_argument("--baseline-label", default="full_vanilla_ae_controller_baseline_stall")
+    parser.add_argument("--refined-label", default="full_vanilla_ae_controller_refined_stall")
+    parser.add_argument("--final-label", default="full_vanilla_ae_controller_random_init_stall")
     parser.add_argument("--ae-checkpoint", default="")
     parser.add_argument("--baseline-checkpoint", default="")
     parser.add_argument("--refined-checkpoint", default="")
@@ -571,8 +672,15 @@ def main() -> None:
     if args.phase in ("all", "refine"):
         if baseline_path is None:
             raise ValueError("refine phase needs --baseline-checkpoint")
-        weights = compute_refinement_weights(baseline_path, ae_path, device, envelope)
-        save_json(weights_path, weights)
+        if args.weights_json:
+            weights = json.loads(Path(args.weights_json).read_text(encoding="utf-8"))
+            print(f"reuse refinement weights {args.weights_json}", flush=True)
+        elif weights_path.exists():
+            weights = json.loads(weights_path.read_text(encoding="utf-8"))
+            print(f"reuse refinement weights {weights_path}", flush=True)
+        else:
+            weights = compute_refinement_weights(baseline_path, ae_path, device, envelope)
+            save_json(weights_path, weights)
         refined_path = train_controller_adaptive(
             args.refined_label,
             ae_path,

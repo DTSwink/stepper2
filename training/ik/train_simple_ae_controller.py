@@ -1086,13 +1086,13 @@ def main() -> None:
                     f"{gt_text} effK_mean={stats['effective_k_mean']:.2f} lr={lr:.3g} elapsed_s={elapsed:.1f}",
                     flush=True,
                 )
-                writer.add_scalar("loss/train_ae", last_loss, step)
+                writer.add_scalar("loss/controller_total", last_loss, step)
                 if RUN_FK_DIAGNOSTIC:
                     writer.add_scalar("eval/rollout_mean_m", mean_err, step)
                     writer.add_scalar("eval/rollout_max_m", max_err, step)
                 writer.add_scalar("curriculum/rollout_k", int(stage_k), step)
-                writer.add_scalar("train/effective_rollout_k_mean", stats["effective_k_mean"], step)
-                writer.add_scalar("train/effective_rollout_k_max", stats["effective_k_max"], step)
+                writer.add_scalar("curriculum/effective_rollout_k_mean", stats["effective_k_mean"], step)
+                writer.add_scalar("curriculum/effective_rollout_k_max", stats["effective_k_max"], step)
                 writer.add_scalar("time/elapsed_s", elapsed, step)
                 writer.flush()
                 print(f"checkpoint_latest={latest}", flush=True)

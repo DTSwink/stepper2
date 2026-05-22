@@ -390,3 +390,55 @@
   - final label `full_vanilla_ae_controller_random_init_stall`;
   - stdout log `training/runs/overnight_ik_ae_envelope_stall_20260522_075753.out.log`;
   - stderr log `training/runs/overnight_ik_ae_envelope_stall_20260522_075753.err.log`.
+
+## 2026-05-22 Full-Dataset Baseline, TB Cleanup, And Envelope Bug
+
+- Full-dataset AE-only baseline completed:
+  - run `20260522_075816_ik_full_vanilla_ae_controller_baseline_stall`;
+  - checkpoint `training/runs/20260522_075816_ik_full_vanilla_ae_controller_baseline_stall/checkpoints/20260522_075816_ik_full_vanilla_ae_controller_baseline_stall_last.pt`;
+  - reached mixed `K=32`;
+  - refinement weights computed from sampled mixed-K32 rollout:
+    - `mean_ae = 0.0038195769`;
+    - `mean_linear = 0.0091195013`;
+    - `mean_angular = 0.0040681789`;
+    - `linear_weight = 0.0418836160`;
+    - `angular_weight = 0.0938891098`.
+- Important checkpoint reality:
+  - there is no trained refined `latest`/`last` checkpoint from the nightly refined phase;
+  - newest refined path `training/runs/20260522_163750_ik_full_vanilla_ae_controller_refined_stall/checkpoints/20260522_163750_ik_full_vanilla_ae_controller_refined_stall_init_from_checkpoint.pt` is only the refinement init checkpoint, functionally the AE-only baseline model;
+  - do not treat any `_refined_stall_init_from_checkpoint.pt` as evidence that slide refinement trained.
+- TensorBoard cleanup:
+  - full-run launcher now watches only the current full-dataset controller sequence, not every old IK probe;
+  - controller scalar names are being normalized to:
+    - `loss/controller_total`;
+    - `loss/ae_score`;
+    - `footslide/linear_excess`;
+    - `footslide/angular_excess`;
+    - `footslide/linear_weighted_loss`;
+    - `footslide/angular_weighted_loss`;
+  - removed future use of confusing controller tags such as `loss/train_ae`, `loss/train_total`, and `monitor/raw_*`.
+- Crash recovery:
+  - added default PowerShell launcher `training/ik/run_full_ae_envelope.ps1`;
+  - watchdog overhead is only a waiting parent process, not a training-loop/GPU cost;
+  - on crash, future runs restart the Python worker;
+  - completed phases reuse `*_last.pt`;
+  - incomplete phases resume from `*_latest.pt` if present;
+  - no-progress crashed run folders are moved under `training/runs/_crashed_ik`.
+- Critical envelope bug found before using the Walk_F fine-tune result:
+  - old `excess_envelope.py` still selected bounds with `store.frame_index(clip_ids, cur_idx)`;
+  - that made the slide allowance partially frame-specific, exactly the design we rejected because it compares against the same frame instead of a general movement situation;
+  - aborted Walk_F fine-tune folder `20260522_165402_ik_walkF_from_refined_init_slide_finetune` was moved to `_crashed_ik` and must not be used as a result.
+- Envelope fix:
+  - cache version bumped to `3`;
+  - removed `linear_bound_mps[frame]` / `angular_bound_radps[frame]` lookup from training loss;
+  - training loss now computes runtime situation feature and does KNN lookup against whole-dataset GT situation/value tables;
+  - runtime situation feature is `[yaw_delta/pi, bend_angle/pi, runtime_horizontal_foot_distance_xz_m]`;
+  - foot distance is computed from the runtime/generated current body pose in world `X/Z`, not from the GT frame and not from vertical `Y`;
+  - metadata now records `bound_lookup = runtime_knn_situation_feature_no_frame_index`.
+- New envelope sanity on Walk_F with version 3:
+  - cache `training/runs/cache/ik_excess_envelopes/ik_excess_envelope_bbeb22afdfb32f6cc0d6.pt`;
+  - GT linear excess mean/p95/max: `0.0/0.0/0.0`;
+  - GT angular excess mean/p95/max: `0.0/0.0/0.0`.
+- Pending next step:
+  - rerun Walk_F temp-baseline metric and fine-tune only after the corrected version-3 envelope is in use;
+  - compare pre/post with the dephase-tolerant foot-pin metric plus one-step reconstruction metric.

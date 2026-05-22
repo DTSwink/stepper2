@@ -22,7 +22,7 @@ ensure_paths()
 import contact_physics as cp
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,25 @@ def root_situation_feature(
     left = int(clip.body_names.index("foot_l"))
     right = int(clip.body_names.index("foot_r"))
     foot_distance = torch.linalg.norm(global_pos[:, left, [0, 2]] - global_pos[:, right, [0, 2]], dim=-1)
+    return torch.stack((yaw_delta, bend, foot_distance), dim=-1)
+
+
+def runtime_situation_feature(
+    store: ctl.SimpleClipStore,
+    cur_pos: torch.Tensor,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+) -> torch.Tensor:
+    prev_idx = cur_idx - 1
+    fut_idx = cur_idx + int(store.cfg.future_window)
+    prev_root_pos, _prev_rot, prev_yaw, _prev_heading = store.root_state(clip_ids, prev_idx)
+    cur_root_pos, _cur_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    fut_root_pos, _fut_rot, fut_yaw, _fut_heading = store.root_state(clip_ids, fut_idx)
+    yaw_delta = tl.wrap_angle(fut_yaw - prev_yaw) / torch.pi
+    bend = signed_horizontal_angle(cur_root_pos - prev_root_pos, fut_root_pos - cur_root_pos) / torch.pi
+    left = int(store.prototype.body_names.index("foot_l"))
+    right = int(store.prototype.body_names.index("foot_r"))
+    foot_distance = torch.linalg.norm(cur_pos[:, left, [0, 2]] - cur_pos[:, right, [0, 2]], dim=-1)
     return torch.stack((yaw_delta, bend, foot_distance), dim=-1)
 
 
@@ -114,7 +133,7 @@ def _cache_key(
         "position_unit_scale": float(cfg.position_unit_scale),
         "margin": float(env_cfg.margin),
         "knn": int(env_cfg.knn),
-        "situation_feature": "yaw_bend_foot_distance_xz",
+        "situation_feature": "yaw_bend_runtime_foot_distance_xz",
         "clips": [
             {
                 "path": str(clip.path.resolve()),
@@ -186,20 +205,13 @@ def build_excess_envelope(
     real_features = torch.cat(source_features, dim=0)
     real_linear = torch.cat(source_linear, dim=0)
     real_angular = torch.cat(source_angular, dim=0)
-    target_features = flat_features[valid_mask]
-    linear_valid = _knn_upper_bound(target_features, real_features, real_linear, env_cfg.knn, env_cfg.chunk_size)
-    angular_valid = _knn_upper_bound(target_features, real_features, real_angular, env_cfg.knn, env_cfg.chunk_size)
-    margin = float(env_cfg.margin)
-    linear_bound = torch.full_like(flat_linear, float(real_linear.max().detach().cpu()) * margin)
-    angular_bound = torch.full_like(flat_angular, float(real_angular.max().detach().cpu()) * margin)
-    linear_bound[valid_mask] = torch.maximum(linear_valid, flat_linear[valid_mask]) * margin
-    angular_bound[valid_mask] = torch.maximum(angular_valid, flat_angular[valid_mask]) * margin
     return {
-        "linear_bound_mps": linear_bound,
-        "angular_bound_radps": angular_bound,
         "groundtruth_linear_mps": flat_linear,
         "groundtruth_angular_radps": flat_angular,
         "features": flat_features,
+        "source_features": real_features,
+        "source_linear_mps": real_linear,
+        "source_angular_radps": real_angular,
         "valid_mask": valid_mask,
         "metadata": {
             "source_transitions": int(real_features.shape[0]),
@@ -208,7 +220,8 @@ def build_excess_envelope(
             "knn": int(env_cfg.knn),
             "max_real_linear_mps": float(real_linear.max().detach().cpu()),
             "max_real_angular_radps": float(real_angular.max().detach().cpu()),
-            "situation_feature": "yaw_delta/pi,bend_angle/pi,horizontal_foot_distance_xz_m",
+            "situation_feature": "yaw_delta/pi,bend_angle/pi,runtime_horizontal_foot_distance_xz_m",
+            "bound_lookup": "runtime_knn_situation_feature_no_frame_index",
             "cache_version": CACHE_VERSION,
         },
     }
@@ -257,9 +270,24 @@ def envelope_excess_rows(
     angular_speeds = cp.foot_vertical_yaw_speeds(cur_pos, cur_rot, next_pos, next_rot, foot_indices, toe_indices, store.prototype.fps)
     linear_selected, planted, _heights = cp.planted_foot_values(linear_speeds, cur_pos, cur_rot, foot_indices, toe_indices)
     angular_selected = angular_speeds.gather(-1, planted.unsqueeze(-1)).squeeze(-1)
-    frame = store.frame_index(clip_ids, cur_idx)
-    linear_bound = envelope["linear_bound_mps"].index_select(0, frame)  # type: ignore[union-attr]
-    angular_bound = envelope["angular_bound_radps"].index_select(0, frame)  # type: ignore[union-attr]
+    features = runtime_situation_feature(store, cur_pos, clip_ids, cur_idx).detach()
+    metadata = envelope["metadata"]  # type: ignore[assignment]
+    assert isinstance(metadata, dict)
+    k = int(metadata.get("knn", 32))
+    linear_bound = _knn_upper_bound(
+        features,
+        envelope["source_features"],  # type: ignore[arg-type]
+        envelope["source_linear_mps"],  # type: ignore[arg-type]
+        k,
+        int(features.shape[0]),
+    ) * float(metadata.get("margin", 1.05))
+    angular_bound = _knn_upper_bound(
+        features,
+        envelope["source_features"],  # type: ignore[arg-type]
+        envelope["source_angular_radps"],  # type: ignore[arg-type]
+        k,
+        int(features.shape[0]),
+    ) * float(metadata.get("margin", 1.05))
     return F.relu(linear_selected - linear_bound), F.relu(angular_selected - angular_bound)
 
 
@@ -271,8 +299,25 @@ def groundtruth_sanity(
     valid = envelope["valid_mask"].bool()  # type: ignore[union-attr]
     linear_gt = envelope["groundtruth_linear_mps"][valid]  # type: ignore[index,union-attr]
     angular_gt = envelope["groundtruth_angular_radps"][valid]  # type: ignore[index,union-attr]
-    linear_bound = envelope["linear_bound_mps"][valid]  # type: ignore[index,union-attr]
-    angular_bound = envelope["angular_bound_radps"][valid]  # type: ignore[index,union-attr]
+    features = envelope["features"][valid]  # type: ignore[index,union-attr]
+    metadata = envelope["metadata"]  # type: ignore[assignment]
+    assert isinstance(metadata, dict)
+    k = int(metadata.get("knn", 32))
+    margin = float(metadata.get("margin", 1.05))
+    linear_bound = _knn_upper_bound(
+        features,
+        envelope["source_features"],  # type: ignore[arg-type]
+        envelope["source_linear_mps"],  # type: ignore[arg-type]
+        k,
+        4096,
+    ) * margin
+    angular_bound = _knn_upper_bound(
+        features,
+        envelope["source_features"],  # type: ignore[arg-type]
+        envelope["source_angular_radps"],  # type: ignore[arg-type]
+        k,
+        4096,
+    ) * margin
     linear_excess = F.relu(linear_gt - linear_bound)
     angular_excess = F.relu(angular_gt - angular_bound)
     return {
