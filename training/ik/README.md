@@ -1,32 +1,48 @@
-# Contained IK Locomotion
+# IK Locomotion
 
-This folder owns the IK-marker experiment code. The main `training/train_locomotion.py`
-file is intentionally left untouched.
+This folder owns the active locomotion system.
 
-Policy baked into this path:
+Current policy:
 
 - Run ids and checkpoint files use `YYYYMMDD_HHMMSS_ik_<label>`.
-- IK markers are always enabled.
-- Periodic clips are treated as cyclic.
-- GPU-resident rows/rollouts are mandatory. IK code should stay on the contained fast path.
-- Batch rows are sampled independently from the dataset; there is no one-animation cohort mode.
-- The supervised trainer uses the same rollout loop for every rollout length.
-- Full-dataset runs should pass `--periodic-folder` and `--nonperiodic-folder` instead of pretending every clip is the same cyclic walk loop.
+- IK payload is the 42-dim hand/foot position+rotation+pole/toe representation.
+- GPU-resident dense rows are mandatory.
+- Batch rows are sampled independently.
+- The supervised trainer uses one rollout loop for every K.
+- Noncyclic rows require a complete rollout window.
+- Full-dataset runs use both:
+  - `--periodic-folder ue5\animations_omni_only_full\npz_final`
+  - `--nonperiodic-folder ue5\animations_transitions_only_full_trimmed\npz_final`
+- TensorBoard cards should stay uncluttered.
+- Do not create one-off trainer files for mini experiments.
 
-Before a real training run, run:
+Before editing training logic, read `JOURNAL.md`.
+
+## Supervised
 
 ```powershell
-.\.tools\python310\python.exe training\ik\perf_audit.py --periodic-folder ue5\animations_omni_only_full\npz_final
+.\.tools\python310\python.exe training\ik\train.py `
+  --periodic-folder ue5\animations_omni_only_full\npz_final `
+  --nonperiodic-folder ue5\animations_transitions_only_full_trimmed\npz_final `
+  --run-label full_supervised
 ```
 
-Simple supervised walk-forward entrypoint:
+## Walk_F Sanity
 
 ```powershell
-.\.tools\python310\python.exe training\ik\train.py --npz ue5\animations_omni_only_full\npz_final\M_Neutral_Walk_Loop_F.npz
+.\.tools\python310\python.exe training\ik\train.py `
+  --npz ue5\animations_omni_only_full\npz_final\M_Neutral_Walk_Loop_F.npz `
+  --run-label walkF_supervised
 ```
 
-Full-dataset supervised entrypoint:
+## TensorBoard
 
 ```powershell
-.\.tools\python310\python.exe training\ik\train.py --periodic-folder ue5\animations_omni_only_full\npz_final --run-label full_supervised
+powershell -NoProfile -ExecutionPolicy Bypass -File training\ik\launch_tensorboard_latest.ps1
+```
+
+## Kaggle
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File training\ik\kaggle_start.ps1
 ```

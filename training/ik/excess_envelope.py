@@ -25,7 +25,7 @@ except ImportError:
     import contact_physics as cp
 
 
-CACHE_VERSION = 12
+CACHE_VERSION = 13
 SOLE_SAMPLE_GRID_VALUES = (
     (-1.0, -1.0),
     (-1.0, 0.0),
@@ -445,6 +445,28 @@ def _animation_upper_bounds(
 
 
 @torch.no_grad()
+def _expand_exact_feature_ties(
+    features: torch.Tensor,
+    values: torch.Tensor,
+    planted: torch.Tensor,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    if int(features.shape[0]) <= 1:
+        return values
+    out = values.clone()
+    for side in (0, 1):
+        rows = (planted == side).nonzero(as_tuple=False).flatten()
+        if rows.numel() <= 1:
+            continue
+        side_features = features.index_select(0, rows)
+        side_values = values.index_select(0, rows)
+        same = (side_features[:, None, :] - side_features[None, :, :]).abs().amax(dim=-1) <= float(eps)
+        tied_max = side_values.reshape(1, -1).expand_as(same).masked_fill(~same, -torch.inf).amax(dim=-1)
+        out[rows] = tied_max
+    return out
+
+
+@torch.no_grad()
 def build_excess_envelope(
     store: ctl.SimpleClipStore,
     env_cfg: ExcessEnvelopeConfig | None = None,
@@ -487,6 +509,8 @@ def build_excess_envelope(
             continue
         flat = idx + int(offsets[clip_id])
         flat_features.index_copy_(0, flat, features)
+        linear = _expand_exact_feature_ties(features, linear, planted)
+        angular = _expand_exact_feature_ties(features, angular, planted)
         flat_linear.index_copy_(0, flat, linear)
         flat_angular.index_copy_(0, flat, angular)
         flat_planted.index_copy_(0, flat, planted)
@@ -542,7 +566,7 @@ def build_excess_envelope(
             "max_real_linear_mps": float(real_linear.max().detach().cpu()),
             "max_real_angular_radps": float(real_angular.max().detach().cpu()),
             "situation_feature": "clip_id,yaw_delta/pi,bend_angle/pi,runtime_horizontal_foot_distance_xz_m,selected_lower_side",
-            "bound_lookup": "animation_dependent_nearest_same_planted_side_foot_ball_points_foot_yaw_no_frame_index",
+            "bound_lookup": "animation_dependent_nearest_same_planted_side_exact_tie_max_foot_ball_points_foot_yaw_no_frame_index",
             "cache_version": CACHE_VERSION,
             "max_clip_source_rows": int(max_clip_rows),
         },

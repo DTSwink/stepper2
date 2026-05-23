@@ -13,13 +13,15 @@ rules that should not be broken again.
 - The controller must imitate the dataset accurately under supervised training.
 - AE and foot-slide envelope losses are still experimental and must not pollute
   the supervised baseline path.
-- The current long run is a full-dataset supervised continuation from the temp
-  baseline, intentionally using eager mode because CUDA graph mode crashed/hung.
+- Full-dataset long-horizon supervised continuation from the temp baseline
+  degraded local Walk_F quality and should not be treated as a trusted
+  baseline.
 
 ## Hard Rules
 
 - Keep IK work contained under `training/ik`.
-- Do not modify the old/main locomotion trainer for IK experiments.
+- The old root-level FK/non-IK training stack has been removed. Do not recreate
+  it.
 - Do not create one-off trainer scripts for mini experiments. Change dataset,
   checkpoint, objective weights, curriculum, or labels through the canonical
   trainer arguments/config instead.
@@ -32,10 +34,12 @@ rules that should not be broken again.
 - Push only when the user asks. For this cleanup the user explicitly asked to
   push after the journal is done.
 - TensorBoard must work for every experiment. Keep it simple and shared.
-- Controller TensorBoard loss cards should stay uncluttered:
-  - supervised controller: `loss/supervised`;
-  - AE/envelope controller: `loss/ae_score`, `loss/weighted_slide_excess`,
-    `loss/weighted_yaw_excess`.
+- Controller TensorBoard loss cards should stay uncluttered. Mixed AE/envelope
+  controller runs should show only:
+  - `loss/ae_score`;
+  - `loss/linear_slide_weighted`;
+  - `loss/angular_slide_weighted`;
+  - `loss/supervised`.
 - Raw diagnostic values can go in viewers/files, but not as dashboard clutter.
 - Every new long-run trainer should write a readable config file with the most
   important fields at the top. `train.py` already writes `config_readable.json`;
@@ -57,6 +61,9 @@ rules that should not be broken again.
   - Viewer for GT slide, envelope, model slide, and excess.
 - `training/ik/watch_supervised_run.ps1`
   - Guarded watchdog/restart script for the current supervised continuation.
+- `training/ik/kaggle_prepare.py`, `kaggle_run.py`, `kaggle_start.ps1`,
+  `kaggle_sync_tensorboard.py`
+  - IK-only Kaggle packaging, launch, and output sync.
 - `training/ik/tensorboard_log.py` and `launch_tensorboard_latest.ps1`
   - TensorBoard helpers.
 
@@ -112,9 +119,38 @@ representation/pipeline.
 
 `train.py` is the supervised controller path.
 
-The supervised loss is MSE between the model raw output for the next step and
-the cached GT target output for that next step. It is not an end-effector global
-delta loss.
+The supervised loss is MSE between the cleaned/canonical predicted vector for
+the next step and the cached GT target output for that next step. It is not an
+end-effector global delta loss.
+
+Important correction from 2026-05-23: this used to compare raw model output and
+that caused a regression. The loss must compare the cleaned/canonical
+prediction vector, not the raw model output. Raw 6D rotations are redundant: a
+raw vector can be numerically far from target while cleaning/normalizing to the
+same rotation. The broken raw loss made Walk_F degrade while raw MSE improved.
+The current rule is:
+
+```text
+raw = model(current_input)
+pred_vec = predicted_state_from_raw(raw)
+loss = mse(pred_vec, target_vec)
+```
+
+Do not change this back to `mse(raw, target_vec)`.
+
+Supervised inside the AE/envelope trainer is a ratio-gated one-step objective,
+not an added term on every step. When the ratio selects a supervised step, the
+trainer uses K=1 only and does not apply AE or envelope losses on that step.
+The intended default experiment ratio is 1 supervised step per 5 objective
+steps; the other 4 steps stay AE + weighted slide envelope.
+
+Mixed-trainer supervised K=1 is weighted in the actual loss, not just in logs.
+On 2026-05-23 the full-dataset temp baseline
+`20260522_075816_ik_full_vanilla_ae_controller_baseline_stall_last.pt`
+measured raw cleaned-vector supervised K=1 MSE `0.0001047247` over 10687 valid
+rows. With the global controller loss scale `500`, the hard-coded
+`SUPERVISED_K1_LOSS_WEIGHT` is `9.548846199989088`, so the baseline supervised
+TensorBoard card reads about `0.5`.
 
 Sampling:
 
@@ -270,6 +306,30 @@ Avoid cards that are not decision-relevant. If a scalar is only useful for a
 one-off audit, write it to a diagnostic JSON/viewer or print it, not to the main
 dashboard.
 
+## Kaggle
+
+Kaggle support is part of IK now. Do not use the old K111/FK launch path for new
+work.
+
+Current IK-local files:
+
+- `kaggle_prepare.py` builds a Kaggle dataset/kernel payload containing:
+  - `training/ik`;
+  - `fbx_npz_pipeline`;
+  - selected `npz_final` datasets;
+  - explicitly requested checkpoints/config files.
+- `kaggle_run.py` runs inside Kaggle and dispatches to canonical IK trainers:
+  - `STEPPER_IK_MODE=supervised` -> `training/ik/train.py`;
+  - `STEPPER_IK_MODE=simple_ae` -> `training/ik/train_simple_autoencoder.py`;
+  - `STEPPER_IK_MODE=ae_envelope` -> `training/ik/train_full_ae_envelope.py`.
+- `kaggle_start.ps1` is the local upload/push wrapper.
+- `kaggle_sync_tensorboard.py` downloads Kaggle outputs for local TensorBoard
+  and checkpoint review.
+
+Defaults are supervised, full periodic/nonperiodic datasets, eager/no CUDA graph
+for stability, and checkpoint mirroring to Kaggle output. Keep future Kaggle
+changes in these IK files, not in old root training scripts.
+
 ## Tally Of Tried Paths
 
 - Contained IK folder:
@@ -313,17 +373,22 @@ dashboard.
   - rejected; too easy to duplicate process logic.
 - Watchdog as one guarded script:
   - kept.
+- Old K111 Kaggle scripts:
+  - deprecated for future work.
+- IK-local Kaggle packaging/run/sync scripts:
+  - kept.
+- Old root `training/train_locomotion*`, old AE-prior, old visual reporter,
+  old K111 Kaggle, and root inspection/sweep scripts:
+  - removed after IK became the only future training path.
 
 ## Current Open Items
 
 - Keep the current full supervised continuation alive and monitor it through the
   guarded watcher.
-- Once the supervised baseline is satisfactory, decide whether to:
-  - continue pure supervised;
-  - add a mixed objective with a supervised fraction;
-  - or revisit AE/envelope after reenactment is solid.
-- If mixed objective work resumes, implement it in the canonical trainer path,
-  not in a new mini harness.
+- Mixed objective work belongs in `training/ik/train_full_ae_envelope.py`, not
+  in a new mini harness.
+- Current mixed-objective rule: supervised ratio steps are K=1 only; do not use
+  long-horizon supervised rollout in the mixed AE/envelope controller.
 - Port `config_readable.json` style to any trainer that will be used for long
   runs beyond `train.py`.
 - Do not trust old refined/AE-envelope runs as final baselines unless their

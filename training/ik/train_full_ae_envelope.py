@@ -19,14 +19,12 @@ try:
     from .naming import checkpoint_path, clean_label, ik_run_id
     from . import excess_envelope as env
     from . import ik_core as tl
-    from . import tensorboard_log as tb_log
     from . import train_simple_ae_controller as ctl
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
     from naming import checkpoint_path, clean_label, ik_run_id
     import excess_envelope as env
     import ik_core as tl
-    import tensorboard_log as tb_log
     import train_simple_ae_controller as ctl
 
 ensure_paths()
@@ -52,6 +50,9 @@ MIN_DELTA_FRACTION = 5e-4
 STALL_RECENT_LOGS = {1: 3, 2: 3, 8: 4, 16: 6, 32: 8}
 STALL_LOOKBACK_LOGS = {1: 6, 2: 6, 8: 8, 16: 12, 32: 24}
 EVAL_BATCHES = 32
+OBJECTIVE_CYCLE_STEPS = 5
+SUPERVISED_STEPS_PER_CYCLE = 0
+SUPERVISED_K1_LOSS_WEIGHT = 9.548846199989088
 
 
 def scaled_loss(value: torch.Tensor) -> torch.Tensor:
@@ -371,6 +372,34 @@ def rollout_loss(
         "angular": angular_total,
         "active": active_total.clamp_min(1e-8),
     }
+
+
+def supervised_k1_loss(
+    model: torch.nn.Module,
+    store: ctl.SimpleClipStore,
+    batch_size: int,
+    start_pool: ctl.StartPool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    batch_size = max(1, int(batch_size))
+    clip_ids, cur_idx = ctl.sample_from_pool(start_pool, batch_size)
+    prev_vec, prev_pelvis, prev_payload = ctl.target_state(store, clip_ids, cur_idx - 1)
+    cur_vec, cur_pelvis, cur_payload = ctl.target_state(store, clip_ids, cur_idx)
+    inp = ctl.build_controller_input(
+        store,
+        clip_ids,
+        cur_idx,
+        prev_vec,
+        cur_vec,
+        prev_pelvis,
+        cur_pelvis,
+        prev_payload,
+        cur_payload,
+    )
+    raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
+    pred_vec = ctl.clean_output_vector(raw, store)
+    target = store.get_target_output(clip_ids, cur_idx + 1)
+    supervised = (pred_vec - target).square().mean(dim=-1).mean() * float(SUPERVISED_K1_LOSS_WEIGHT)
+    return scaled_loss(supervised), {"supervised": supervised}
 
 
 class EnvelopeStepper:
@@ -725,27 +754,91 @@ def make_stage_stepper(
     )
 
 
+class SupervisedK1Stepper:
+    kind = "eager_supervised_k1"
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        store: ctl.SimpleClipStore,
+        batch_size: int,
+        start_pool: ctl.StartPool,
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.store = store
+        self.batch_size = int(batch_size)
+        self.start_pool = start_pool
+        self.last_parts: dict[str, torch.Tensor] = {}
+
+    def step(self) -> torch.Tensor:
+        loss, parts = supervised_k1_loss(self.model, self.store, self.batch_size, self.start_pool)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), controller_grad_clip_norm())
+        self.optimizer.step()
+        self.last_parts = {name: value.detach() for name, value in parts.items()}
+        return loss.detach()
+
+
+class MixedObjectiveStepper:
+    kind = "mixed_objective"
+
+    def __init__(
+        self,
+        primary_stepper: object,
+        supervised_stepper: SupervisedK1Stepper,
+        supervised_steps_per_cycle: int,
+        objective_cycle_steps: int,
+    ):
+        self.primary_stepper = primary_stepper
+        self.supervised_stepper = supervised_stepper
+        self.supervised_steps_per_cycle = max(0, int(supervised_steps_per_cycle))
+        self.objective_cycle_steps = max(1, int(objective_cycle_steps))
+        if self.supervised_steps_per_cycle > self.objective_cycle_steps:
+            raise ValueError("supervised_steps_per_cycle cannot exceed objective_cycle_steps")
+        self.last_parts: dict[str, torch.Tensor | float] = {}
+        self.last_mode = "primary"
+
+    def use_supervised(self, step: int) -> bool:
+        if self.supervised_steps_per_cycle <= 0:
+            return False
+        slot = (max(1, int(step)) - 1) % self.objective_cycle_steps
+        return slot < self.supervised_steps_per_cycle
+
+    def step(self, step: int) -> torch.Tensor:
+        if self.use_supervised(step):
+            self.last_mode = "supervised"
+            loss = self.supervised_stepper.step()
+            self.last_parts = self.supervised_stepper.last_parts
+            return loss
+        self.last_mode = "primary"
+        loss = self.primary_stepper.step()  # type: ignore[attr-defined]
+        self.last_parts = dict(getattr(self.primary_stepper, "last_parts", {}))
+        if not self.last_parts:
+            self.last_parts = {"ae": loss.detach() / float(CONTROLLER_LOSS_SCALE)}
+        return loss
+
+
 def log_loss_scalars(
     writer: SummaryWriter,
     step: int,
-    total_loss: float,
-    parts: dict[str, float] | None,
+    parts: dict[str, float],
     linear_weight: float,
     angular_weight: float,
-    has_envelope_loss: bool,
 ) -> None:
-    if not tb_log.should_log_controller_step(step):
-        return
-    tb_log.log_controller_loss(
-        writer,
-        step=step,
-        total_loss=total_loss,
-        parts=parts,
-        linear_weight=linear_weight,
-        angular_weight=angular_weight,
-        has_envelope_loss=has_envelope_loss,
-        loss_scale=CONTROLLER_LOSS_SCALE,
-    )
+    scale = float(CONTROLLER_LOSS_SCALE)
+    writer.add_scalar("loss/ae_score", float(parts.get("ae", 0.0)) * scale, int(step))
+    writer.add_scalar("loss/linear_slide_weighted", float(parts.get("linear", 0.0)) * float(linear_weight) * scale, int(step))
+    writer.add_scalar("loss/angular_slide_weighted", float(parts.get("angular", 0.0)) * float(angular_weight) * scale, int(step))
+    writer.add_scalar("loss/supervised", float(parts.get("supervised", 0.0)) * scale, int(step))
+
+
+def tensor_to_float(value: object) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().cpu())
+    return float(value)
 
 
 def train_controller_adaptive(
@@ -758,6 +851,8 @@ def train_controller_adaptive(
     angular_weight: float = 0.0,
     random_init_pose: bool = False,
     start_at_k32: bool = False,
+    supervised_steps_per_cycle: int = SUPERVISED_STEPS_PER_CYCLE,
+    objective_cycle_steps: int = OBJECTIVE_CYCLE_STEPS,
 ) -> Path:
     controller_state = clean_controller_run_state(label)
     if controller_state is not None:
@@ -795,6 +890,10 @@ def train_controller_adaptive(
             "controller_loss_scale": float(CONTROLLER_LOSS_SCALE),
             "linear_excess_loss_weight": float(linear_weight),
             "angular_excess_loss_weight": float(angular_weight),
+            "supervised_steps_per_cycle": int(supervised_steps_per_cycle),
+            "objective_cycle_steps": int(objective_cycle_steps),
+            "supervised_rollout_k": 1,
+            "supervised_k1_loss_weight": float(SUPERVISED_K1_LOSS_WEIGHT),
             "pose_representation": tl.IK_POSE_REPRESENTATION,
             "adaptive_stall_curriculum": True,
         },
@@ -806,7 +905,6 @@ def train_controller_adaptive(
     ctl.refresh_tensorboard_async()
 
     step = int(base_step)
-    tb_log.log_controller_start(writer, rollout_k=32 if start_at_k32 else 0, linear_weight=linear_weight, angular_weight=angular_weight)
     writer.flush()
     ctl.refresh_tensorboard_async()
     write_run_status(run_dir, {"state": "running", "label": label, "init_checkpoint": str(init_checkpoint or "")})
@@ -818,7 +916,6 @@ def train_controller_adaptive(
     else:
         min_stage = max(1, int(loaded_k or 1))
         schedule = tuple(k for k in SCHEDULE if int(k) >= min_stage) or (int(SCHEDULE[-1]),)
-    t0 = time.perf_counter()
     last_loss = math.inf
     final_path: Path | None = None
     for stage_i, stage_k in enumerate(schedule):
@@ -844,44 +941,61 @@ def train_controller_adaptive(
             angular_weight,
             random_init_pose,
         )
+        if int(supervised_steps_per_cycle) > 0:
+            supervised_pool = ctl.build_start_pool(store, 1)
+            supervised_batch = min(batch_size, int(supervised_pool.row_count))
+            supervised_stepper = SupervisedK1Stepper(model, optimizer, store, supervised_batch, supervised_pool)
+            stepper = MixedObjectiveStepper(
+                stepper,
+                supervised_stepper,
+                int(supervised_steps_per_cycle),
+                int(objective_cycle_steps),
+            )
         stage_start = time.perf_counter()
         stage_logs = 0
         stalls = 0
         best_stage = math.inf
         stage_loss_history: list[float] = []
-        has_envelope_loss = envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0)
         print(f"{label}: stage K={stage_k} batch={batch_size} stepper={getattr(stepper, 'kind', 'unknown')}", flush=True)
         while True:
+            chunk_parts = {"ae": 0.0, "linear": 0.0, "angular": 0.0, "supervised": 0.0}
+            chunk_counts = {"ae": 0, "linear": 0, "angular": 0, "supervised": 0}
+            chunk_loss = 0.0
             for _ in range(LOG_EVERY_STEPS):
                 step += 1
-                loss = stepper.step()  # type: ignore[attr-defined]
+                if isinstance(stepper, MixedObjectiveStepper):
+                    loss = stepper.step(step)
+                else:
+                    loss = stepper.step()  # type: ignore[attr-defined]
                 last_loss = float(loss.detach().cpu())
-                parts = dict(getattr(stepper, "last_parts")) if hasattr(stepper, "last_parts") else None
-                log_loss_scalars(writer, step, last_loss, parts, linear_weight, angular_weight, has_envelope_loss)
+                chunk_loss += last_loss
+                parts = dict(getattr(stepper, "last_parts")) if hasattr(stepper, "last_parts") else {}
+                for name in chunk_parts:
+                    if name in parts:
+                        chunk_parts[name] += tensor_to_float(parts[name])
+                        chunk_counts[name] += 1
             stage_logs += 1
-            stage_loss_history.append(last_loss)
+            chunk_loss_mean = chunk_loss / float(LOG_EVERY_STEPS)
+            chunk_part_means = {
+                name: (value / float(chunk_counts[name]) if chunk_counts[name] else 0.0)
+                for name, value in chunk_parts.items()
+            }
+            log_loss_scalars(writer, step, chunk_part_means, linear_weight, angular_weight)
+            stage_loss_history.append(chunk_loss_mean)
             improved = stage_trend_improved(stage_loss_history, int(stage_k))
             if improved or not math.isfinite(best_stage):
                 stalls = 0
             else:
                 stalls += 1
-            best_stage = min(best_stage, last_loss)
-            best_global = min(best_global, last_loss)
-            stats = ctl.rollout_stat_summary(batch_size, int(stage_k))
-            tb_log.log_controller_curriculum(
-                writer,
-                step=step,
-                rollout_k=int(stage_k),
-                effective_rollout_k_mean=float(stats["effective_k_mean"]),
-                effective_rollout_k_max=float(stats["effective_k_max"]),
-                stalls=stalls,
-                start_time=t0,
-            )
+            best_stage = min(best_stage, chunk_loss_mean)
+            best_global = min(best_global, chunk_loss_mean)
             writer.flush()
-            final_path = ctl.save_controller_checkpoint(run_dir, run_id, "latest", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
+            final_path = ctl.save_controller_checkpoint(run_dir, run_id, "latest", model, optimizer, step, chunk_loss_mean, int(stage_k), cfg, metadata)
             elapsed_stage = time.perf_counter() - stage_start
             print(
-                f"{label}: step={step} K={stage_k} loss={last_loss:.6g} best_stage={best_stage:.6g} "
+                f"{label}: step={step} K={stage_k} loss={chunk_loss_mean:.6g} best_stage={best_stage:.6g} "
+                f"ae={chunk_part_means['ae']:.6g} linear={chunk_part_means['linear']:.6g} "
+                f"angular={chunk_part_means['angular']:.6g} supervised={chunk_part_means['supervised']:.6g} "
                 f"stalls={stalls} elapsed_stage_s={elapsed_stage:.1f}",
                 flush=True,
             )
@@ -894,8 +1008,8 @@ def train_controller_adaptive(
             if elapsed_stage >= max_time:
                 print(f"{label}: max stage time reached for K={stage_k}", flush=True)
                 break
-        final_path = ctl.save_controller_checkpoint(run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
-        final_path = ctl.save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, step, last_loss, int(stage_k), cfg, metadata)
+        final_path = ctl.save_controller_checkpoint(run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, best_stage, int(stage_k), cfg, metadata)
+        final_path = ctl.save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, step, best_stage, int(stage_k), cfg, metadata)
         del stepper
     assert final_path is not None
     writer.close()
@@ -949,6 +1063,8 @@ def main() -> None:
     parser.add_argument("--npz", default="", help="Optional cyclic .npz path or semicolon-separated paths.")
     parser.add_argument("--periodic-folder", default="", help="Optional periodic .npz folder/path list.")
     parser.add_argument("--nonperiodic-folder", default="", help="Optional nonperiodic .npz folder/path list.")
+    parser.add_argument("--supervised-steps-per-cycle", type=int, default=SUPERVISED_STEPS_PER_CYCLE)
+    parser.add_argument("--objective-cycle-steps", type=int, default=OBJECTIVE_CYCLE_STEPS)
     args = parser.parse_args()
     configure_dataset(args.npz, args.periodic_folder, args.nonperiodic_folder)
 
@@ -968,7 +1084,13 @@ def main() -> None:
     baseline_path = Path(args.baseline_checkpoint).resolve() if args.baseline_checkpoint else None
     refined_path = Path(args.refined_checkpoint).resolve() if args.refined_checkpoint else None
     if args.phase in ("all", "baseline") and baseline_path is None:
-        baseline_path = train_controller_adaptive(args.baseline_label, ae_path, device)
+        baseline_path = train_controller_adaptive(
+            args.baseline_label,
+            ae_path,
+            device,
+            supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
+            objective_cycle_steps=int(args.objective_cycle_steps),
+        )
     if args.phase in ("all", "refine"):
         if baseline_path is None:
             raise ValueError("refine phase needs --baseline-checkpoint")
@@ -986,6 +1108,8 @@ def main() -> None:
             linear_weight=weights["linear_weight"],
             angular_weight=weights["angular_weight"],
             start_at_k32=True,
+            supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
+            objective_cycle_steps=int(args.objective_cycle_steps),
         )
     if args.phase in ("all", "final"):
         if refined_path is None:
@@ -1008,6 +1132,8 @@ def main() -> None:
             angular_weight=float(weights["angular_weight"]),
             random_init_pose=True,
             start_at_k32=True,
+            supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
+            objective_cycle_steps=int(args.objective_cycle_steps),
         )
 
 

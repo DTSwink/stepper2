@@ -200,14 +200,25 @@ def rollout_stat_summary(batch_size: int, rollout_k: int) -> dict[str, float]:
     }
 
 
-def rollout_stage_for_step(step: int) -> tuple[int, int, int, int]:
+def effective_rollout_stage_steps(train_steps: int) -> tuple[int, ...]:
+    steps = [int(v) for v in ROLLOUT_STAGE_STEPS]
+    scheduled = sum(steps)
+    if int(train_steps) > scheduled:
+        steps[-1] += int(train_steps) - scheduled
+    return tuple(steps)
+
+
+def rollout_stage_for_step(step: int, train_steps: int = TRAIN_STEPS) -> tuple[int, int, int, int]:
     start = 1
-    for stage_idx, (rollout_k, stage_steps) in enumerate(zip(ROLLOUT_SCHEDULE, ROLLOUT_STAGE_STEPS)):
+    stage_steps_all = effective_rollout_stage_steps(train_steps)
+    for stage_idx, (rollout_k, stage_steps) in enumerate(zip(ROLLOUT_SCHEDULE, stage_steps_all)):
         end = start + int(stage_steps) - 1
         if int(step) <= end:
             return stage_idx, int(rollout_k), start, end
         start = end + 1
-    return len(ROLLOUT_SCHEDULE) - 1, int(ROLLOUT_SCHEDULE[-1]), start, start
+    final_start = 1 + sum(stage_steps_all[:-1])
+    final_end = sum(stage_steps_all)
+    return len(ROLLOUT_SCHEDULE) - 1, int(ROLLOUT_SCHEDULE[-1]), final_start, final_end
 
 
 def mixed_rollout_enabled(rollout_k: int) -> bool:
@@ -471,9 +482,12 @@ def supervised_rollout_loss(
             cfg,
         )
         raw = model_forward(model, inp, cur_vec, cfg)
+        next_vec, next_pelvis, next_markers = predicted_state_from_raw(raw, store)
         target_idx = cur_idx + 1
         target = store.get_target_output(clip_ids, target_idx)
-        row_loss = (raw - target).square().mean(dim=-1)
+        # Loss must use the canonical cleaned state that rollout feeds back.
+        # Raw 6D rotations can be numerically far while decoding to the same pose.
+        row_loss = (next_vec - target).square().mean(dim=-1)
         total_loss = total_loss + (row_loss * row_weight).sum()
         if step + 1 >= rollout_k:
             break
@@ -481,13 +495,14 @@ def supervised_rollout_loss(
         rows = continuing.nonzero(as_tuple=False).flatten()
         if rows.numel() == 0:
             break
-        raw = raw.index_select(0, rows)
         next_clip_ids = clip_ids.index_select(0, rows)
         next_target_idx = target_idx.index_select(0, rows)
         prev_vec = cur_vec.index_select(0, rows)
         prev_pelvis = cur_pelvis.index_select(0, rows)
         prev_markers = cur_markers.index_select(0, rows)
-        cur_vec, cur_pelvis, cur_markers = predicted_state_from_raw(raw, store)
+        cur_vec = next_vec.index_select(0, rows)
+        cur_pelvis = next_pelvis.index_select(0, rows)
+        cur_markers = next_markers.index_select(0, rows)
         clip_ids = next_clip_ids
         prev_idx = cur_idx.index_select(0, rows)
         cur_idx = next_target_idx
@@ -526,18 +541,18 @@ def supervised_rollout_loss_static(
             cfg,
         )
         raw = model_forward(model, inp, cur_vec, cfg)
+        next_vec, next_pelvis, next_markers = predicted_state_from_raw(raw, store)
         active = effective_k > step
         target_idx = torch.where(active, cur_idx + 1, cur_idx)
         target = store.get_target_output(clip_ids, target_idx)
-        row_loss = (raw - target).square().mean(dim=-1)
+        # Keep static/CUDA-graph loss identical to the eager path.
+        row_loss = (next_vec - target).square().mean(dim=-1)
         total_loss = total_loss + (row_loss * row_weight * active.float()).sum()
         if step + 1 >= rollout_k:
             break
         continuing = effective_k > (step + 1)
         continuing_vec = continuing[:, None]
         continuing_markers = continuing[:, None]
-        raw_next = raw
-        next_vec, next_pelvis, next_markers = predicted_state_from_raw(raw_next, store)
         prev_vec = torch.where(continuing_vec, cur_vec, prev_vec)
         prev_pelvis = torch.where(continuing_vec, cur_pelvis, prev_pelvis)
         prev_markers = torch.where(continuing_markers, cur_markers, prev_markers)
@@ -935,7 +950,7 @@ def main() -> None:
         "rollout_k": int(ROLLOUT_K),
         "max_rollout_k": int(MAX_ROLLOUT_K),
         "rollout_schedule": [int(k) for k in ROLLOUT_SCHEDULE],
-        "rollout_stage_steps": [int(n) for n in ROLLOUT_STAGE_STEPS],
+        "rollout_stage_steps": [int(n) for n in effective_rollout_stage_steps(train_steps)],
         "rollout_values": [int(k) for k in final_cache["rollout_values"]],
         "fractal_rollout_probabilities": {
             str(int(k)): float(p)
@@ -992,7 +1007,7 @@ def main() -> None:
     if start_step >= train_steps:
         print(f"checkpoint already at step={start_step}, train_steps={train_steps}; writing last checkpoint", flush=True)
     for step in range(start_step + 1, train_steps + 1):
-        stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(step)
+        stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(step, train_steps)
         stage_step = step - stage_start + 1
         stage_steps = stage_end - stage_start + 1
         lr = stage_learning_rate(LEARNING_RATE, stage_step, stage_steps)
@@ -1023,6 +1038,19 @@ def main() -> None:
             )
         assert stepper is not None
         loss = stepper.step()
+        if step == stage_end or step == train_steps:
+            stage_path = save_named_checkpoint(
+                run_dir,
+                run_id,
+                f"stage_K{int(stage_k)}",
+                model,
+                optimizer,
+                step,
+                best,
+                cfg,
+                metadata,
+            )
+            print(f"saved stage checkpoint {stage_path}", flush=True)
 
         if step == 1 or step == stage_start or step % 250 == 0 or step == train_steps:
             cache = stage_cache[int(stage_k)]

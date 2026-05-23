@@ -9,7 +9,7 @@ import tkinter as tk
 import ctypes
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
 import torch
@@ -35,9 +35,11 @@ if str(FBX_PIPELINE_DIR) not in sys.path:
 if str(IK_DIR) not in sys.path:
     sys.path.insert(0, str(IK_DIR))
 
-import train_locomotion as tl
 import ik_core as ik_tl
-import contact_physics as cp
+tl = ik_tl
+from ik import contact_physics as cp
+from ik import excess_envelope as ik_env
+from ik import train_simple_ae_controller as ik_ctl
 from ik import transition_autoencoder as tae
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
@@ -48,7 +50,6 @@ from foot_contact import (
     foot_toe_box_specs,
     is_foot_contact,
 )
-from visualize_model import apply_config_dict
 
 
 DEFAULT_NPZ_DIR = PROJECT_ROOT / "data" / "npz_final"
@@ -65,7 +66,10 @@ PANEL_2 = "#23272f"
 TEXT = "#edf1f7"
 MUTED = "#9da6b5"
 LINE = "#313846"
-FLOOR = "#303846"
+FLOOR = "#1f3a61"
+FLOOR_GRID_SUBTLE = "#8db9d2"
+FLOOR_GRID_MINOR = "#75a9cb"
+FLOOR_GRID_MAJOR = "#a6cce0"
 SHADOW = "#090b0f"
 SKY = "#000000"
 RENDER_SCALE = 1.5
@@ -78,6 +82,13 @@ FLAT_PITCH = 0.35 / 0.55
 NEUTRAL_PITCH = 0.48
 MIN_CAMERA_DISTANCE = 0.01
 CAMERA_TRANSITION_SECONDS = 0.22
+FOLLOW_CAMERA_PITCH = 0.22 + math.radians(20.0)
+FLOOR_SUBGRID_STEP = 0.05
+FLOOR_GRID_STEP = 0.25
+FLOOR_GRID_MAJOR_EVERY = 4
+FLOOR_SUBGRID_RADIUS = 2.5
+FLOOR_GRID_RADIUS = 4.6
+FLOOR_MAJOR_GRID_RADIUS = 6.5
 DEFAULT_FOOT_LENGTH = 0.175
 DEFAULT_FOOT_WIDTH = 0.12
 DEFAULT_FOOT_HEIGHT = 0.051
@@ -91,6 +102,7 @@ TARGET_RENDER_FPS = 60.0
 TARGET_RENDER_INTERVAL_MS = max(1, int(round(1000.0 / TARGET_RENDER_FPS)))
 TARGET_PLAYBACK_FPS = 120.0
 MAX_PLAYBACK_SUBSTEPS = 3
+AE_VALUE_OVERLAY_ENABLED = False
 XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE = 7849
 XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE = 8689
 XINPUT_THUMB_MAX = 32767.0
@@ -164,6 +176,19 @@ def resolve_path(path: str | Path) -> Path:
     if not p.is_absolute():
         p = PROJECT_ROOT / p
     return p.resolve()
+
+
+def normalize_hex_color(value: object, fallback: str = FLOOR) -> str:
+    text = str(value).strip()
+    if not text.startswith("#"):
+        text = f"#{text}"
+    if len(text) != 7:
+        return fallback
+    try:
+        int(text[1:], 16)
+    except ValueError:
+        return fallback
+    return text.lower()
 
 
 def vec3(values: tuple[float, float, float] | list[float] | np.ndarray) -> np.ndarray:
@@ -314,19 +339,44 @@ def checkpoint_candidates(pattern: str) -> list[Path]:
     return list(unique.values())
 
 
+def checkpoint_run_dir(path: Path) -> Path:
+    return path.parent.parent if path.parent.name == "checkpoints" else path.parent
+
+
+def checkpoint_time_key(path: Path) -> tuple[int, int, int, str]:
+    try:
+        checkpoint_mtime = int(path.stat().st_mtime_ns)
+    except OSError:
+        checkpoint_mtime = 0
+    folder_times = [checkpoint_mtime]
+    for folder in (path.parent, checkpoint_run_dir(path)):
+        try:
+            folder_times.append(int(folder.stat().st_mtime_ns))
+        except OSError:
+            pass
+    run_activity = max(folder_times) if folder_times else checkpoint_mtime
+    return (run_activity, checkpoint_mtime, len(path.parts), str(path).lower())
+
+
 def newest_checkpoint(policy: str = "last") -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
     policy = normalize_checkpoint_policy(policy)
-    patterns = ["*best*.pt", "checkpoint_best*.pt"] if policy == "best" else ["*last*.pt", "checkpoint*.pt"]
-    fallback_patterns = ["*.pt"] if policy == "best" else ["*best*.pt", "*.pt"]
-    candidates: list[Path] = []
-    for pattern in patterns + fallback_patterns:
-        candidates.extend(checkpoint_candidates(pattern))
-    candidates = sorted(set(candidates), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in candidates:
-        if is_locomotion_checkpoint(path) and checkpoint_uses_ik(path):
-            return path
+    if policy == "best":
+        pattern_groups = [["*best*.pt", "checkpoint_best*.pt"], ["*.pt"]]
+    else:
+        pattern_groups = [["*.pt"]]
+    for patterns in pattern_groups:
+        candidates: list[Path] = []
+        for pattern in patterns:
+            candidates.extend(checkpoint_candidates(pattern))
+        unique: dict[str, Path] = {}
+        for path in candidates:
+            unique[str(path.resolve()).lower()] = path
+        candidates = sorted(unique.values(), key=checkpoint_time_key, reverse=True)
+        for path in candidates:
+            if is_locomotion_checkpoint(path) and checkpoint_uses_ik(path):
+                return path
     return None
 
 
@@ -430,6 +480,9 @@ class Actor:
     generated_pos: list[np.ndarray] = field(default_factory=list)
     generated_rot: list[np.ndarray] = field(default_factory=list)
     generated_contacts: list[np.ndarray] = field(default_factory=list)
+    ragdoll_overrides: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    root_pos_np_cache: np.ndarray | None = field(default=None, repr=False)
+    root_yaw_np_cache: np.ndarray | None = field(default=None, repr=False)
     controller_root_offset: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     controller_velocity: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
     controller_root_anchor: np.ndarray | None = None
@@ -527,6 +580,9 @@ class Actor:
         return out
 
     def load_npz(self, path: Path, cfg: object | None = None) -> None:
+        self.ragdoll_overrides.clear()
+        self.root_pos_np_cache = None
+        self.root_yaw_np_cache = None
         self.npz_path = path
         self.source_npz_path = path if self.kind == "model" else None
         self.ik_mode = True
@@ -552,6 +608,9 @@ class Actor:
         return contacts[:, :2].copy()
 
     def load_checkpoint(self, checkpoint_path: Path, source_npz_path: Path, device: torch.device) -> None:
+        self.ragdoll_overrides.clear()
+        self.root_pos_np_cache = None
+        self.root_yaw_np_cache = None
         self.checkpoint_path = checkpoint_path
         self.source_npz_path = source_npz_path
         self.device = device
@@ -839,7 +898,7 @@ class Actor:
             if int(self.generation_target) <= target:
                 return
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_to(self, frame: int, extend_authored: bool = False) -> None:
         if self.kind == "model" and self.clip is not None and not self.controller_active:
             self.authored_extension_active = bool(extend_authored)
@@ -1174,6 +1233,9 @@ class ModelViewerApp(tk.Tk):
         self.camera_transition: dict[str, object] | None = None
         self.timeline_last_frame: int | None = None
         self.timeline_last_max_frame: int | None = None
+        self.last_timeline_ui_update = 0.0
+        self.frame_label_text = ""
+        self.axis_gizmo_drawn = False
         self.pan_drag_start: tuple[int, int] | None = None
         self.drag_start: tuple[int, int] | None = None
         self.pointer_down_start: tuple[int, int] | None = None
@@ -1183,6 +1245,7 @@ class ModelViewerApp(tk.Tk):
         self.gizmo_drag: str | None = None
         self.gizmo_last_mouse: tuple[int, int] | None = None
         self.gizmo_hits: dict[str, tuple[float, float, float, float]] = {}
+        self.ragdoll_drag: dict[str, object] | None = None
         self.follow_cam_actor_id: int | None = None
         self.programmatic_tree_selection = False
         self.tree_select_source: str | None = None
@@ -1197,6 +1260,10 @@ class ModelViewerApp(tk.Tk):
         self.render_photo: ImageTk.PhotoImage | None = None
         self.render_font: ImageFont.ImageFont | None = None
         self.gl_lists: dict[str, int] = {}
+        self.gl_transform_matrix = np.eye(4, dtype=np.float32)
+        self.floor_texture_id = 0
+        self.floor_texture_color = ""
+        self._frame_foot_metrics_cache: dict[tuple[object, ...], dict[str, object] | None] = {}
         self.shadow_lists: dict[int, tuple[int, int, int]] = {}
         self.shadow_generation = 0
         self.animation_browser_paths: list[Path] = []
@@ -1227,6 +1294,10 @@ class ModelViewerApp(tk.Tk):
         self.ae_prior_load_attempted = False
         self.ae_prior_error = ""
         self.ae_value_cache: dict[str, object] = {}
+        self.foot_envelope_info: dict[str, object] | None = None
+        self.foot_envelope_by_source: dict[str, dict[str, object] | None] = {}
+        self.foot_envelope_load_attempted = False
+        self.foot_envelope_error = ""
         self.xinput = load_xinput()
         self.controller_sample = ControllerSample()
         self.synthetic_controller_phase = 0.0
@@ -1239,6 +1310,7 @@ class ModelViewerApp(tk.Tk):
         self.show_foot_height_var = tk.BooleanVar(value=False)
         self.show_foot_contact_var = tk.BooleanVar(value=False)
         self.foot_contact_from_source_var = tk.BooleanVar(value=False)
+        self.ragdoll_mode_var = tk.BooleanVar(value=False)
         self.ik_mode_var = tk.BooleanVar(value=True)
         self.controller_detected_on_startup = self.poll_controller().connected
         self.controller_enabled_var = tk.BooleanVar(value=self.controller_detected_on_startup)
@@ -1262,6 +1334,8 @@ class ModelViewerApp(tk.Tk):
             tk.DoubleVar(value=float(current_target[2])),
         ]
         self.settings_locked_var = tk.BooleanVar(value=self.camera_target_locked)
+        floor_settings = self.app_settings.get("floor", {}) if isinstance(self.app_settings.get("floor", {}), dict) else {}
+        self.floor_base_color_var = tk.StringVar(value=normalize_hex_color(floor_settings.get("base_color", FLOOR), FLOOR))
         collider_settings = self.app_settings.get("colliders", {}) if isinstance(self.app_settings.get("colliders", {}), dict) else {}
         foot_length_setting = float(collider_settings.get("foot_length", DEFAULT_FOOT_LENGTH))
         if foot_length_setting <= 1e-6:
@@ -1432,7 +1506,11 @@ class ModelViewerApp(tk.Tk):
             command=self.on_extend_trajectory_toggle,
         ).pack(anchor=tk.W)
         ttk.Checkbutton(toolbar, text="Labels", variable=self.labels_var, command=self.draw).pack(side=tk.LEFT, padx=4, anchor=tk.N, pady=(4, 0))
-        ttk.Button(toolbar, text="Reset View", command=self.reset_camera).pack(side=tk.LEFT, padx=(12, 4), anchor=tk.N)
+        camera_controls = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        camera_controls.pack(side=tk.LEFT, padx=(12, 4), anchor=tk.N)
+        ttk.Button(camera_controls, text="Reset View", command=self.reset_camera).pack(anchor=tk.W, fill=tk.X)
+        self.ragdoll_button = ttk.Button(camera_controls, text="Ragdoll Off", command=self.toggle_ragdoll_mode)
+        self.ragdoll_button.pack(anchor=tk.W, fill=tk.X, pady=(4, 0))
         self.follow_cam_button = ttk.Button(toolbar, text="Follow Cam", command=self.follow_camera)
         self.follow_cam_button.pack(side=tk.LEFT, padx=(6, 4), anchor=tk.N)
         ttk.Button(toolbar, text="Penetration Cam", command=self.penetration_camera).pack(side=tk.LEFT, padx=(6, 4), anchor=tk.N)
@@ -1752,6 +1830,15 @@ class ModelViewerApp(tk.Tk):
         ttk.Button(content, text="Use Current Camera", command=self.capture_current_camera_settings).pack(fill=tk.X, pady=(2, 6))
 
         ttk.Separator(content).pack(fill=tk.X, pady=(10, 8))
+        ttk.Label(content, text="Floor").pack(anchor=tk.W)
+        floor_form = ttk.Frame(content)
+        floor_form.pack(fill=tk.X, pady=(8, 6))
+        ttk.Label(floor_form, text="Base Color", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(floor_form, textvariable=self.floor_base_color_var, width=10).grid(row=0, column=1, sticky=tk.EW, pady=3)
+        ttk.Button(floor_form, text="Pick...", command=self.choose_floor_base_color).grid(row=0, column=2, sticky=tk.E, padx=(6, 0), pady=3)
+        floor_form.columnconfigure(1, weight=1)
+
+        ttk.Separator(content).pack(fill=tk.X, pady=(10, 8))
         ttk.Label(content, text="Startup Model Source").pack(anchor=tk.W)
         startup_form = ttk.Frame(content)
         startup_form.pack(fill=tk.X, pady=(8, 6))
@@ -1833,6 +1920,14 @@ class ModelViewerApp(tk.Tk):
         self.settings_locked_var.set(True)
         self.settings_status_var.set("Captured current camera.")
 
+    def choose_floor_base_color(self) -> None:
+        current = normalize_hex_color(self.floor_base_color_var.get(), FLOOR)
+        _rgb, color = colorchooser.askcolor(color=current, title="Floor base color")
+        if color:
+            self.floor_base_color_var.set(normalize_hex_color(color, current))
+            self.floor_texture_color = ""
+            self.draw()
+
     def browse_startup_npz(self) -> None:
         path_text = filedialog.askopenfilename(
             title="Startup source NPZ",
@@ -1868,6 +1963,7 @@ class ModelViewerApp(tk.Tk):
                 "target": target,
                 "locked": bool(self.settings_locked_var.get()),
             }
+            floor = {"base_color": normalize_hex_color(self.floor_base_color_var.get(), FLOOR)}
             colliders = {
                 "foot_length": max(0.0, float(self.foot_length_var.get())),
                 "foot_width": max(0.001, float(self.foot_width_var.get())),
@@ -1916,6 +2012,7 @@ class ModelViewerApp(tk.Tk):
             self.settings_status_var.set("Invalid setting.")
             return
         self.app_settings["camera"] = camera
+        self.app_settings["floor"] = floor
         self.app_settings["colliders"] = colliders
         self.app_settings["startup"] = startup
         self.app_settings["animation_browser"] = animation_browser
@@ -1927,6 +2024,7 @@ class ModelViewerApp(tk.Tk):
             self.settings_status_var.set(f"Save failed: {exc}")
             return
         self.settings_status_var.set(f"Saved to {SETTINGS_PATH.name}.")
+        self.draw()
 
     def invalidate_shadow_cache(self) -> None:
         self.shadow_generation += 1
@@ -2543,7 +2641,13 @@ class ModelViewerApp(tk.Tk):
 
     def update_gizmo_visibility(self) -> None:
         actor = self.selected_actor()
-        self.gizmo_visible = bool(actor is not None and actor.visible and actor.clip is not None and not self.playing)
+        self.gizmo_visible = bool(
+            actor is not None
+            and actor.visible
+            and actor.clip is not None
+            and not self.playing
+            and not self.ragdoll_mode_var.get()
+        )
 
     def on_tree_double_click(self, event: tk.Event) -> None:
         item = self.tree.identify_row(event.y)
@@ -2633,7 +2737,17 @@ class ModelViewerApp(tk.Tk):
         counts = [actor.frame_count for actor in self.actors if actor.visible and actor.clip is not None]
         return max(counts) if counts else 1
 
+    def set_frame_label(self, frame_i: int, max_frame: int) -> None:
+        text = f"{int(frame_i)} / {int(max_frame)}"
+        if text != self.frame_label_text:
+            self.frame_label.configure(text=text)
+            self.frame_label_text = text
+
     def update_timeline(self) -> None:
+        now = time.perf_counter()
+        if self.playing and not self.timeline_dragging and now - self.last_timeline_ui_update < 0.05:
+            return
+        self.last_timeline_ui_update = now
         max_frame = max(0, self.max_frames() - 1)
         if not self.playing and not self.extend_playback_active():
             self.frame = min(self.frame, float(max_frame))
@@ -2645,7 +2759,7 @@ class ModelViewerApp(tk.Tk):
         self.updating_timeline = True
         self.frame_var.set(frame_i)
         self.updating_timeline = False
-        self.frame_label.configure(text=f"{frame_i} / {max_frame}")
+        self.set_frame_label(frame_i, max_frame)
         self.draw_timeline()
 
     def update_bounds(self) -> None:
@@ -2750,7 +2864,7 @@ class ModelViewerApp(tk.Tk):
         if self.updating_timeline:
             return
         self.frame = float(int(float(value)))
-        self.frame_label.configure(text=f"{int(self.frame)} / {max(0, self.max_frames() - 1)}")
+        self.set_frame_label(int(self.frame), max(0, self.max_frames() - 1))
         self.draw_timeline()
         self.draw()
 
@@ -2770,7 +2884,7 @@ class ModelViewerApp(tk.Tk):
     def set_frame_from_timeline(self, x: float) -> None:
         self.frame = float(self.frame_from_timeline_x(x))
         self.frame_var.set(int(self.frame))
-        self.frame_label.configure(text=f"{int(self.frame)} / {max(0, self.max_frames() - 1)}")
+        self.set_frame_label(int(self.frame), max(0, self.max_frames() - 1))
         self.draw_timeline()
         self.draw()
 
@@ -2860,7 +2974,7 @@ class ModelViewerApp(tk.Tk):
         self.set_follow_cam_actor(actor.actor_id)
         actor_yaw = float(actor.controller_yaw) if actor.kind == "model" else 0.0
         self.yaw = actor_yaw + math.pi
-        self.pitch = 0.22
+        self.pitch = FOLLOW_CAMERA_PITCH
         self.view_axis = None
         self.penetration_mode = False
         self.camera_target_locked = True
@@ -3175,6 +3289,34 @@ class ModelViewerApp(tk.Tk):
         transformed_pos = transformed_pos + actor.offset[None, :]
         return transformed_pos, transformed_rot
 
+    def inverse_actor_world_transform(
+        self, actor: Actor, positions: np.ndarray, rotations: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        transformed_pos = np.asarray(positions, dtype=np.float32).copy() - actor.offset[None, :]
+        transformed_rot = np.asarray(rotations, dtype=np.float32).copy()
+        if actor.kind == "model" and (actor.controller_active or np.linalg.norm(actor.controller_root_offset) > 1e-6):
+            pivot_index = max(0, min(actor.root_index, len(transformed_pos) - 1))
+            if actor.controller_active and actor.controller_root_anchor is not None:
+                pivot = actor.controller_root_anchor.astype(np.float32)
+            else:
+                pivot = (transformed_pos[pivot_index] - actor.controller_root_offset).astype(np.float32)
+            yaw_matrix = yaw_rotation_matrix_np(actor.controller_yaw)
+            transformed_pos = (
+                (transformed_pos - actor.controller_root_offset[None, :] - pivot[None, :]) @ yaw_matrix.T
+                + pivot[None, :]
+            ).astype(np.float32)
+            transformed_rot = np.matmul(transformed_rot, yaw_matrix.T).astype(np.float32)
+        if abs(float(actor.initial_root_yaw)) > 1e-8:
+            yaw_matrix = self.actor_root_yaw_matrix(actor)
+            if self.actor_root_yaw_affects_velocity(actor):
+                pivot = self.actor_root_yaw_pivot(actor)
+            else:
+                root = max(0, min(actor.root_index, len(transformed_pos) - 1))
+                pivot = transformed_pos[root].astype(np.float32, copy=True)
+            transformed_pos = ((transformed_pos - pivot[None, :]) @ yaw_matrix.T + pivot[None, :]).astype(np.float32)
+            transformed_rot = np.matmul(transformed_rot, yaw_matrix.T).astype(np.float32)
+        return transformed_pos.astype(np.float32), transformed_rot.astype(np.float32)
+
     def blend_rotation_matrices(self, a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
         blended = a * (1.0 - t) + b * t
         try:
@@ -3205,6 +3347,8 @@ class ModelViewerApp(tk.Tk):
         base = int(math.floor(frame))
         nxt = base + 1 if (controller_live or extend_live) else min(max_frame, base + 1)
         t = frame - base
+        override_a = self.ragdoll_override_for_frame(actor, base)
+        override_b = self.ragdoll_override_for_frame(actor, nxt)
         generate_sync = not (self.playing and actor.kind == "model")
         if not generate_sync:
             if controller_live or extend_live:
@@ -3217,12 +3361,22 @@ class ModelViewerApp(tk.Tk):
         if pose_a is None:
             return None
         if nxt == base or t <= 1e-4:
+            if override_a is not None:
+                return override_a
             positions, rotations = pose_a
             return self.apply_actor_world_transform(actor, positions, rotations)
         pose_b = actor.pose_for_frame(nxt, generate=generate_sync, extend_authored=extend_live)
         if pose_b is None:
+            if override_a is not None:
+                return override_a
             positions, rotations = pose_a
             return self.apply_actor_world_transform(actor, positions, rotations)
+        if override_a is not None or override_b is not None:
+            world_a = override_a if override_a is not None else self.apply_actor_world_transform(actor, pose_a[0], pose_a[1])
+            world_b = override_b if override_b is not None else self.apply_actor_world_transform(actor, pose_b[0], pose_b[1])
+            positions = (world_a[0] * (1.0 - t) + world_b[0] * t).astype(np.float32)
+            rotations = self.blend_rotation_matrices(world_a[1], world_b[1], float(t))
+            return positions, rotations
         pos_a, rot_a = pose_a
         pos_b, rot_b = pose_b
         positions = (pos_a * (1.0 - t) + pos_b * t).astype(np.float32)
@@ -3293,7 +3447,8 @@ class ModelViewerApp(tk.Tk):
                 self.playback_accumulator -= target_step
                 steps += 1
             if steps > 0:
-                self.update_timeline()
+                if time.perf_counter() - self.last_timeline_ui_update >= 0.05:
+                    self.update_timeline()
                 follow_moved = self.update_follow_camera_target()
                 self.draw()
                 drew = True
@@ -3512,6 +3667,8 @@ class ModelViewerApp(tk.Tk):
         self.cancel_camera_transition()
         self.pointer_down_start = (event.x, event.y)
         self.pending_gizmo_clear_on_release = False
+        if self.ragdoll_mode_var.get() and self.begin_ragdoll_drag(event.x, event.y):
+            return
         hit = self.hit_gizmo(event.x, event.y)
         if hit is not None and not self.playing:
             self.gizmo_drag = hit
@@ -3527,6 +3684,10 @@ class ModelViewerApp(tk.Tk):
         self.drag_pan = bool(event.state & 0x0001)
 
     def on_mouse_drag(self, event: tk.Event) -> None:
+        if self.ragdoll_drag is not None:
+            self.mark_pointer_dragged(event.x, event.y)
+            self.drag_ragdoll_limb(event.x, event.y)
+            return
         if self.gizmo_drag is not None:
             self.drag_gizmo(event.x, event.y)
             return
@@ -3550,6 +3711,7 @@ class ModelViewerApp(tk.Tk):
         self.draw()
 
     def on_mouse_up(self, event: tk.Event) -> None:
+        self.end_ragdoll_drag()
         self.clear_gizmo_on_click_release(event.x, event.y)
         self.drag_start = None
         self.gizmo_drag = None
@@ -3607,6 +3769,7 @@ class ModelViewerApp(tk.Tk):
         for name, (x, y, label, color) in points.items():
             canvas.create_oval(x - 11, y - 11, x + 11, y + 11, fill=color, outline="#e4e9f2", width=1)
             canvas.create_text(x, y, text=label, fill="#05070a", font=("Segoe UI", 7, "bold"))
+        self.axis_gizmo_drawn = True
 
     def record_render_frame(self) -> None:
         self.fps_frame_count += 1
@@ -3652,6 +3815,19 @@ class ModelViewerApp(tk.Tk):
                     angle_wrap_np(float(actor.controller_yaw) + float(actor.initial_root_yaw)),
                 )
         return self.authored_root_sample(actor, frame_value)
+
+    def actor_root_numpy_arrays(self, actor: Actor) -> tuple[np.ndarray, np.ndarray] | None:
+        if actor.clip is None:
+            return None
+        if (
+            actor.root_pos_np_cache is None
+            or actor.root_yaw_np_cache is None
+            or actor.root_pos_np_cache.shape[0] != int(actor.clip.T)
+            or actor.root_yaw_np_cache.shape[0] != int(actor.clip.T)
+        ):
+            actor.root_pos_np_cache = actor.clip.root_pos.detach().cpu().numpy().astype(np.float32, copy=False)
+            actor.root_yaw_np_cache = actor.clip.root_yaw.detach().cpu().numpy().astype(np.float32, copy=False)
+        return actor.root_pos_np_cache, actor.root_yaw_np_cache
 
     def previous_root_motion_sample_world(self, actor: Actor, frame_value: float) -> tuple[np.ndarray, float, float] | None:
         if actor.kind == "model" and actor.controller_active:
@@ -3881,6 +4057,183 @@ class ModelViewerApp(tk.Tk):
             return actor
         return None
 
+    def toggle_ragdoll_mode(self) -> None:
+        enabled = not bool(self.ragdoll_mode_var.get())
+        self.ragdoll_mode_var.set(enabled)
+        if hasattr(self, "ragdoll_button"):
+            self.ragdoll_button.configure(text="Ragdoll On" if enabled else "Ragdoll Off")
+        self.ragdoll_drag = None
+        if not enabled:
+            for actor in self.actors:
+                had_ragdoll = bool(actor.ragdoll_overrides)
+                actor.ragdoll_overrides.clear()
+                if had_ragdoll and actor.kind == "model":
+                    actor.reset_generation()
+            self.invalidate_shadow_cache()
+            self.update_gizmo_visibility()
+        else:
+            self.gizmo_visible = False
+        self.draw()
+
+    def ragdoll_frame_index(self, actor: Actor | None = None) -> int:
+        if actor is None or actor.clip is None:
+            return max(0, int(round(float(self.frame))))
+        return max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
+
+    def ragdoll_override_for_frame(
+        self, actor: Actor, frame: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        return actor.ragdoll_overrides.get(max(0, int(frame)))
+
+    def ragdoll_internal_root_state(
+        self, actor: Actor, frame: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if actor.clip is None or actor.cfg is None:
+            raise ValueError("actor has no clip/config")
+        backend = actor.backend()
+        frame_i = max(0, int(frame))
+        if actor.kind == "model" and actor.controller_active:
+            idx = torch.tensor([min(frame_i, actor.clip.T - 1)], dtype=torch.long, device=device)
+            root_pos, root_rot, _yaw, _heading = backend.root_state(actor.clip, idx, actor.cfg, device)
+            return root_pos, root_rot
+        root_pos, root_rot, _yaw, _heading = actor.authored_root_state(
+            frame_i, device, self.extend_playback_active(actor)
+        )
+        return root_pos, root_rot
+
+    def pose_from_actor_local_global(
+        self,
+        actor: Actor,
+        frame: int,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+    ) -> dict[str, torch.Tensor] | None:
+        if actor.clip is None or actor.cfg is None:
+            return None
+        backend = actor.backend()
+        device = actor.device or torch.device("cpu")
+        root_pos, root_rot = self.ragdoll_internal_root_state(actor, frame, device)
+        pos_t = torch.as_tensor(np.asarray(positions, dtype=np.float32), dtype=torch.float32, device=device).unsqueeze(0)
+        rot_t = torch.as_tensor(np.asarray(rotations, dtype=np.float32), dtype=torch.float32, device=device).unsqueeze(0)
+        local_rotations: list[torch.Tensor] = []
+        root_inv = root_rot.transpose(-1, -2)
+        for bone_index, parent in enumerate(actor.clip.parents_body_list):
+            if parent < 0:
+                local_rotations.append(rot_t[:, bone_index] @ root_inv)
+            else:
+                local_rotations.append(rot_t[:, bone_index] @ rot_t[:, int(parent)].transpose(-1, -2))
+        local_rot = torch.stack(local_rotations, dim=1)
+        root_relative = backend.root_relative_positions(pos_t, root_pos, root_rot)
+        pelvis = int(actor.clip.pelvis)
+        non_pelvis_idx = torch.tensor(actor.clip.non_pelvis, dtype=torch.long, device=device)
+        pose: dict[str, torch.Tensor] = {
+            "pelvis_pos": root_relative[:, pelvis],
+            "pelvis_rot6": backend.rotmat_to_6d(local_rot[:, pelvis]),
+            "nonpelvis_rot6": backend.rotmat_to_6d(local_rot.index_select(1, non_pelvis_idx)),
+        }
+        if actor.clip.ik_payload_dim > 0:
+            core_idx = torch.tensor(actor.clip.core_non_pelvis, dtype=torch.long, device=device)
+            pose["core_nonpelvis_rot6"] = backend.rotmat_to_6d(local_rot.index_select(1, core_idx))
+            tensors = actor.clip.tensors(device)
+            payload_parts: list[torch.Tensor] = []
+            for limb_i, spec in enumerate(actor.clip.ik_limb_specs):
+                start = int(spec["start"])
+                mid = int(spec["mid"])
+                end = int(spec["end"])
+                payload_parts.append(root_relative[:, end])
+                end_rot_root = rot_t[:, end] @ root_inv
+                payload_parts.append(backend.rotmat_to_6d(end_rot_root))
+                pole_float = backend.encode_pole_float(
+                    root_relative[:, start],
+                    root_relative[:, mid],
+                    root_relative[:, end],
+                    tensors["ik_rest_axis"][limb_i].to(dtype=root_rot.dtype),
+                    tensors["ik_rest_pole"][limb_i].to(dtype=root_rot.dtype),
+                ).unsqueeze(-1)
+                payload_parts.append(pole_float)
+                toe = spec.get("toe")
+                if toe is not None:
+                    toe_i = int(toe)
+                    axis = tensors["ik_toe_axis"][limb_i].to(dtype=root_rot.dtype).reshape(1, 3)
+                    ref = backend.stable_perpendicular(axis)
+                    rotated_ref = torch.matmul(ref.unsqueeze(1), local_rot[:, toe_i]).squeeze(1)
+                    rotated_ref = backend.project_to_plane(rotated_ref, axis)
+                    sin_v = (torch.cross(ref, rotated_ref, dim=-1) * axis).sum(dim=-1)
+                    cos_v = (ref * rotated_ref).sum(dim=-1)
+                    payload_parts.append((torch.atan2(sin_v, cos_v) / backend.IK_TOE_ALPHA).unsqueeze(-1))
+            pose["ik_payload"] = backend.clean_ik_payload(torch.cat(payload_parts, dim=-1))
+        _fk_pos, _fk_rot, canon = backend.fk_from_pose(actor.clip, root_pos, root_rot, pose, device)
+        pose["canon_pos"] = canon
+        if "contacts" in (actor.cur_pose or {}):
+            pose["contacts"] = torch.zeros_like(actor.cur_pose["contacts"])
+        return pose
+
+    def commit_ragdoll_pose_to_model_state(
+        self,
+        actor: Actor,
+        frame: int,
+        world_positions: np.ndarray,
+        world_rotations: np.ndarray,
+    ) -> None:
+        if actor.kind != "model" or actor.model is None or actor.clip is None or actor.cfg is None:
+            return
+        frame_i = max(0, int(frame))
+        actor.generate_to(frame_i, extend_authored=self.extend_playback_active(actor))
+        local_pos, local_rot = self.inverse_actor_world_transform(actor, world_positions, world_rotations)
+        cur_pose = self.pose_from_actor_local_global(actor, frame_i, local_pos, local_rot)
+        if cur_pose is None:
+            return
+        if frame_i > 0 and frame_i - 1 < min(len(actor.generated_pos), len(actor.generated_rot)):
+            prev_pose = self.pose_from_actor_local_global(
+                actor,
+                frame_i - 1,
+                actor.generated_pos[frame_i - 1],
+                actor.generated_rot[frame_i - 1],
+            )
+        else:
+            prev_pose = actor.backend().clone_pose(cur_pose)
+        if prev_pose is None:
+            prev_pose = actor.backend().clone_pose(cur_pose)
+        with actor.generation_lock:
+            while len(actor.generated_pos) <= frame_i:
+                actor.generated_pos.append(local_pos.copy())
+                actor.generated_rot.append(local_rot.copy())
+                actor.generated_contacts.append(np.zeros(2, dtype=np.float32))
+            actor.generated_pos[frame_i] = local_pos.astype(np.float32, copy=True)
+            actor.generated_rot[frame_i] = local_rot.astype(np.float32, copy=True)
+            actor.generated_contacts[frame_i] = actor.pose_contacts_numpy(cur_pose)
+            del actor.generated_pos[frame_i + 1 :]
+            del actor.generated_rot[frame_i + 1 :]
+            del actor.generated_contacts[frame_i + 1 :]
+            actor.prev_pose = prev_pose
+            actor.cur_pose = cur_pose
+            actor.prev_idx = torch.tensor([max(0, frame_i - 1)], dtype=torch.long)
+            actor.cur_idx = torch.tensor([frame_i], dtype=torch.long)
+            actor.generation_target = frame_i
+            for override_frame in list(actor.ragdoll_overrides):
+                if override_frame > frame_i:
+                    del actor.ragdoll_overrides[override_frame]
+
+    def store_ragdoll_override(
+        self, actor: Actor, frame: int, positions: np.ndarray, rotations: np.ndarray
+    ) -> None:
+        if actor.clip is None:
+            return
+        frame = max(0, min(actor.frame_count - 1, int(frame)))
+        actor.ragdoll_overrides[frame] = (
+            np.asarray(positions, dtype=np.float32).copy(),
+            np.asarray(rotations, dtype=np.float32).copy(),
+        )
+        self.commit_ragdoll_pose_to_model_state(actor, frame, positions, rotations)
+        self.invalidate_shadow_cache()
+
+    def clear_actor_ragdoll_overrides(self, actor: Actor) -> None:
+        if actor.ragdoll_overrides:
+            actor.ragdoll_overrides.clear()
+            if actor.kind == "model":
+                actor.reset_generation()
+            self.invalidate_shadow_cache()
+
     def select_actor_from_viewport(self, actor_id: int) -> None:
         self.selected_actor_id = actor_id
         item = str(actor_id)
@@ -3892,7 +4245,7 @@ class ModelViewerApp(tk.Tk):
             self.tree.see(item)
             self.after(150, lambda: self.clear_tree_select_source("viewport"))
         self.load_inspector()
-        self.gizmo_visible = self.selected_model_actor() is not None
+        self.gizmo_visible = self.selected_model_actor() is not None and not self.ragdoll_mode_var.get()
         self.gizmo_drag = None
         self.gizmo_last_mouse = None
         self.draw()
@@ -4154,6 +4507,441 @@ class ModelViewerApp(tk.Tk):
                 scores.append(score)
         return min(scores) if scores else None
 
+    def closest_point_on_segment_world(self, a: np.ndarray, b: np.ndarray, x: float, y: float) -> np.ndarray:
+        pa = np.asarray(self.screen_project(a)[:2], dtype=np.float32)
+        pb = np.asarray(self.screen_project(b)[:2], dtype=np.float32)
+        segment = pb - pa
+        denom = float(np.dot(segment, segment))
+        if denom <= 1e-6:
+            return np.asarray(a, dtype=np.float32)
+        t = max(0.0, min(1.0, float(np.dot(np.asarray([x, y], dtype=np.float32) - pa, segment) / denom)))
+        return (np.asarray(a, dtype=np.float32) * (1.0 - t) + np.asarray(b, dtype=np.float32) * t).astype(np.float32)
+
+    def pick_ragdoll_limb_at(self, x: float, y: float) -> dict[str, object] | None:
+        best: dict[str, object] | None = None
+        best_score = float("inf")
+        for actor in self.actors:
+            if not actor.visible or actor.clip is None:
+                continue
+            pose = self.actor_pose_for_display(actor)
+            if pose is None:
+                continue
+            positions, rotations = pose
+            name_to_index = {name: i for i, name in enumerate(actor.bone_names)}
+            for body_part, center, radius in self.ragdoll_body_drag_targets(positions, name_to_index):
+                score = self.collider_sphere_hit_score(x, y, center, radius)
+                if score is None or score >= best_score:
+                    continue
+                best_score = score
+                best = {
+                    "actor": actor,
+                    "frame": self.ragdoll_frame_index(actor),
+                    "drag_kind": "body",
+                    "body_part": body_part,
+                    "grabbed_index": name_to_index.get(body_part, actor.root_index),
+                    "body_grab_offset": (center - positions[name_to_index.get(body_part, actor.root_index)]).astype(np.float32),
+                    "grabbed_world": center.astype(np.float32),
+                    "grab_depth": float(self.screen_project(center)[2]),
+                    "positions": positions.astype(np.float32, copy=True),
+                    "rotations": rotations.astype(np.float32, copy=True),
+                }
+            for limb_index, spec in enumerate(actor.clip.ik_limb_specs):
+                start = int(spec["start"])
+                mid = int(spec["mid"])
+                end = int(spec["end"])
+                toe_value = spec.get("toe")
+                toe = int(toe_value) if toe_value is not None else None
+                candidates: list[tuple[float, np.ndarray, int]] = []
+                for a, b, radius in ((start, mid, 0.075), (mid, end, 0.070)):
+                    score = self.collider_segment_hit_score(x, y, positions[a], positions[b], radius)
+                    if score is not None:
+                        candidates.append((score, self.closest_point_on_segment_world(positions[a], positions[b], x, y), end))
+                for point_index, radius in ((end, 0.085), *(([(toe, 0.075)] if toe is not None else []))):
+                    if point_index is None:
+                        continue
+                    score = self.collider_sphere_hit_score(x, y, positions[point_index], radius)
+                    if score is not None:
+                        candidates.append((score, positions[point_index].astype(np.float32), int(point_index)))
+                for score, grabbed, grabbed_index in candidates:
+                    if score < best_score:
+                        best_score = score
+                        depth = float(self.screen_project(grabbed)[2])
+                        best = {
+                            "actor": actor,
+                            "frame": self.ragdoll_frame_index(actor),
+                            "drag_kind": "limb",
+                            "limb_index": limb_index,
+                            "start": start,
+                            "mid": mid,
+                            "end": end,
+                            "toe": toe,
+                            "grabbed_index": grabbed_index,
+                            "grabbed_world": grabbed.astype(np.float32),
+                            "grab_depth": depth,
+                            "end_offset": (positions[end] - grabbed).astype(np.float32),
+                            "positions": positions.astype(np.float32, copy=True),
+                            "rotations": rotations.astype(np.float32, copy=True),
+                        }
+        return best
+
+    def ragdoll_body_drag_targets(
+        self, positions: np.ndarray, name_to_index: dict[str, int]
+    ) -> list[tuple[str, np.ndarray, float]]:
+        targets: list[tuple[str, np.ndarray, float]] = []
+        pelvis = name_to_index.get("pelvis")
+        if pelvis is not None:
+            frame = self.body_box_frame(positions, name_to_index)
+            up = frame[1] if frame is not None else np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            targets.append(("pelvis", add3(positions[pelvis], mul3(up, 0.025)), 0.095))
+        head = self.gl_head_sphere(positions, name_to_index)
+        if head is not None:
+            center, radius = head
+            targets.append(("head", center.astype(np.float32), max(0.08, radius)))
+        else:
+            head_index = name_to_index.get("head")
+            if head_index is not None:
+                targets.append(("head", positions[head_index].astype(np.float32), 0.11))
+        return targets
+
+    def screen_to_world_at_depth(self, x: float, y: float, depth: float) -> np.ndarray | None:
+        if self.gl_modelview is not None and self.gl_projection is not None and self.gl_viewport is not None:
+            try:
+                wx, wy, wz = GLU.gluUnProject(
+                    float(x),
+                    float(self.gl_viewport[3] - y),
+                    float(depth),
+                    self.gl_modelview,
+                    self.gl_projection,
+                    self.gl_viewport,
+                )
+                return np.asarray([wx, wy, wz], dtype=np.float32)
+            except Exception:
+                pass
+        return None
+
+    def row_rotation_between(self, old_dir: np.ndarray, new_dir: np.ndarray) -> np.ndarray:
+        a = np.asarray(old_dir, dtype=np.float32)
+        b = np.asarray(new_dir, dtype=np.float32)
+        an = float(np.linalg.norm(a))
+        bn = float(np.linalg.norm(b))
+        if an <= 1e-8 or bn <= 1e-8:
+            return np.eye(3, dtype=np.float32)
+        a = a / an
+        b = b / bn
+        v = np.cross(a, b)
+        c = max(-1.0, min(1.0, float(np.dot(a, b))))
+        s = float(np.linalg.norm(v))
+        if s <= 1e-7:
+            if c > 0.0:
+                return np.eye(3, dtype=np.float32)
+            axis = np.cross(a, np.asarray([1.0, 0.0, 0.0], dtype=np.float32))
+            if np.linalg.norm(axis) <= 1e-6:
+                axis = np.cross(a, np.asarray([0.0, 1.0, 0.0], dtype=np.float32))
+            axis = axis / max(1e-8, float(np.linalg.norm(axis)))
+            v = axis
+            s = 0.0
+            c = -1.0
+        vx = np.asarray(
+            [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]],
+            dtype=np.float32,
+        )
+        if c < -0.999999:
+            r_col = np.eye(3, dtype=np.float32) + 2.0 * (vx @ vx)
+        else:
+            r_col = np.eye(3, dtype=np.float32) + vx + (vx @ vx) * ((1.0 - c) / max(1e-8, s * s))
+        return r_col.T.astype(np.float32)
+
+    def orthonormalize_matrix(self, matrix: np.ndarray) -> np.ndarray:
+        try:
+            u, _s, vh = np.linalg.svd(matrix.astype(np.float32))
+            out = u @ vh
+            if np.linalg.det(out) < 0.0:
+                u[:, -1] *= -1.0
+                out = u @ vh
+            return out.astype(np.float32)
+        except np.linalg.LinAlgError:
+            return np.eye(3, dtype=np.float32)
+
+    def solve_ragdoll_two_bone(
+        self,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+        start: int,
+        mid: int,
+        end: int,
+        toe: int | None,
+        target: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        out_pos = positions.astype(np.float32, copy=True)
+        out_rot = rotations.astype(np.float32, copy=True)
+        old_start = out_pos[start].copy()
+        old_mid = out_pos[mid].copy()
+        old_end = out_pos[end].copy()
+        old_toe = out_pos[toe].copy() if toe is not None else None
+        l1 = max(1e-4, float(np.linalg.norm(old_mid - old_start)))
+        l2 = max(1e-4, float(np.linalg.norm(old_end - old_mid)))
+        target = np.asarray(target, dtype=np.float32)
+        base = old_start.copy()
+        raw = target - base
+        dist = float(np.linalg.norm(raw))
+        if dist <= 1e-7:
+            return out_pos, out_rot
+        max_reach = max(1e-4, l1 + l2 - 1e-4)
+        min_reach = max(0.0, abs(l1 - l2) + 1e-4)
+        direction = raw / dist
+        if dist > max_reach:
+            body_delta = direction * (dist - max_reach)
+            out_pos += body_delta[None, :]
+            base = out_pos[start].copy()
+            raw = target - base
+            dist = float(np.linalg.norm(raw))
+            direction = raw / max(1e-7, dist)
+        dist_clamped = max(min_reach, min(max_reach, dist))
+        solved_end = base + direction * dist_clamped
+        pole = old_mid - old_start
+        pole = pole - direction * float(np.dot(pole, direction))
+        if np.linalg.norm(pole) <= 1e-6:
+            try:
+                cam, target_cam, _up = self.camera_render_view()
+                camera_dir = target_cam - cam
+            except Exception:
+                camera_dir = np.asarray([0.0, 0.0, -1.0], dtype=np.float32)
+            pole = np.cross(direction, camera_dir)
+        if np.linalg.norm(pole) <= 1e-6:
+            pole = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            pole = pole - direction * float(np.dot(pole, direction))
+        pole = pole / max(1e-7, float(np.linalg.norm(pole)))
+        a = (l1 * l1 - l2 * l2 + dist_clamped * dist_clamped) / max(1e-7, 2.0 * dist_clamped)
+        h = math.sqrt(max(0.0, l1 * l1 - a * a))
+        solved_mid = base + direction * a + pole * h
+        out_pos[mid] = solved_mid.astype(np.float32)
+        out_pos[end] = solved_end.astype(np.float32)
+        if toe is not None and old_toe is not None:
+            out_pos[toe] = (solved_end + (old_toe - old_end)).astype(np.float32)
+        for joint, old_a, old_b, new_a, new_b in (
+            (start, old_start, old_mid, out_pos[start], out_pos[mid]),
+            (mid, old_mid, old_end, out_pos[mid], out_pos[end]),
+        ):
+            delta = self.row_rotation_between(old_b - old_a, new_b - new_a)
+            out_rot[joint] = self.orthonormalize_matrix(out_rot[joint] @ delta)
+        return out_pos.astype(np.float32), out_rot.astype(np.float32)
+
+    def solve_ragdoll_two_bone_fixed_base(
+        self,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+        start: int,
+        mid: int,
+        end: int,
+        toe: int | None,
+        target: np.ndarray,
+        reference_positions: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, np.ndarray]:
+        out_pos = positions.astype(np.float32, copy=True)
+        out_rot = rotations.astype(np.float32, copy=True)
+        ref_pos = out_pos if reference_positions is None else np.asarray(reference_positions, dtype=np.float32)
+        old_start = ref_pos[start].copy()
+        old_mid = ref_pos[mid].copy()
+        old_end = ref_pos[end].copy()
+        old_toe = ref_pos[toe].copy() if toe is not None else None
+        l1 = max(1e-4, float(np.linalg.norm(old_mid - old_start)))
+        l2 = max(1e-4, float(np.linalg.norm(old_end - old_mid)))
+        base = out_pos[start].copy()
+        target = np.asarray(target, dtype=np.float32)
+        raw = target - base
+        dist = float(np.linalg.norm(raw))
+        if dist <= 1e-7:
+            return out_pos, out_rot
+        direction = raw / dist
+        max_reach = max(1e-4, l1 + l2 - 1e-4)
+        min_reach = max(0.0, abs(l1 - l2) + 1e-4)
+        dist_clamped = max(min_reach, min(max_reach, dist))
+        solved_end = base + direction * dist_clamped
+        pole = old_mid - old_start
+        pole = pole - direction * float(np.dot(pole, direction))
+        if np.linalg.norm(pole) <= 1e-6:
+            pole = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+            pole = pole - direction * float(np.dot(pole, direction))
+        if np.linalg.norm(pole) <= 1e-6:
+            pole = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+            pole = pole - direction * float(np.dot(pole, direction))
+        pole = pole / max(1e-7, float(np.linalg.norm(pole)))
+        a = (l1 * l1 - l2 * l2 + dist_clamped * dist_clamped) / max(1e-7, 2.0 * dist_clamped)
+        h = math.sqrt(max(0.0, l1 * l1 - a * a))
+        solved_mid = base + direction * a + pole * h
+        out_pos[mid] = solved_mid.astype(np.float32)
+        out_pos[end] = solved_end.astype(np.float32)
+        if toe is not None and old_toe is not None:
+            out_pos[toe] = (solved_end + (old_toe - old_end)).astype(np.float32)
+        for joint, old_a, old_b, new_a, new_b in (
+            (start, old_start, old_mid, out_pos[start], out_pos[mid]),
+            (mid, old_mid, old_end, out_pos[mid], out_pos[end]),
+        ):
+            delta = self.row_rotation_between(old_b - old_a, new_b - new_a)
+            out_rot[joint] = self.orthonormalize_matrix(out_rot[joint] @ delta)
+        return out_pos.astype(np.float32), out_rot.astype(np.float32)
+
+    def clamp_ragdoll_body_delta(
+        self,
+        reference_positions: np.ndarray,
+        anchored_ends: list[tuple[int, int, int, int | None, np.ndarray]],
+        delta: np.ndarray,
+    ) -> np.ndarray:
+        out_delta = np.asarray(delta, dtype=np.float32).copy()
+        for _iteration in range(4):
+            changed = False
+            for start, mid, end, _toe, end_target in anchored_ends:
+                start_pos = reference_positions[start]
+                l1 = max(1e-4, float(np.linalg.norm(reference_positions[mid] - start_pos)))
+                l2 = max(1e-4, float(np.linalg.norm(reference_positions[end] - reference_positions[mid])))
+                max_reach = max(1e-4, l1 + l2 - 1e-4)
+                min_reach = max(0.0, abs(l1 - l2) + 1e-4)
+                proposed_start = start_pos + out_delta
+                raw = proposed_start - end_target
+                dist = float(np.linalg.norm(raw))
+                if dist <= 1e-8:
+                    direction = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+                else:
+                    direction = raw / dist
+                clamped_dist = max(min_reach, min(max_reach, dist))
+                if abs(clamped_dist - dist) > 1e-6:
+                    clamped_start = end_target + direction * clamped_dist
+                    out_delta += (clamped_start - proposed_start).astype(np.float32)
+                    changed = True
+            if not changed:
+                break
+        return out_delta.astype(np.float32)
+
+    def solve_ragdoll_body_part(
+        self,
+        actor: Actor,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+        body_part: str,
+        grabbed_world: np.ndarray,
+        target_world: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        out_pos = np.asarray(positions, dtype=np.float32).copy()
+        out_rot = np.asarray(rotations, dtype=np.float32).copy()
+        if actor.clip is None:
+            return out_pos, out_rot
+        name_to_index = {name: i for i, name in enumerate(actor.bone_names)}
+        index = name_to_index.get(body_part)
+        if index is None:
+            return out_pos, out_rot
+        delta = np.asarray(target_world, dtype=np.float32) - np.asarray(grabbed_world, dtype=np.float32)
+        if float(np.linalg.norm(delta)) <= 1e-7:
+            return out_pos, out_rot
+        if body_part == "pelvis":
+            anchored_ends: list[tuple[int, int, int, int | None, np.ndarray]] = []
+            ik_controlled: set[int] = set()
+            for spec in actor.clip.ik_limb_specs:
+                start = int(spec["start"])
+                mid = int(spec["mid"])
+                end = int(spec["end"])
+                toe_value = spec.get("toe")
+                toe = int(toe_value) if toe_value is not None else None
+                anchored_ends.append((start, mid, end, toe, out_pos[end].copy()))
+                ik_controlled.update((mid, end))
+                if toe is not None:
+                    ik_controlled.add(toe)
+            reference_pos = out_pos.copy()
+            delta = self.clamp_ragdoll_body_delta(reference_pos, anchored_ends, delta)
+            for bone_index in range(len(out_pos)):
+                if bone_index not in ik_controlled:
+                    out_pos[bone_index] += delta
+            for start, mid, end, toe, end_target in anchored_ends:
+                out_pos, out_rot = self.solve_ragdoll_two_bone_fixed_base(
+                    out_pos, out_rot, start, mid, end, toe, end_target, reference_pos
+                )
+            return out_pos.astype(np.float32), out_rot.astype(np.float32)
+
+        chain: list[int] = []
+        cursor = index
+        pelvis = name_to_index.get("pelvis", actor.root_index)
+        while cursor >= 0 and cursor not in chain:
+            chain.append(cursor)
+            if cursor == pelvis:
+                break
+            cursor = int(actor.parents[cursor]) if cursor < len(actor.parents) else -1
+        chain = list(reversed(chain))
+        if not chain:
+            out_pos[index] += delta
+            return out_pos, out_rot
+        denom = max(1, len(chain) - 1)
+        for i, bone_index in enumerate(chain):
+            weight = float(i) / float(denom)
+            out_pos[bone_index] += delta * weight
+        return out_pos.astype(np.float32), out_rot.astype(np.float32)
+
+    def begin_ragdoll_drag(self, x: int, y: int) -> bool:
+        hit = self.pick_ragdoll_limb_at(x, y)
+        if hit is None:
+            return False
+        actor = hit["actor"]
+        if not isinstance(actor, Actor):
+            return False
+        self.select_actor_from_viewport(actor.actor_id)
+        self.gizmo_visible = False
+        self.ragdoll_drag = hit
+        self.gizmo_drag = None
+        self.drag_start = None
+        self.pending_gizmo_clear_on_release = False
+        return True
+
+    def drag_ragdoll_limb(self, x: int, y: int) -> None:
+        drag = self.ragdoll_drag
+        if drag is None:
+            return
+        actor = drag.get("actor")
+        if not isinstance(actor, Actor) or actor.clip is None:
+            return
+        world = self.screen_to_world_at_depth(x, y, float(drag.get("grab_depth", 0.5)))
+        if world is None:
+            return
+        positions = np.asarray(drag["positions"], dtype=np.float32)
+        rotations = np.asarray(drag["rotations"], dtype=np.float32)
+        if drag.get("drag_kind") == "body":
+            solved_pos, solved_rot = self.solve_ragdoll_body_part(
+                actor,
+                positions,
+                rotations,
+                str(drag.get("body_part", "")),
+                np.asarray(drag.get("grabbed_world", np.zeros(3, dtype=np.float32)), dtype=np.float32),
+                world,
+            )
+        else:
+            target = world + np.asarray(drag.get("end_offset", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+            solved_pos, solved_rot = self.solve_ragdoll_two_bone(
+                positions,
+                rotations,
+                int(drag["start"]),
+                int(drag["mid"]),
+                int(drag["end"]),
+                drag.get("toe") if drag.get("toe") is None else int(drag["toe"]),
+                target,
+            )
+        frame = int(drag.get("frame", self.ragdoll_frame_index(actor)))
+        self.store_ragdoll_override(actor, frame, solved_pos, solved_rot)
+        drag["positions"] = solved_pos
+        drag["rotations"] = solved_rot
+        if drag.get("drag_kind") == "body":
+            grabbed_index = int(drag.get("grabbed_index", actor.root_index))
+            grab_offset = np.asarray(drag.get("body_grab_offset", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+            grabbed_world = (solved_pos[grabbed_index] + grab_offset).astype(np.float32)
+        else:
+            grabbed_index = int(drag.get("grabbed_index", drag["end"]))
+            grabbed_world = solved_pos[grabbed_index]
+        drag["grabbed_world"] = grabbed_world.astype(np.float32)
+        drag["grab_depth"] = float(self.screen_project(grabbed_world)[2])
+        if drag.get("drag_kind") != "body":
+            drag["end_offset"] = (solved_pos[int(drag["end"])] - grabbed_world).astype(np.float32)
+        self.update_bounds()
+        self.draw()
+
+    def end_ragdoll_drag(self) -> None:
+        self.ragdoll_drag = None
+
     def pick_actor_at(self, x: float, y: float) -> Actor | None:
         best_actor = None
         best_score = float("inf")
@@ -4215,13 +5003,14 @@ class ModelViewerApp(tk.Tk):
 
     def draw(self) -> None:
         if isinstance(self.canvas, MotionGLFrame):
-            self.frame_label.configure(text=f"{int(self.frame)} / {max(0, self.max_frames() - 1)}")
+            self.set_frame_label(int(self.frame), max(0, self.max_frames() - 1))
             if self.canvas.context_created and self.canvas.winfo_ismapped():
                 self.canvas._display()
                 self.record_render_frame()
-            if hasattr(self, "timeline_bar"):
+            if hasattr(self, "timeline_bar") and not self.playing:
                 self.timeline_bar.lift()
-            self.draw_camera_axis_gizmo()
+            if not self.axis_gizmo_drawn:
+                self.draw_camera_axis_gizmo()
             return
         self.begin_scene()
         self.draw_floor_plane()
@@ -4242,15 +5031,17 @@ class ModelViewerApp(tk.Tk):
         self.draw_gizmo()
         self.finish_scene()
         self.record_render_frame()
-        self.draw_camera_axis_gizmo()
-        self.frame_label.configure(text=f"{int(self.frame)} / {max(0, self.max_frames() - 1)}")
+        if not self.axis_gizmo_drawn:
+            self.draw_camera_axis_gizmo()
+        self.set_frame_label(int(self.frame), max(0, self.max_frames() - 1))
 
     def init_gl_resources(self) -> None:
-        if self.gl_lists:
-            return
-        self.gl_lists["capsule"] = self.create_unit_capsule_list(10)
-        self.gl_lists["box"] = self.create_unit_box_list()
-        self.gl_lists["sphere"] = self.create_unit_sphere_list()
+        if "capsule" not in self.gl_lists:
+            self.gl_lists["capsule"] = self.create_unit_capsule_list(10)
+        if "box" not in self.gl_lists:
+            self.gl_lists["box"] = self.create_unit_box_list()
+        if "sphere" not in self.gl_lists:
+            self.gl_lists["sphere"] = self.create_unit_sphere_list()
 
     def create_unit_capsule_list(self, segments: int) -> int:
         list_id = GL.glGenLists(1)
@@ -4794,6 +5585,205 @@ class ModelViewerApp(tk.Tk):
         self.ae_value_cache = {"key": cache_key, "value": value}
         return value
 
+    def latest_ik_envelope(self) -> dict[str, object] | None:
+        if self.foot_envelope_info is not None:
+            return self.foot_envelope_info
+        if self.foot_envelope_load_attempted:
+            return None
+        self.foot_envelope_load_attempted = True
+        self.foot_envelope_error = ""
+        cache_dir = PROJECT_ROOT / "training" / "runs" / "cache" / "ik_excess_envelopes"
+        try:
+            candidates = sorted(cache_dir.glob("ik_excess_envelope_*.pt"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError as exc:
+            self.foot_envelope_error = str(exc)
+            return None
+        required = (
+            "clip_source_features",
+            "clip_source_linear_mps",
+            "clip_source_angular_radps",
+            "clip_source_counts",
+            "metadata",
+        )
+        accepted_lookup = {
+            "animation_dependent_nearest_same_planted_side_foot_ball_points_foot_yaw_no_frame_index",
+            "animation_dependent_exact_knn_foot_ball_points_foot_yaw_no_frame_index",
+        }
+        for path in candidates:
+            try:
+                envelope = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                self.foot_envelope_error = f"{path.name}: {exc}"
+                continue
+            if not isinstance(envelope, dict) or not all(key in envelope for key in required):
+                continue
+            metadata = envelope.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("bound_lookup") not in accepted_lookup:
+                continue
+            for key, value in list(envelope.items()):
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().cpu()
+                    envelope[key] = value.float() if value.is_floating_point() else value
+            metadata["cache_path"] = str(path)
+            metadata["cache_hit"] = 1
+            self.foot_envelope_info = envelope
+            return envelope
+        if not self.foot_envelope_error:
+            self.foot_envelope_error = "no animation-dependent IK excess envelope cache"
+        return None
+
+    def ik_envelope_for_actor(self, actor: Actor) -> dict[str, object] | None:
+        if actor.clip is None:
+            return self.latest_ik_envelope()
+        cfg = self.foot_loss_config_for_actor(actor)
+        clip_path = actor.source_npz_path or actor.npz_path or actor.clip.path
+        try:
+            stat = clip_path.stat()
+            cache_key = (
+                f"{clip_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}:"
+                f"{getattr(cfg, 'future_window', 8)}:{getattr(cfg, 'position_unit_scale', 1.0)}:"
+                f"{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+            )
+        except OSError:
+            cache_key = f"{actor.actor_id}:{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+        if cache_key in self.foot_envelope_by_source:
+            return self.foot_envelope_by_source[cache_key]
+        try:
+            store = ik_ctl.SimpleClipStore([actor.clip], cfg, torch.device("cpu"))
+            envelope = ik_env.load_or_build_excess_envelope(store)
+            if not isinstance(envelope, dict):
+                self.foot_envelope_by_source[cache_key] = None
+                return None
+            metadata = envelope.get("metadata")
+            if isinstance(metadata, dict):
+                metadata["viewer_source_path"] = str(clip_path.resolve())
+            for key, value in list(envelope.items()):
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().cpu()
+                    envelope[key] = value.float() if value.is_floating_point() else value
+            self.foot_envelope_by_source[cache_key] = envelope  # type: ignore[assignment]
+            return envelope  # type: ignore[return-value]
+        except Exception as exc:
+            self.foot_envelope_error = str(exc)
+            self.foot_envelope_by_source[cache_key] = None
+            return self.latest_ik_envelope()
+
+    def envelope_clip_id_for_actor(self, envelope: dict[str, object], actor: Actor) -> int | None:
+        features = envelope.get("clip_source_features")
+        if not isinstance(features, torch.Tensor) or features.ndim < 1:
+            return None
+        clip_count = int(features.shape[0])
+        if clip_count <= 1:
+            return 0
+        actor_path = actor.npz_path or actor.source_npz_path
+        if actor_path is None:
+            self.foot_envelope_error = "animation envelope has multiple clips and actor has no source path"
+            return None
+        resolved_actor = actor_path.resolve()
+        metadata = envelope.get("metadata")
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        clip_entries = (
+            metadata_dict.get("clip_paths")
+            or metadata_dict.get("clips")
+            or metadata_dict.get("source_paths")
+            or metadata_dict.get("paths")
+        )
+        if isinstance(clip_entries, (list, tuple)):
+            for index, entry in enumerate(clip_entries):
+                raw_path = entry.get("path") if isinstance(entry, dict) else entry
+                if not raw_path:
+                    continue
+                try:
+                    if Path(str(raw_path)).resolve() == resolved_actor:
+                        return index
+                except OSError:
+                    continue
+        self.foot_envelope_error = (
+            "animation-dependent envelope has multiple clips but no clip path map; "
+            "rebuild the cache with clip paths in metadata for exact viewer lookup"
+        )
+        return None
+
+    def foot_envelope_values_for_actor(
+        self,
+        actor: Actor,
+        frame: int,
+        cur_positions: np.ndarray,
+        cur_rotations: np.ndarray,
+        next_positions: np.ndarray,
+        next_rotations: np.ndarray,
+        foot_indices: tuple[int, int],
+        toe_indices: tuple[int, int],
+    ) -> dict[str, float | int] | None:
+        if actor.clip is None:
+            return None
+        envelope = self.ik_envelope_for_actor(actor)
+        if envelope is None:
+            return None
+        metadata = envelope.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        clip_id = self.envelope_clip_id_for_actor(envelope, actor)
+        if clip_id is None:
+            return None
+        cfg = self.foot_loss_config_for_actor(actor)
+        device = torch.device("cpu")
+        max_frame = max(1, int(actor.frame_count) - 2)
+        cur_frame = max(1, min(max_frame, int(frame)))
+        cur_idx = torch.tensor([cur_frame], dtype=torch.long, device=device)
+        if actor.clip is not None and not actor.clip.cyclic_animation and not self.extend_playback_active(actor):
+            cur_idx = torch.clamp(cur_idx, min=1, max=max(1, actor.clip.T - 2))
+        prev_idx = cur_idx - 1
+        fut_idx = cur_idx + int(getattr(cfg, "future_window", 8))
+        if actor.clip is not None and not actor.clip.cyclic_animation and not self.extend_playback_active(actor):
+            fut_idx = torch.clamp(fut_idx, max=actor.clip.T - 1)
+        try:
+            with torch.no_grad():
+                prev_pos, _prev_rot, prev_yaw, _prev_heading = self.ae_root_state_for_actor(actor, prev_idx, cfg, device)
+                cur_pos, _cur_rot, _cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+                fut_pos, _fut_rot, fut_yaw, _fut_heading = self.ae_root_state_for_actor(actor, fut_idx, cfg, device)
+                yaw_delta = ik_tl.wrap_angle(fut_yaw - prev_yaw) / torch.pi
+                bend = ik_env.signed_horizontal_angle(cur_pos - prev_pos, fut_pos - cur_pos) / torch.pi
+                order = (foot_indices[0], toe_indices[0], foot_indices[1], toe_indices[1])
+                cur_pos_t = torch.as_tensor(cur_positions[order][None, :, :], dtype=torch.float32, device=device)
+                cur_rot_t = torch.as_tensor(cur_rotations[order][None, :, :, :], dtype=torch.float32, device=device)
+                next_pos_t = torch.as_tensor(next_positions[order][None, :, :], dtype=torch.float32, device=device)
+                next_rot_t = torch.as_tensor(next_rotations[order][None, :, :, :], dtype=torch.float32, device=device)
+                linear_selected, angular_selected, planted = ik_env.compact_slide_yaw_selected_with_planted(
+                    cur_pos_t,
+                    cur_rot_t,
+                    next_pos_t,
+                    next_rot_t,
+                    actor.clip.fps,
+                )
+                foot_dx = cur_pos_t[:, 0, 0] - cur_pos_t[:, 2, 0]
+                foot_dz = cur_pos_t[:, 0, 2] - cur_pos_t[:, 2, 2]
+                foot_distance = torch.sqrt(foot_dx.square() + foot_dz.square() + 1e-12)
+                feature = torch.stack((yaw_delta.reshape(1), bend.reshape(1), foot_distance.reshape(1)), dim=-1)
+                clip_ids = torch.tensor([clip_id], dtype=torch.long, device=device)
+                linear_bound, angular_bound = ik_env._animation_upper_bounds(  # type: ignore[attr-defined]
+                    envelope,  # type: ignore[arg-type]
+                    feature,
+                    clip_ids,
+                    planted,
+                )
+                margin = float(metadata.get("margin", 1.05))
+                linear_bound = linear_bound * margin
+                angular_bound = angular_bound * margin
+            return {
+                "slide_speed": float(linear_selected[0].detach().cpu()),
+                "yaw_speed": float(angular_selected[0].detach().cpu()),
+                "slide_bound": float(linear_bound[0].detach().cpu()),
+                "yaw_bound": float(angular_bound[0].detach().cpu()),
+                "selected_index": int(planted[0].detach().cpu()),
+                "clip_id": int(clip_id),
+            }
+        except Exception as exc:
+            self.foot_envelope_error = str(exc)
+            return None
+
     def contact_geometry_config(self) -> cp.ContactGeometryConfig:
         visual = self.foot_contact_config()
         return replace(
@@ -4811,9 +5801,12 @@ class ModelViewerApp(tk.Tk):
         )
 
     def actor_metric_pose_for_frame(
-        self, actor: Actor, frame: int
+        self, actor: Actor, frame: int, generate: bool = False
     ) -> tuple[np.ndarray, np.ndarray] | None:
-        pose = actor.pose_for_frame(frame, generate=False, extend_authored=self.extend_playback_active(actor))
+        override = self.ragdoll_override_for_frame(actor, int(frame))
+        if override is not None:
+            return override
+        pose = actor.pose_for_frame(frame, generate=generate, extend_authored=self.extend_playback_active(actor))
         if pose is None:
             return None
         return self.apply_actor_world_transform(actor, pose[0], pose[1])
@@ -4854,8 +5847,10 @@ class ModelViewerApp(tk.Tk):
         frame = max(0, min(actor.frame_count - 1, int(frame)))
         prev_frame = 0 if frame <= 0 else frame - 1
         cur_frame = 1 if frame <= 0 and actor.frame_count > 1 else frame
+        next_frame = min(actor.frame_count - 1, cur_frame + 1)
         prev_pose = self.actor_metric_pose_for_frame(actor, prev_frame)
         cur_pose = self.actor_metric_pose_for_frame(actor, cur_frame)
+        next_pose = self.actor_metric_pose_for_frame(actor, next_frame, generate=not self.playing)
         if prev_pose is None or cur_pose is None:
             prev_positions = positions
             prev_rotations = rotations
@@ -4864,6 +5859,11 @@ class ModelViewerApp(tk.Tk):
         else:
             prev_positions, prev_rotations = prev_pose
             cur_positions, cur_rotations = cur_pose
+        if next_pose is None:
+            next_positions = cur_positions
+            next_rotations = cur_rotations
+        else:
+            next_positions, next_rotations = next_pose
 
         foot_indices = tuple(int(side[2]) for side in sides)
         toe_indices = tuple(int(side[3]) for side in sides)
@@ -4892,14 +5892,45 @@ class ModelViewerApp(tk.Tk):
         selected_index = int(np.argmin(heights)) if heights.size else 0
         slide_excess = float(slide_speeds[selected_index]) if slide_speeds.size else 0.0
         cfg = self.foot_loss_config_for_actor(actor)
-        slide_threshold = max(0.0, float(getattr(cfg, "slide_excess_threshold_mps", 0.0)))
-        yaw_speed = float(yaw_speeds[selected_index]) if yaw_speeds.size else 0.0
+        envelope_values = self.foot_envelope_values_for_actor(
+            actor,
+            frame,
+            cur_positions,
+            cur_rotations,
+            next_positions,
+            next_rotations,
+            foot_indices,
+            toe_indices,
+        )
+        envelope_available = envelope_values is not None
+        if envelope_values is not None:
+            selected_index = max(0, min(len(sides) - 1, int(envelope_values["selected_index"])))
+            slide_excess = float(envelope_values["slide_speed"])
+            yaw_speed = float(envelope_values["yaw_speed"])
+            slide_threshold = float(envelope_values["slide_bound"])
+            yaw_threshold = float(envelope_values["yaw_bound"])
+        else:
+            slide_threshold = max(0.0, float(getattr(cfg, "slide_excess_threshold_mps", 0.0)))
+            yaw_threshold = 0.0
+            yaw_speed = float(yaw_speeds[selected_index]) if yaw_speeds.size else 0.0
         yaw_scale = max(1e-6, float(getattr(cfg, "yaw_excess_scale_radps", 1.0) or 1.0))
         selected_mask = np.zeros_like(slide_speeds, dtype=np.bool_)
         if slide_speeds.size:
             selected_mask[selected_index] = True
         side_metrics = []
         for i, (side_index, contact_name, foot_index, toe_index) in enumerate(sides):
+            if envelope_values is not None and i == selected_index:
+                side_slide_loss = max(0.0, slide_excess - slide_threshold)
+                side_yaw_loss = max(0.0, yaw_speed - yaw_threshold)
+                envelope_ok = slide_excess <= slide_threshold + 1e-6 and yaw_speed <= yaw_threshold + 1e-6
+            elif envelope_values is not None:
+                side_slide_loss = 0.0
+                side_yaw_loss = 0.0
+                envelope_ok = True
+            else:
+                side_slide_loss = max(0.0, float(slide_speeds[i]) - slide_threshold)
+                side_yaw_loss = max(0.0, float(yaw_speeds[i]) - yaw_threshold)
+                envelope_ok = True
             side_metrics.append(
                 {
                     "side_index": side_index,
@@ -4911,8 +5942,12 @@ class ModelViewerApp(tk.Tk):
                     "contact_speed": float(contact_speeds[i]),
                     "slide_speed": float(slide_speeds[i]),
                     "yaw_speed": float(yaw_speeds[i]),
-                    "slide_loss": max(0.0, float(slide_speeds[i]) - slide_threshold),
-                    "yaw_loss": max(0.0, float(yaw_speeds[i])) / yaw_scale,
+                    "slide_loss": side_slide_loss,
+                    "yaw_loss": side_yaw_loss,
+                    "slide_bound": slide_threshold,
+                    "yaw_bound": yaw_threshold,
+                    "envelope_available": envelope_available,
+                    "envelope_ok": envelope_ok,
                     "computed_contact": bool(selected_mask[i]),
                 }
             )
@@ -4922,8 +5957,33 @@ class ModelViewerApp(tk.Tk):
             "slide_excess": slide_excess,
             "slide_threshold": slide_threshold,
             "yaw_speed": yaw_speed,
+            "yaw_threshold": yaw_threshold,
             "yaw_scale": yaw_scale,
+            "envelope_available": envelope_available,
         }
+
+    def cached_training_foot_metrics(
+        self,
+        actor: Actor,
+        frame: int,
+        positions: np.ndarray,
+        rotations: np.ndarray,
+    ) -> dict[str, object] | None:
+        key = (
+            actor.actor_id,
+            int(frame),
+            id(positions),
+            id(rotations),
+            bool(self.foot_contact_from_source_var.get()),
+            bool(self.show_foot_height_var.get()),
+            bool(self.show_foot_contact_var.get()),
+        )
+        cache = self._frame_foot_metrics_cache
+        if key in cache:
+            return cache[key]
+        value = self.training_foot_metrics(actor, frame, positions, rotations)
+        cache[key] = value
+        return value
 
     def gl_draw_text_overlay(
         self,
@@ -5018,13 +6078,13 @@ class ModelViewerApp(tk.Tk):
         if chosen is None:
             return ""
         actor, positions, rotations = chosen
-        metrics = self.training_foot_metrics(actor, max(0, int(round(float(self.frame)))), positions, rotations)
+        metrics = self.cached_training_foot_metrics(actor, max(0, int(round(float(self.frame)))), positions, rotations)
         if metrics is None:
             return ""
         config = metrics["config"]
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         source_mode = bool(self.foot_contact_from_source_var.get())
-        lines = [f"{actor.name} contact {'source' if source_mode else 'least-slide'}"]
+        lines = [f"{actor.name} contact {'source' if source_mode else 'envelope'}"]
         loss_by_side: dict[str, tuple[float, float]] = {}
         for side_metric in metrics["sides"]:
             side_index = int(side_metric["side_index"])
@@ -5036,7 +6096,8 @@ class ModelViewerApp(tk.Tk):
             else:
                 contact = bool(side_metric["computed_contact"])
             side = "L" if contact_name.endswith("L") else "R"
-            mark = "on " if contact else "off"
+            envelope_ok = bool(side_metric.get("envelope_ok", True))
+            mark = "bad" if contact and not envelope_ok else ("on " if contact else "off")
             slide_loss = float(side_metric["slide_loss"]) if contact else 0.0
             yaw_loss = float(side_metric["yaw_loss"]) if contact else 0.0
             loss_by_side[side] = (slide_loss, yaw_loss)
@@ -5234,21 +6295,30 @@ class ModelViewerApp(tk.Tk):
         if list_id is None:
             self.init_gl_resources()
             list_id = self.gl_lists[list_name]
-        matrix = np.asarray(
-            [
-                [axis_x[0], axis_y[0], axis_z[0], origin[0]],
-                [axis_x[1], axis_y[1], axis_z[1], origin[1]],
-                [axis_x[2], axis_y[2], axis_z[2], origin[2]],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
+        matrix = self.gl_transform_matrix
+        matrix[0, 0] = axis_x[0]
+        matrix[0, 1] = axis_x[1]
+        matrix[0, 2] = axis_x[2]
+        matrix[0, 3] = 0.0
+        matrix[1, 0] = axis_y[0]
+        matrix[1, 1] = axis_y[1]
+        matrix[1, 2] = axis_y[2]
+        matrix[1, 3] = 0.0
+        matrix[2, 0] = axis_z[0]
+        matrix[2, 1] = axis_z[1]
+        matrix[2, 2] = axis_z[2]
+        matrix[2, 3] = 0.0
+        matrix[3, 0] = origin[0]
+        matrix[3, 1] = origin[1]
+        matrix[3, 2] = origin[2]
+        matrix[3, 3] = 1.0
         GL.glPushMatrix()
-        GL.glMultMatrixf(matrix.T)
+        GL.glMultMatrixf(matrix)
         GL.glCallList(list_id)
         GL.glPopMatrix()
 
     def render_gl(self) -> None:
+        self._frame_foot_metrics_cache.clear()
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
         GL.glViewport(0, 0, width, height)
@@ -5300,7 +6370,8 @@ class ModelViewerApp(tk.Tk):
             self.gl_draw_controller_trajectory()
         self.gl_draw_gizmo_overlay(width, height)
         self.gl_draw_contact_metrics_overlay(width, height, actor_poses)
-        self.gl_draw_ae_value_overlay(width, height, actor_poses)
+        if AE_VALUE_OVERLAY_ENABLED:
+            self.gl_draw_ae_value_overlay(width, height, actor_poses)
         self.gl_draw_camera_overlay(width, height)
         self.gl_draw_root_motion_overlay(width, height)
         GL.glFlush()
@@ -5312,21 +6383,266 @@ class ModelViewerApp(tk.Tk):
             int(color[5:7], 16) / 255.0,
         )
 
+    def floor_base_color(self) -> str:
+        return normalize_hex_color(self.floor_base_color_var.get(), FLOOR)
+
     def gl_color(self, color: str, alpha: float = 1.0) -> None:
         r, g, b = self.hex_to_rgb(color)
         GL.glColor4f(r, g, b, alpha)
 
+    def floor_grid_center(self) -> np.ndarray:
+        actors: list[Actor] = []
+        selected = self.selected_controller_actor() or self.selected_actor()
+        if selected is not None:
+            actors.append(selected)
+        seen_ids = {actor.actor_id for actor in actors}
+        actors.extend(actor for actor in self.actors if actor.actor_id not in seen_ids)
+        for actor in actors:
+            if not actor.visible or actor.clip is None:
+                continue
+            root = self.actor_follow_root_world(actor)
+            if root is not None:
+                return np.asarray([root[0], 0.0, root[2]], dtype=np.float32)
+        target = self.camera_target()
+        return np.asarray([target[0], 0.0, target[2]], dtype=np.float32)
+
+    def grid_alpha_at(self, x: float, z: float, center: np.ndarray, inner: float, outer: float, alpha: float) -> float:
+        dx = float(x) - float(center[0])
+        dz = float(z) - float(center[2])
+        dist = math.sqrt(dx * dx + dz * dz)
+        if dist >= outer:
+            return 0.0
+        if dist <= inner:
+            return alpha
+        t = (outer - dist) / max(1e-6, outer - inner)
+        t = t * t * (3.0 - 2.0 * t)
+        return alpha * t
+
+    def gl_draw_grid_layer(
+        self,
+        center: np.ndarray,
+        spacing: float,
+        radius: float,
+        color: str,
+        alpha: float,
+        line_width: float,
+        y: float,
+        skip_every: int | None = None,
+        only_every: int | None = None,
+    ) -> None:
+        spacing = max(1e-4, float(spacing))
+        radius = max(spacing, float(radius))
+        origin_x = round(float(center[0]) / spacing) * spacing
+        origin_z = round(float(center[2]) / spacing) * spacing
+        list_key = (
+            "grid",
+            round(spacing, 5),
+            round(radius, 3),
+            color.lower(),
+            round(float(alpha), 3),
+            round(float(line_width), 3),
+            round(float(y), 5),
+            int(skip_every or 0),
+            int(only_every or 0),
+        )
+        list_name = repr(list_key)
+        list_id = self.gl_lists.get(list_name)
+        if list_id is None:
+            list_id = self.create_grid_layer_list(
+                spacing,
+                radius,
+                color,
+                alpha,
+                line_width,
+                y,
+                skip_every=skip_every,
+                only_every=only_every,
+            )
+            self.gl_lists[list_name] = list_id
+        GL.glPushMatrix()
+        GL.glTranslatef(float(origin_x), 0.0, float(origin_z))
+        GL.glCallList(list_id)
+        GL.glPopMatrix()
+
+    def create_grid_layer_list(
+        self,
+        spacing: float,
+        radius: float,
+        color: str,
+        alpha: float,
+        line_width: float,
+        y: float,
+        skip_every: int | None = None,
+        only_every: int | None = None,
+    ) -> int:
+        inner = radius * 0.55
+        sample = max(0.24, spacing * 2.0)
+        r, g, b = self.hex_to_rgb(color)
+        center = np.zeros(3, dtype=np.float32)
+        x0 = math.floor(-radius / spacing) * spacing
+        x1 = math.ceil(radius / spacing) * spacing
+        z0 = math.floor(-radius / spacing) * spacing
+        z1 = math.ceil(radius / spacing) * spacing
+        list_id = int(GL.glGenLists(1))
+        GL.glNewList(list_id, GL.GL_COMPILE)
+        GL.glLineWidth(float(line_width))
+
+        def draw_strip(axis_value: float, along_start: float, along_end: float, horizontal: bool) -> None:
+            samples = max(2, int(math.ceil((along_end - along_start) / sample)) + 1)
+            GL.glBegin(GL.GL_LINE_STRIP)
+            for index in range(samples):
+                t = index / max(1, samples - 1)
+                along = along_start * (1.0 - t) + along_end * t
+                x = along if horizontal else axis_value
+                z = axis_value if horizontal else along
+                a = self.grid_alpha_at(x, z, center, inner, radius, alpha)
+                GL.glColor4f(r, g, b, a)
+                GL.glVertex3f(float(x), y, float(z))
+            GL.glEnd()
+
+        index = int(round(x0 / spacing))
+        value = x0
+        while value <= x1 + spacing * 0.5:
+            if (skip_every is None or index % skip_every != 0) and (only_every is None or index % only_every == 0):
+                draw_strip(value, z0, z1, horizontal=False)
+            value += spacing
+            index += 1
+
+        index = int(round(z0 / spacing))
+        value = z0
+        while value <= z1 + spacing * 0.5:
+            if (skip_every is None or index % skip_every != 0) and (only_every is None or index % only_every == 0):
+                draw_strip(value, x0, x1, horizontal=True)
+            value += spacing
+            index += 1
+
+        GL.glEndList()
+        return list_id
+
+    def floor_grid_texture_pixels(self, color: str) -> np.ndarray:
+        texture_size = 512
+        base = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
+        image = Image.new("RGBA", (texture_size, texture_size), (*base, 255))
+        overlay = Image.new("RGBA", (texture_size, texture_size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        def rgba(hex_color: str, alpha: int) -> tuple[int, int, int, int]:
+            return (
+                int(hex_color[1:3], 16),
+                int(hex_color[3:5], 16),
+                int(hex_color[5:7], 16),
+                int(max(0, min(255, alpha))),
+            )
+
+        sub_spacing = max(2, int(round(texture_size * FLOOR_SUBGRID_STEP)))
+        minor_spacing = max(sub_spacing, int(round(texture_size * FLOOR_GRID_STEP)))
+
+        def dotted_line(pos: int, horizontal: bool) -> None:
+            dash = 2
+            gap = 7
+            for start in range(0, texture_size, dash + gap):
+                end = min(texture_size - 1, start + dash)
+                if horizontal:
+                    draw.line((start, pos, end, pos), fill=rgba(FLOOR_GRID_SUBTLE, 36), width=1)
+                else:
+                    draw.line((pos, start, pos, end), fill=rgba(FLOOR_GRID_SUBTLE, 36), width=1)
+
+        for pos in range(0, texture_size, sub_spacing):
+            if pos % minor_spacing != 0:
+                dotted_line(pos, horizontal=True)
+                dotted_line(pos, horizontal=False)
+
+        for pos in range(0, texture_size, minor_spacing):
+            if pos not in (0, texture_size - 1):
+                draw.line((0, pos, texture_size - 1, pos), fill=rgba(FLOOR_GRID_MINOR, 70), width=1)
+                draw.line((pos, 0, pos, texture_size - 1), fill=rgba(FLOOR_GRID_MINOR, 70), width=1)
+
+        major = rgba(FLOOR_GRID_MAJOR, 128)
+        for pos in (0, texture_size - 1):
+            draw.line((0, pos, texture_size - 1, pos), fill=major, width=2)
+            draw.line((pos, 0, pos, texture_size - 1), fill=major, width=2)
+
+        image = Image.alpha_composite(image, overlay).convert("RGB")
+        return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+
+    def ensure_floor_texture(self) -> int:
+        color = self.floor_base_color()
+        if self.floor_texture_id and self.floor_texture_color == color:
+            return int(self.floor_texture_id)
+        if self.floor_texture_id:
+            try:
+                GL.glDeleteTextures([int(self.floor_texture_id)])
+            except Exception:
+                pass
+            self.floor_texture_id = 0
+        pixels = self.floor_grid_texture_pixels(color)
+        height, width = pixels.shape[:2]
+        texture_id = int(GL.glGenTextures(1))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
+        GL.glTexEnvi(GL.GL_TEXTURE_ENV, GL.GL_TEXTURE_ENV_MODE, GL.GL_MODULATE)
+        try:
+            GL.glTexImage2D(
+                GL.GL_TEXTURE_2D,
+                0,
+                GL.GL_RGB,
+                width,
+                height,
+                0,
+                GL.GL_RGB,
+                GL.GL_UNSIGNED_BYTE,
+                pixels,
+            )
+            GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        except Exception:
+            GLU.gluBuild2DMipmaps(
+                GL.GL_TEXTURE_2D,
+                GL.GL_RGB,
+                width,
+                height,
+                GL.GL_RGB,
+                GL.GL_UNSIGNED_BYTE,
+                pixels,
+            )
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        self.floor_texture_id = texture_id
+        self.floor_texture_color = color
+        return texture_id
+
     def gl_draw_floor(self) -> None:
+        GL.glPushAttrib(GL.GL_ENABLE_BIT | GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
         GL.glDisable(GL.GL_LIGHTING)
-        self.gl_color(FLOOR, 1.0)
-        size = max(18.0, self.extent * 5.0)
+        center = self.floor_grid_center()
+        size = 18.0
+        x0 = float(center[0]) - size
+        x1 = float(center[0]) + size
+        z0 = float(center[2]) - size
+        z1 = float(center[2]) + size
+        texture_id = self.ensure_floor_texture()
+        if texture_id:
+            GL.glEnable(GL.GL_TEXTURE_2D)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+            GL.glColor4f(1.0, 1.0, 1.0, 1.0)
+        else:
+            self.gl_color(self.floor_base_color(), 1.0)
+        tile_m = 1.0
         GL.glBegin(GL.GL_QUADS)
-        GL.glVertex3f(-size, 0.0, -size)
-        GL.glVertex3f(size, 0.0, -size)
-        GL.glVertex3f(size, 0.0, size)
-        GL.glVertex3f(-size, 0.0, size)
+        GL.glTexCoord2f(x0 / tile_m, z0 / tile_m)
+        GL.glVertex3f(x0, 0.0, z0)
+        GL.glTexCoord2f(x1 / tile_m, z0 / tile_m)
+        GL.glVertex3f(x1, 0.0, z0)
+        GL.glTexCoord2f(x1 / tile_m, z1 / tile_m)
+        GL.glVertex3f(x1, 0.0, z1)
+        GL.glTexCoord2f(x0 / tile_m, z1 / tile_m)
+        GL.glVertex3f(x0, 0.0, z1)
         GL.glEnd()
-        GL.glEnable(GL.GL_LIGHTING)
+        if texture_id:
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glPopAttrib()
 
     def gl_draw_penetration_line(self) -> None:
         target = self.camera_target()
@@ -5794,8 +7110,10 @@ class ModelViewerApp(tk.Tk):
         clip = actor.clip
         max_frame = max(0, clip.T - 1)
         frame_value = float(frame_value)
-        root_pos = clip.root_pos.detach().cpu().numpy().astype(np.float32)
-        root_yaw = clip.root_yaw.detach().cpu().numpy().astype(np.float32)
+        arrays = self.actor_root_numpy_arrays(actor)
+        if arrays is None:
+            return None
+        root_pos, root_yaw = arrays
         if frame_value <= max_frame or not self.extend_trajectory_var.get():
             frame_value = max(0.0, min(float(max_frame), frame_value))
             base = int(math.floor(frame_value))
@@ -6048,7 +7366,7 @@ class ModelViewerApp(tk.Tk):
         frame = max(0, min(actor.frame_count - 1, int(round(float(self.frame)))))
         draw_height = bool(self.show_foot_height_var.get())
         draw_contact = bool(self.show_foot_contact_var.get())
-        metrics = self.training_foot_metrics(actor, frame, positions, rotations)
+        metrics = self.cached_training_foot_metrics(actor, frame, positions, rotations)
         if metrics is None:
             return
         config = metrics["config"]
@@ -6073,7 +7391,12 @@ class ModelViewerApp(tk.Tk):
                     contact = self.actor_source_contact(actor, frame, side_index)
                 else:
                     contact = bool(side_metric["computed_contact"])
-                color = (0.28, 1.0, 0.46, 0.98) if contact else (1.0, 0.16, 0.18, 0.98)
+                if contact and bool(side_metric.get("envelope_ok", True)):
+                    color = (0.28, 1.0, 0.46, 0.98)
+                elif contact:
+                    color = (0.70, 0.28, 1.0, 0.98)
+                else:
+                    color = (1.0, 0.16, 0.18, 0.98)
                 if draw_contact:
                     GL.glLineWidth(3.0)
                     GL.glColor4f(*color)
@@ -6120,7 +7443,7 @@ class ModelViewerApp(tk.Tk):
             if cached is not None:
                 _cached_frame, _cached_generation, list_id = cached
                 GL.glDeleteLists(list_id, 1)
-            self.gl_draw_actor_shadows(actor, positions, rotations)
+            self.gl_draw_contact_shadows(actor, positions, rotations)
             return
         frame_key = self.actor_shadow_frame_key(actor)
         cached = self.shadow_lists.get(actor.actor_id)
@@ -6148,7 +7471,37 @@ class ModelViewerApp(tk.Tk):
         GL.glDisable(GL.GL_BLEND)
         GL.glDepthMask(GL.GL_FALSE)
         try:
-            self.gl_draw_volumes(actor, positions, rotations, blend_hex(FLOOR, "#000000", 0.42), 1.0, rounded_caps=False)
+            self.gl_draw_volumes(actor, positions, rotations, blend_hex(self.floor_base_color(), "#000000", 0.42), 1.0, rounded_caps=False)
+        finally:
+            GL.glDepthMask(GL.GL_TRUE)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glEnable(GL.GL_DEPTH_TEST)
+            GL.glEnable(GL.GL_LIGHTING)
+            GL.glPopMatrix()
+
+    def gl_draw_contact_shadows(self, actor: Actor, positions: np.ndarray, rotations: np.ndarray) -> None:
+        if actor.clip is None or not self.volumes_var.get():
+            return
+        name_to_index = {name: i for i, name in enumerate(actor.bone_names)}
+        feet = []
+        for ankle_name, toe_name in (("foot_l", "ball_l"), ("foot_r", "ball_r")):
+            ankle = name_to_index.get(ankle_name)
+            toe = name_to_index.get(toe_name)
+            if ankle is not None and toe is not None:
+                feet.append((ankle, toe))
+        if not feet:
+            return
+        GL.glPushMatrix()
+        GL.glMultMatrixf(self.planar_shadow_matrix(0.012).T)
+        GL.glDisable(GL.GL_LIGHTING)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glDepthMask(GL.GL_FALSE)
+        shadow_color = blend_hex(self.floor_base_color(), "#000000", 0.46)
+        try:
+            for ankle, toe in feet:
+                self.gl_draw_foot_boxes(positions, rotations, ankle, toe, shadow_color, 1.0)
         finally:
             GL.glDepthMask(GL.GL_TRUE)
             GL.glEnable(GL.GL_BLEND)
@@ -6182,7 +7535,7 @@ class ModelViewerApp(tk.Tk):
         ]
         projected = [self.project(c) for c in corners]
         coords = [value for p in projected for value in (p[0], p[1])]
-        self.scene_polygon(coords, FLOOR, None, width=1)
+        self.scene_polygon(coords, self.floor_base_color(), None, width=1)
 
     def draw_actor_shadow(self, actor: Actor, positions: np.ndarray) -> None:
         if actor.clip is None or not self.volumes_var.get():

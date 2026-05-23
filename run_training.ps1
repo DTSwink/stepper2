@@ -6,6 +6,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Runner = Join-Path $Root "training\run_delta_ae_scratch.ps1"
+$Python = Join-Path $Root ".tools\python310\python.exe"
+if (!(Test-Path $Python)) {
+    $Python = "python"
+}
+$Runner = Join-Path $Root "training\ik\train.py"
 
-& $Runner @Args
+& $Python $Runner @Args

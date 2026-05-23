@@ -40,7 +40,7 @@ def refresh_live_viewer(args: argparse.Namespace, checkpoint_path: Path) -> None
         return
     cmd = [
         sys.executable,
-        str(PROJECT_ROOT / "training" / "visualize_model.py"),
+        str(PROJECT_ROOT / "training" / "ik" / "visualize.py"),
         "--npz-path",
         str(tl.resolve_path(args.live_npz_path)),
         "--checkpoint-path",

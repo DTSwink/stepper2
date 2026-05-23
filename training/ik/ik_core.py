@@ -2224,7 +2224,10 @@ def update_model_comparison_html(clip_path: Path, ckpt_dir: Path, cfg: TrainConf
         return
 
     output = resolve_path(cfg.comparison_output_path)
-    script = PROJECT_ROOT / "training" / "visualize_model.py"
+    script = PROJECT_ROOT / "training" / "ik" / "visualize.py"
+    if not script.exists():
+        print(f"model comparison refresh skipped: missing {script}", flush=True)
+        return
     cmd = [
         sys.executable,
         str(script),
@@ -2362,6 +2365,10 @@ class LiveTrainingBridge:
             },
         )
         script = PROJECT_ROOT / "training" / "live_training_viewer.py"
+        if not script.exists():
+            print(f"live training viewer disabled: missing {script}", flush=True)
+            self.process = None
+            return
         cmd = [sys.executable, str(script), "--run-dir", str(self.run_dir)]
         if self.cfg.live_viewer_start_visualizing:
             cmd.append("--start-visualizing")
