@@ -37,22 +37,25 @@ NONPERIODIC_FOLDER = PROJECT_ROOT / "ue5" / "animations_transitions_only_full_tr
 DATASET_NPZ_TEXT: str | None = None
 DATASET_PERIODIC_TEXT: str | None = str(PERIODIC_FOLDER)
 DATASET_NONPERIODIC_TEXT: str | None = str(NONPERIODIC_FOLDER)
-SCHEDULE = (1, 2, 8, 16, 32)
+SCHEDULE = (1, 2, 8, 16, 32, 64)
 LOG_EVERY_STEPS = 100
 ENVELOPE_BATCH_SIZE = 1024
 CONTROLLER_LOSS_SCALE = 500.0
+AE_LOSS_WEIGHT = 0.19147315761749842
 BASE_GRAD_CLIP_NORM = 1.0
-MIN_STAGE_SECONDS = {1: 45.0, 2: 45.0, 8: 90.0, 16: 120.0, 32: 180.0}
-STALL_PATIENCE_LOGS = {1: 8, 2: 8, 8: 10, 16: 10, 32: 24}
+PERIODIC_CHECKPOINT_SECONDS = 30.0 * 60.0
+MIN_STAGE_SECONDS = {1: 45.0, 2: 45.0, 8: 90.0, 16: 120.0, 32: 180.0, 64: 240.0}
+STALL_PATIENCE_LOGS = {1: 8, 2: 8, 8: 10, 16: 10, 32: 24, 64: 32}
 FINAL_STALL_PATIENCE_LOGS = 96
-MAX_STAGE_SECONDS = {1: math.inf, 2: math.inf, 8: math.inf, 16: math.inf, 32: math.inf}
+MAX_STAGE_SECONDS = {1: math.inf, 2: math.inf, 8: math.inf, 16: math.inf, 32: math.inf, 64: math.inf}
 MIN_DELTA_FRACTION = 5e-4
-STALL_RECENT_LOGS = {1: 3, 2: 3, 8: 4, 16: 6, 32: 8}
-STALL_LOOKBACK_LOGS = {1: 6, 2: 6, 8: 8, 16: 12, 32: 24}
+STALL_RECENT_LOGS = {1: 3, 2: 3, 8: 4, 16: 6, 32: 8, 64: 10}
+STALL_LOOKBACK_LOGS = {1: 6, 2: 6, 8: 8, 16: 12, 32: 24, 64: 32}
 EVAL_BATCHES = 32
 OBJECTIVE_CYCLE_STEPS = 5
 SUPERVISED_STEPS_PER_CYCLE = 0
 SUPERVISED_K1_LOSS_WEIGHT = 9.548846199989088
+FINAL_STAGE_RUNS_UNTIL_MANUAL_STOP = True
 
 
 def scaled_loss(value: torch.Tensor) -> torch.Tensor:
@@ -277,6 +280,7 @@ def rollout_loss(
     linear_weight: float,
     angular_weight: float,
     random_init_pose: bool,
+    pose_noise_amount: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     max_k = max(1, int(rollout_k))
     batch_size = max(1, int(batch_size))
@@ -291,6 +295,9 @@ def rollout_loss(
         state_clip_ids, state_starts = ctl.sample_from_pool(init_pool, batch_size)
     prev_vec, prev_pelvis, prev_payload = ctl.target_state(store, state_clip_ids, state_starts - 1)
     cur_vec, cur_pelvis, cur_payload = ctl.target_state(store, state_clip_ids, state_starts)
+    if pose_noise_amount > 0.0:
+        cur_vec = ctl.add_pose_noise_to_vector(store, cur_vec, pose_noise_amount)
+        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(cur_vec, store)
     row_weight = (1.0 / effective_k.float()) / float(batch_size)
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
     ae_total = torch.zeros_like(total_loss)
@@ -311,6 +318,7 @@ def rollout_loss(
         raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = ctl.clean_output_vector(raw, store)
         ae_rows = ctl.ae_score_rows(ae, mean, std, inp, pred_vec)
+        ae_rows = ae_rows * float(AE_LOSS_WEIGHT)
         step_rows = ae_rows
         active_f = active.float()
         ae_total = ae_total + (ae_rows * row_weight * active_f).sum()
@@ -349,22 +357,36 @@ def rollout_loss(
         rows = continuing.nonzero(as_tuple=False).flatten()
         if rows.numel() == 0:
             break
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
-        if has_envelope_loss:
-            carried_cur_foot_pos = next_foot_pos.index_select(0, rows)
-            carried_cur_foot_rot = next_foot_rot.index_select(0, rows)
-            carried_cur_root_pos = next_root_pos.index_select(0, rows)
-            carried_cur_root_rot = next_root_rot.index_select(0, rows)
-        clip_ids = clip_ids.index_select(0, rows)
-        prev_vec = cur_vec.index_select(0, rows)
-        prev_pelvis = cur_pelvis.index_select(0, rows)
-        prev_payload = cur_payload.index_select(0, rows)
-        cur_vec = next_vec.index_select(0, rows)
-        cur_pelvis = next_pelvis.index_select(0, rows)
-        cur_payload = next_payload.index_select(0, rows)
-        cur_idx = cur_idx.index_select(0, rows) + 1
+        selected_clip_ids = clip_ids.index_select(0, rows)
+        selected_cur_idx = cur_idx.index_select(0, rows)
+        reset = ctl.training_reset_rows(
+            store,
+            selected_clip_ids,
+            selected_cur_idx,
+            torch.ones_like(selected_cur_idx, dtype=torch.bool),
+        )
+        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec.index_select(0, rows), store)
+        reset_starts = ctl.sample_same_clip_training_starts(store, selected_clip_ids)
+        reset_prev_vec, reset_prev_pelvis, reset_prev_payload = ctl.target_state(store, selected_clip_ids, reset_starts - 1)
+        reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.target_state(store, selected_clip_ids, reset_starts)
+        if pose_noise_amount > 0.0:
+            reset_cur_vec = ctl.add_pose_noise_to_vector(store, reset_cur_vec, pose_noise_amount)
+            reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.predicted_state_from_vector(reset_cur_vec, store)
+        reset_mask = reset[:, None]
+        clip_ids = selected_clip_ids
+        prev_vec = torch.where(reset_mask, reset_prev_vec, cur_vec.index_select(0, rows))
+        prev_pelvis = torch.where(reset_mask, reset_prev_pelvis, cur_pelvis.index_select(0, rows))
+        prev_payload = torch.where(reset_mask, reset_prev_payload, cur_payload.index_select(0, rows))
+        cur_vec = torch.where(reset_mask, reset_cur_vec, next_vec)
+        cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, next_pelvis)
+        cur_payload = torch.where(reset_mask, reset_cur_payload, next_payload)
+        cur_idx = torch.where(reset, reset_starts, selected_cur_idx + 1)
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
+        carried_cur_foot_pos = None
+        carried_cur_foot_rot = None
+        carried_cur_root_pos = None
+        carried_cur_root_rot = None
 
     return scaled_loss(total_loss), {
         "ae": ae_total,
@@ -420,6 +442,7 @@ class EnvelopeStepper:
         linear_weight: float,
         angular_weight: float,
         random_init_pose: bool,
+        pose_noise_amount: float = 0.0,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -434,6 +457,7 @@ class EnvelopeStepper:
         self.linear_weight = float(linear_weight)
         self.angular_weight = float(angular_weight)
         self.random_init_pose = bool(random_init_pose)
+        self.pose_noise_amount = float(pose_noise_amount)
         self.last_parts: dict[str, float] = {}
 
     def step(self) -> torch.Tensor:
@@ -450,6 +474,7 @@ class EnvelopeStepper:
             self.linear_weight,
             self.angular_weight,
             self.random_init_pose,
+            self.pose_noise_amount,
         )
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -474,12 +499,22 @@ def rollout_loss_static(
     linear_weight: float,
     angular_weight: float,
     root_cycle_count: int,
+    reset_starts_by_step: torch.Tensor | None = None,
+    start_cur_vec_override: torch.Tensor | None = None,
+    reset_cur_vec_by_step: torch.Tensor | None = None,
+    pose_noise_amount: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     max_k = max(1, int(rollout_k))
     cur_idx = starts
     prev_idx = cur_idx - 1
     prev_vec, prev_pelvis, prev_payload = ctl.target_state(store, clip_ids, prev_idx)
     cur_vec, cur_pelvis, cur_payload = ctl.target_state(store, clip_ids, cur_idx)
+    if start_cur_vec_override is not None:
+        cur_vec = start_cur_vec_override
+        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(cur_vec, store)
+    elif pose_noise_amount > 0.0:
+        cur_vec = ctl.add_pose_noise_to_vector(store, cur_vec, pose_noise_amount)
+        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(cur_vec, store)
     row_weight = (1.0 / effective_k.float()) / float(max(1, int(batch_size)))
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
     ae_total = torch.zeros_like(total_loss)
@@ -498,6 +533,7 @@ def rollout_loss_static(
         raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = ctl.clean_output_vector(raw, store)
         ae_rows = ctl.ae_score_rows(ae, mean, std, inp, pred_vec)
+        ae_rows = ae_rows * float(AE_LOSS_WEIGHT)
         next_root_pos, next_root_rot = root_state_fixed_cycles(store, clip_ids, cur_idx + 1, root_cycle_count)
         next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
         linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
@@ -525,21 +561,41 @@ def rollout_loss_static(
             break
 
         continuing = effective_k > (step + 1)
-        mask = continuing[:, None]
-        mask_3 = continuing[:, None, None]
-        mask_rot = continuing[:, None, None, None]
         next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
-        prev_vec = torch.where(mask, cur_vec, prev_vec)
-        prev_pelvis = torch.where(mask, cur_pelvis, prev_pelvis)
-        prev_payload = torch.where(mask, cur_payload, prev_payload)
-        cur_vec = torch.where(mask, next_vec, cur_vec)
-        cur_pelvis = torch.where(mask, next_pelvis, cur_pelvis)
-        cur_payload = torch.where(mask, next_payload, cur_payload)
-        cur_idx = torch.where(continuing, cur_idx + 1, cur_idx)
-        cur_root_pos = torch.where(mask, next_root_pos, cur_root_pos)
-        cur_root_rot = torch.where(mask_3, next_root_rot, cur_root_rot)
-        cur_foot_pos = torch.where(mask_3, next_foot_pos, cur_foot_pos)
-        cur_foot_rot = torch.where(mask_rot, next_foot_rot, cur_foot_rot)
+        reset = ctl.training_reset_rows(store, clip_ids, cur_idx, continuing)
+        advance = continuing & (~reset)
+        reset_starts = (
+            reset_starts_by_step[step]
+            if reset_starts_by_step is not None
+            else ctl.sample_same_clip_training_starts(store, clip_ids)
+        )
+        reset_prev_vec, reset_prev_pelvis, reset_prev_payload = ctl.target_state(store, clip_ids, reset_starts - 1)
+        reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.target_state(store, clip_ids, reset_starts)
+        if reset_cur_vec_by_step is not None:
+            reset_cur_vec = reset_cur_vec_by_step[step]
+            reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.predicted_state_from_vector(reset_cur_vec, store)
+        elif pose_noise_amount > 0.0:
+            reset_cur_vec = ctl.add_pose_noise_to_vector(store, reset_cur_vec, pose_noise_amount)
+            reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.predicted_state_from_vector(reset_cur_vec, store)
+        reset_root_pos, reset_root_rot = root_state_fixed_cycles(store, clip_ids, reset_starts, root_cycle_count)
+        reset_foot_pos, reset_foot_rot = env.ik_foot_toe_state_from_vec(store, reset_root_pos, reset_root_rot, reset_cur_vec)
+        reset_mask = reset[:, None]
+        advance_mask = advance[:, None]
+        reset_mask_3 = reset[:, None, None]
+        advance_mask_3 = advance[:, None, None]
+        reset_mask_rot = reset[:, None, None, None]
+        advance_mask_rot = advance[:, None, None, None]
+        prev_vec = torch.where(reset_mask, reset_prev_vec, torch.where(advance_mask, cur_vec, prev_vec))
+        prev_pelvis = torch.where(reset_mask, reset_prev_pelvis, torch.where(advance_mask, cur_pelvis, prev_pelvis))
+        prev_payload = torch.where(reset_mask, reset_prev_payload, torch.where(advance_mask, cur_payload, prev_payload))
+        cur_vec = torch.where(reset_mask, reset_cur_vec, torch.where(advance_mask, next_vec, cur_vec))
+        cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, torch.where(advance_mask, next_pelvis, cur_pelvis))
+        cur_payload = torch.where(reset_mask, reset_cur_payload, torch.where(advance_mask, next_payload, cur_payload))
+        cur_idx = torch.where(reset, reset_starts, torch.where(continuing, cur_idx + 1, cur_idx))
+        cur_root_pos = torch.where(reset_mask, reset_root_pos, torch.where(advance_mask, next_root_pos, cur_root_pos))
+        cur_root_rot = torch.where(reset_mask_3, reset_root_rot, torch.where(advance_mask_3, next_root_rot, cur_root_rot))
+        cur_foot_pos = torch.where(reset_mask_3, reset_foot_pos, torch.where(advance_mask_3, next_foot_pos, cur_foot_pos))
+        cur_foot_rot = torch.where(reset_mask_rot, reset_foot_rot, torch.where(advance_mask_rot, next_foot_rot, cur_foot_rot))
     return scaled_loss(total_loss), ae_total, linear_total, angular_total, active_total.clamp_min(1e-8)
 
 
@@ -560,6 +616,7 @@ class CudaGraphEnvelopeStep:
         envelope: dict[str, object],
         linear_weight: float,
         angular_weight: float,
+        pose_noise_amount: float = 0.0,
     ):
         if store.device.type != "cuda":
             raise RuntimeError("CudaGraphEnvelopeStep requires CUDA")
@@ -575,10 +632,19 @@ class CudaGraphEnvelopeStep:
         self.envelope = envelope
         self.linear_weight = float(linear_weight)
         self.angular_weight = float(angular_weight)
+        self.pose_noise_amount = float(pose_noise_amount)
         self.root_cycle_count = graph_root_cycle_count(store, rollout_k)
+        self.vec_dim = 3 + 6 + store.Jcore * 6 + store.ik_payload_dim
         self.effective_k = torch.empty((self.batch_size,), dtype=torch.long, device=store.device)
         self.clip_ids = torch.empty_like(self.effective_k)
         self.starts = torch.empty_like(self.effective_k)
+        self.reset_starts_by_step = torch.empty(
+            (max(1, int(self.rollout_k)), self.batch_size), dtype=torch.long, device=store.device
+        )
+        self.start_cur_vec = torch.empty((self.batch_size, self.vec_dim), dtype=torch.float32, device=store.device)
+        self.reset_cur_vec_by_step = torch.empty(
+            (max(1, int(self.rollout_k)), self.batch_size, self.vec_dim), dtype=torch.float32, device=store.device
+        )
         self.loss = torch.zeros((), dtype=torch.float32, device=store.device)
         self.ae_part = torch.zeros_like(self.loss)
         self.linear_part = torch.zeros_like(self.loss)
@@ -594,6 +660,17 @@ class CudaGraphEnvelopeStep:
         self.effective_k.copy_(effective_k)
         self.clip_ids.copy_(clip_ids)
         self.starts.copy_(starts)
+        self.reset_starts_by_step.copy_(
+            ctl.sample_same_clip_training_starts_by_step(self.store, clip_ids, self.reset_starts_by_step.shape[0])
+        )
+        if self.pose_noise_amount > 0.0:
+            cur_vec = self.store.get_target_output(clip_ids, starts)
+            self.start_cur_vec.copy_(ctl.add_pose_noise_to_vector(self.store, cur_vec, self.pose_noise_amount))
+            flat_clip_ids = clip_ids.unsqueeze(0).expand(self.reset_starts_by_step.shape[0], -1).reshape(-1)
+            flat_starts = self.reset_starts_by_step.reshape(-1)
+            reset_cur_vec = self.store.get_target_output(flat_clip_ids, flat_starts)
+            reset_cur_vec = ctl.add_pose_noise_to_vector(self.store, reset_cur_vec, self.pose_noise_amount)
+            self.reset_cur_vec_by_step.copy_(reset_cur_vec.reshape_as(self.reset_cur_vec_by_step))
 
     def _loss_parts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return rollout_loss_static(
@@ -611,6 +688,10 @@ class CudaGraphEnvelopeStep:
             self.linear_weight,
             self.angular_weight,
             self.root_cycle_count,
+            self.reset_starts_by_step,
+            self.start_cur_vec if self.pose_noise_amount > 0.0 else None,
+            self.reset_cur_vec_by_step if self.pose_noise_amount > 0.0 else None,
+            self.pose_noise_amount,
         )
 
     def _capture(self) -> None:
@@ -658,7 +739,7 @@ def estimate_loss_means(
 ) -> dict[str, float]:
     rollout_k = int(ctl.ROLLOUT_K)
     values = ctl.rollout_values_for(rollout_k)
-    start_pools = ctl.build_start_pools(store, values)
+    start_pools = ctl.build_training_start_pools(store, values)
     batch_size = min(int(ctl.BATCH_SIZE), ENVELOPE_BATCH_SIZE, int(start_pools[rollout_k].row_count))
     sums = {"ae": 0.0, "linear": 0.0, "angular": 0.0}
     model_was_training = model.training
@@ -714,14 +795,19 @@ def make_stage_stepper(
     linear_weight: float,
     angular_weight: float,
     random_init_pose: bool,
+    pose_noise_amount: float = 0.0,
+    disable_cuda_graph: bool = False,
 ) -> object:
-    if envelope is None and linear_weight == 0.0 and angular_weight == 0.0 and not random_init_pose:
+    if envelope is None and linear_weight == 0.0 and angular_weight == 0.0 and not random_init_pose and pose_noise_amount <= 0.0:
+        if disable_cuda_graph:
+            return ctl.EagerPureAEStep(model, optimizer, ae, mean, std, store, stage_k, batch_size, start_pools)
         return ctl.make_pure_ae_stepper(model, optimizer, ae, mean, std, store, stage_k, batch_size, start_pools)
     if (
         envelope is not None
         and (linear_weight > 0.0 or angular_weight > 0.0)
         and not random_init_pose
         and store.device.type == "cuda"
+        and not disable_cuda_graph
     ):
         return CudaGraphEnvelopeStep(
             model,
@@ -736,6 +822,7 @@ def make_stage_stepper(
             envelope,
             linear_weight,
             angular_weight,
+            pose_noise_amount,
         )
     return EnvelopeStepper(
         model,
@@ -751,6 +838,7 @@ def make_stage_stepper(
         linear_weight,
         angular_weight,
         random_init_pose,
+        pose_noise_amount,
     )
 
 
@@ -817,7 +905,10 @@ class MixedObjectiveStepper:
         loss = self.primary_stepper.step()  # type: ignore[attr-defined]
         self.last_parts = dict(getattr(self.primary_stepper, "last_parts", {}))
         if not self.last_parts:
-            self.last_parts = {"ae": loss.detach() / float(CONTROLLER_LOSS_SCALE)}
+            kind = str(getattr(self.primary_stepper, "kind", ""))
+            pure_ae_raw_loss = kind in {"cuda_graph_static_masked", "eager"}
+            ae_part = loss.detach() if pure_ae_raw_loss else loss.detach() / float(CONTROLLER_LOSS_SCALE)
+            self.last_parts = {"ae": ae_part}
         return loss
 
 
@@ -853,6 +944,8 @@ def train_controller_adaptive(
     start_at_k32: bool = False,
     supervised_steps_per_cycle: int = SUPERVISED_STEPS_PER_CYCLE,
     objective_cycle_steps: int = OBJECTIVE_CYCLE_STEPS,
+    pose_noise_amount: float = 0.0,
+    disable_cuda_graph: bool = False,
 ) -> Path:
     controller_state = clean_controller_run_state(label)
     if controller_state is not None:
@@ -865,7 +958,12 @@ def train_controller_adaptive(
     cfg, store = load_store_from_ae(ae_ckpt, device)
     input_dim, output_dim = tl.make_batch_dims(store.prototype, cfg)
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
-    optimizer = ctl.make_adamw(model.parameters(), ctl.LEARNING_RATE, device, capturable=bool(device.type == "cuda" and not random_init_pose))
+    optimizer = ctl.make_adamw(
+        model.parameters(),
+        ctl.LEARNING_RATE,
+        device,
+        capturable=bool(device.type == "cuda" and not random_init_pose and not disable_cuda_graph),
+    )
     base_step = 0
     loaded_k = 0
     prior_metadata: dict = {}
@@ -888,14 +986,30 @@ def train_controller_adaptive(
         "policy": {
             "loss": "simple_ae_output_reconstruction_with_optional_envelope",
             "controller_loss_scale": float(CONTROLLER_LOSS_SCALE),
+            "ae_loss_weight": float(AE_LOSS_WEIGHT),
             "linear_excess_loss_weight": float(linear_weight),
             "angular_excess_loss_weight": float(angular_weight),
             "supervised_steps_per_cycle": int(supervised_steps_per_cycle),
             "objective_cycle_steps": int(objective_cycle_steps),
             "supervised_rollout_k": 1,
             "supervised_k1_loss_weight": float(SUPERVISED_K1_LOSS_WEIGHT),
+            "pose_noise_amount": float(pose_noise_amount),
+            "pose_noise_recipe": {
+                "pos_sigma_m_at_1": float(ctl.POSE_NOISE_POS_SIGMA_M_AT_1),
+                "rot_sigma_deg_at_1": float(ctl.POSE_NOISE_ROT_SIGMA_DEG_AT_1),
+                "pole_toe_sigma_at_1": float(ctl.POSE_NOISE_SCALAR_SIGMA_AT_1),
+            },
             "pose_representation": tl.IK_POSE_REPRESENTATION,
             "adaptive_stall_curriculum": True,
+            "final_stage_runs_until_manual_stop": bool(FINAL_STAGE_RUNS_UNTIL_MANUAL_STOP),
+            "disable_cuda_graph": bool(disable_cuda_graph),
+        },
+        "training_constants": {
+            "schedule": [int(k) for k in SCHEDULE],
+            "max_mixed_rollout_k": int(ctl.ROLLOUT_K),
+            "stage_learning_rates": {str(int(k)): float(ctl.stage_learning_rate(int(k))) for k in SCHEDULE},
+            "dynamic_start_rule": "training rows need one-step starts; noncyclic rows reset randomly inside the same clip when they reach the usable end",
+            "periodic_checkpoint_seconds": float(PERIODIC_CHECKPOINT_SECONDS),
         },
         "prior_metadata": prior_metadata,
     }
@@ -912,16 +1026,17 @@ def train_controller_adaptive(
     init_tag = "init_from_checkpoint" if init_checkpoint is not None else "init"
     ctl.save_controller_checkpoint(run_dir, run_id, init_tag, model, optimizer, step, best_global, 0, cfg, metadata)
     if start_at_k32:
-        schedule = (32,)
+        schedule = (int(SCHEDULE[-1]),)
     else:
         min_stage = max(1, int(loaded_k or 1))
         schedule = tuple(k for k in SCHEDULE if int(k) >= min_stage) or (int(SCHEDULE[-1]),)
     last_loss = math.inf
     final_path: Path | None = None
+    last_periodic_checkpoint_time = time.perf_counter()
     for stage_i, stage_k in enumerate(schedule):
         ctl.set_optimizer_lr(optimizer, ctl.stage_learning_rate(int(stage_k)))
         rollout_values = ctl.rollout_values_for(int(stage_k)) if ctl.mixed_rollout_enabled(int(stage_k)) else (int(stage_k),)
-        start_pools = ctl.build_start_pools(store, rollout_values)
+        start_pools = ctl.build_training_start_pools(store, rollout_values)
         max_pool = start_pools[int(stage_k)]
         batch_size = min(int(ctl.BATCH_SIZE), int(max_pool.row_count))
         if envelope is not None and (linear_weight > 0.0 or angular_weight > 0.0):
@@ -940,6 +1055,8 @@ def train_controller_adaptive(
             linear_weight,
             angular_weight,
             random_init_pose,
+            pose_noise_amount,
+            disable_cuda_graph,
         )
         if int(supervised_steps_per_cycle) > 0:
             supervised_pool = ctl.build_start_pool(store, 1)
@@ -970,6 +1087,10 @@ def train_controller_adaptive(
                 last_loss = float(loss.detach().cpu())
                 chunk_loss += last_loss
                 parts = dict(getattr(stepper, "last_parts")) if hasattr(stepper, "last_parts") else {}
+                if not parts:
+                    pure_ae_stepper = str(getattr(stepper, "kind", "")) in {"cuda_graph_static_masked", "eager"}
+                    ae_part = last_loss * float(AE_LOSS_WEIGHT) if pure_ae_stepper else last_loss / float(CONTROLLER_LOSS_SCALE)
+                    parts = {"ae": ae_part}
                 for name in chunk_parts:
                     if name in parts:
                         chunk_parts[name] += tensor_to_float(parts[name])
@@ -991,6 +1112,22 @@ def train_controller_adaptive(
             best_global = min(best_global, chunk_loss_mean)
             writer.flush()
             final_path = ctl.save_controller_checkpoint(run_dir, run_id, "latest", model, optimizer, step, chunk_loss_mean, int(stage_k), cfg, metadata)
+            now = time.perf_counter()
+            if now - last_periodic_checkpoint_time >= float(PERIODIC_CHECKPOINT_SECONDS):
+                periodic_path = ctl.save_controller_checkpoint(
+                    run_dir,
+                    run_id,
+                    f"periodic_step{int(step)}",
+                    model,
+                    optimizer,
+                    step,
+                    chunk_loss_mean,
+                    int(stage_k),
+                    cfg,
+                    metadata,
+                )
+                last_periodic_checkpoint_time = now
+                print(f"saved periodic checkpoint {periodic_path}", flush=True)
             elapsed_stage = time.perf_counter() - stage_start
             print(
                 f"{label}: step={step} K={stage_k} loss={chunk_loss_mean:.6g} best_stage={best_stage:.6g} "
@@ -1004,10 +1141,16 @@ def train_controller_adaptive(
             min_time = MIN_STAGE_SECONDS[int(stage_k)]
             max_time = MAX_STAGE_SECONDS[int(stage_k)]
             if elapsed_stage >= min_time and stalls >= patience:
-                break
+                if is_final and FINAL_STAGE_RUNS_UNTIL_MANUAL_STOP:
+                    stalls = 0
+                else:
+                    break
             if elapsed_stage >= max_time:
-                print(f"{label}: max stage time reached for K={stage_k}", flush=True)
-                break
+                if is_final and FINAL_STAGE_RUNS_UNTIL_MANUAL_STOP:
+                    print(f"{label}: max stage time ignored for final manual-stop K={stage_k}", flush=True)
+                else:
+                    print(f"{label}: max stage time reached for K={stage_k}", flush=True)
+                    break
         final_path = ctl.save_controller_checkpoint(run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, best_stage, int(stage_k), cfg, metadata)
         final_path = ctl.save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, step, best_stage, int(stage_k), cfg, metadata)
         del stepper
@@ -1065,6 +1208,8 @@ def main() -> None:
     parser.add_argument("--nonperiodic-folder", default="", help="Optional nonperiodic .npz folder/path list.")
     parser.add_argument("--supervised-steps-per-cycle", type=int, default=SUPERVISED_STEPS_PER_CYCLE)
     parser.add_argument("--objective-cycle-steps", type=int, default=OBJECTIVE_CYCLE_STEPS)
+    parser.add_argument("--pose-noise", type=float, default=0.0, help="Noise amount applied to rollout seed/reset poses.")
+    parser.add_argument("--disable-cuda-graph", action="store_true", help="Use stable eager training instead of CUDA graph capture.")
     args = parser.parse_args()
     configure_dataset(args.npz, args.periodic_folder, args.nonperiodic_folder)
 
@@ -1090,6 +1235,8 @@ def main() -> None:
             device,
             supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
             objective_cycle_steps=int(args.objective_cycle_steps),
+            pose_noise_amount=float(args.pose_noise),
+            disable_cuda_graph=bool(args.disable_cuda_graph),
         )
     if args.phase in ("all", "refine"):
         if baseline_path is None:
@@ -1110,6 +1257,8 @@ def main() -> None:
             start_at_k32=True,
             supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
             objective_cycle_steps=int(args.objective_cycle_steps),
+            pose_noise_amount=float(args.pose_noise),
+            disable_cuda_graph=bool(args.disable_cuda_graph),
         )
     if args.phase in ("all", "final"):
         if refined_path is None:
@@ -1134,6 +1283,8 @@ def main() -> None:
             start_at_k32=True,
             supervised_steps_per_cycle=int(args.supervised_steps_per_cycle),
             objective_cycle_steps=int(args.objective_cycle_steps),
+            pose_noise_amount=float(args.pose_noise),
+            disable_cuda_graph=bool(args.disable_cuda_graph),
         )
 
 

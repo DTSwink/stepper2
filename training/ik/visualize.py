@@ -18,8 +18,10 @@ import torch
 
 try:
     from . import ik_core as tl
+    from . import train_simple_ae_controller as simple_ctl
 except ImportError:
     import ik_core as tl
+    import train_simple_ae_controller as simple_ctl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -708,6 +710,33 @@ def infer_npz_path(ckpt: dict, checkpoint: Path) -> Path:
     )
 
 
+def infer_npz_cyclic_flag(ckpt: dict, npz: Path) -> bool | None:
+    metadata = ckpt.get("metadata", {})
+    npz_resolved = npz.resolve()
+    for item in metadata.get("npz_folders", []):
+        if not isinstance(item, dict):
+            continue
+        folder_text = item.get("path")
+        if not folder_text:
+            continue
+        try:
+            folder = resolve_path(str(folder_text))
+        except Exception:
+            continue
+        if npz_resolved.parent == folder:
+            return bool(item.get("cyclic", False))
+    for path_text in metadata.get("npz_paths", []):
+        try:
+            if resolve_path(str(path_text)) == npz_resolved:
+                # The simple controller records one-off --npz paths as cyclic.
+                policy = metadata.get("policy", {})
+                if isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction":
+                    return True
+        except Exception:
+            continue
+    return None
+
+
 def apply_config_dict(cfg: tl.TrainConfig, values: dict) -> None:
     valid = {field.name for field in fields(tl.TrainConfig)}
     for key, value in values.items():
@@ -725,6 +754,102 @@ def load_model(checkpoint: dict, clip: tl.MotionClip, cfg: tl.TrainConfig, devic
     model.load_state_dict(checkpoint["model"])
     model.eval()
     return model
+
+
+def is_simple_controller_checkpoint(checkpoint: dict) -> bool:
+    metadata = checkpoint.get("metadata", {})
+    policy = metadata.get("policy", {})
+    return isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction"
+
+
+@torch.no_grad()
+def rollout_simple_controller_model(
+    model: torch.nn.Module,
+    clip: tl.MotionClip,
+    cfg: tl.TrainConfig,
+    device: torch.device,
+    max_frames: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    frame_count = clip.T if max_frames is None else min(clip.T, max(3, max_frames))
+    frame_idx = torch.arange(frame_count, dtype=torch.long, device=device)
+    gt_pos_t, gt_rot_t = tl.global_from_clip(clip, frame_idx, cfg, device)
+    pred_ar_pos_t = torch.empty_like(gt_pos_t)
+    pred_one_step_pos_t = torch.empty_like(gt_pos_t)
+    pred_ar_rot_t = torch.empty_like(gt_rot_t)
+    pred_one_step_rot_t = torch.empty_like(gt_rot_t)
+    pred_ar_pos_t[:2] = gt_pos_t[:2]
+    pred_one_step_pos_t[:2] = gt_pos_t[:2]
+    pred_ar_rot_t[:2] = gt_rot_t[:2]
+    pred_one_step_rot_t[:2] = gt_rot_t[:2]
+
+    store = simple_ctl.SimpleClipStore([clip], cfg, device)
+    clip_ids = torch.zeros(1, dtype=torch.long, device=device)
+
+    cur_idx = torch.tensor([1], dtype=torch.long, device=device)
+    prev_vec, prev_pelvis, prev_payload = simple_ctl.target_state(store, clip_ids, cur_idx - 1)
+    cur_vec, cur_pelvis, cur_payload = simple_ctl.target_state(store, clip_ids, cur_idx)
+
+    for target in range(2, frame_count):
+        target_idx = torch.tensor([target], dtype=torch.long, device=device)
+        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
+
+        one_cur_idx = torch.tensor([target - 1], dtype=torch.long, device=device)
+        one_prev_vec, one_prev_pelvis, one_prev_payload = simple_ctl.target_state(store, clip_ids, one_cur_idx - 1)
+        one_cur_vec, one_cur_pelvis, one_cur_payload = simple_ctl.target_state(store, clip_ids, one_cur_idx)
+        one_inp = simple_ctl.build_controller_input(
+            store,
+            clip_ids,
+            one_cur_idx,
+            one_prev_vec,
+            one_cur_vec,
+            one_prev_pelvis,
+            one_cur_pelvis,
+            one_prev_payload,
+            one_cur_payload,
+        )
+        one_raw = simple_ctl.model_forward(model, one_inp, one_cur_vec, cfg)
+        one_vec = simple_ctl.clean_output_vector(one_raw, store)
+        one_pose, _ = tl.output_to_pose(one_vec, clip)
+        one_global_pos, one_global_rot, _ = tl.fk_from_pose(clip, root_pos, root_rot, one_pose, device)
+        pred_one_step_pos_t[target] = one_global_pos[0]
+        pred_one_step_rot_t[target] = one_global_rot[0]
+
+        inp = simple_ctl.build_controller_input(
+            store,
+            clip_ids,
+            cur_idx,
+            prev_vec,
+            cur_vec,
+            prev_pelvis,
+            cur_pelvis,
+            prev_payload,
+            cur_payload,
+        )
+        raw = simple_ctl.model_forward(model, inp, cur_vec, cfg)
+        pred_vec = simple_ctl.clean_output_vector(raw, store)
+        pred_pose, _ = tl.output_to_pose(pred_vec, clip)
+        global_pos, global_rot, _ = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
+        pred_ar_pos_t[target] = global_pos[0]
+        pred_ar_rot_t[target] = global_rot[0]
+
+        prev_vec = cur_vec
+        prev_pelvis = cur_pelvis
+        prev_payload = cur_payload
+        cur_vec, cur_pelvis, cur_payload = simple_ctl.predicted_state_from_vector(pred_vec, store)
+        cur_idx = target_idx
+
+    error_ar = (pred_ar_pos_t - gt_pos_t).norm(dim=-1).mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+    error_one_step = (pred_one_step_pos_t - gt_pos_t).norm(dim=-1).mean(dim=-1).detach().cpu().numpy().astype(np.float32)
+    return (
+        gt_pos_t.detach().cpu().numpy().astype(np.float32),
+        gt_rot_t.detach().cpu().numpy().astype(np.float32),
+        pred_one_step_pos_t.detach().cpu().numpy().astype(np.float32),
+        pred_one_step_rot_t.detach().cpu().numpy().astype(np.float32),
+        error_one_step,
+        pred_ar_pos_t.detach().cpu().numpy().astype(np.float32),
+        pred_ar_rot_t.detach().cpu().numpy().astype(np.float32),
+        error_ar,
+    )
 
 
 @torch.no_grad()
@@ -870,11 +995,16 @@ def main() -> None:
     cfg.device = str(device)
     cfg.use_torch_compile = False
 
-    clip = tl.MotionClip(npz, cfg)
+    clip = tl.MotionClip(npz, cfg, cyclic_animation=infer_npz_cyclic_flag(ckpt, npz))
     model = load_model(ckpt, clip, cfg, device)
-    gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = rollout_model(
-        model, clip, cfg, device, args.max_frames
-    )
+    if is_simple_controller_checkpoint(ckpt):
+        gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = (
+            rollout_simple_controller_model(model, clip, cfg, device, args.max_frames)
+        )
+    else:
+        gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = rollout_model(
+            model, clip, cfg, device, args.max_frames
+        )
     payload = make_payload(
         clip,
         gt_pos,

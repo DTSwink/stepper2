@@ -776,7 +776,7 @@ class ClipStore:
                 cursor += 3
                 end_rot_root = tl.rotation_6d_to_matrix(payload[:, cursor : cursor + 6])
                 cursor += 6
-                pole_float = payload[:, cursor]
+                pole_float = payload[:, cursor].clamp(-1.0, 1.0)
                 cursor += 1
 
                 base = global_pos_list[start]
@@ -829,7 +829,7 @@ class ClipStore:
                 toe = spec.get("toe")
                 if toe is not None:
                     toe_i = int(toe)
-                    toe_float = payload[:, cursor]
+                    toe_float = payload[:, cursor].clamp(-1.0, 1.0)
                     cursor += 1
                     toe_offset = offsets[:, toe_i]
                     toe_pos_root = end_root + torch.matmul(toe_offset.unsqueeze(1), end_rot_root).squeeze(1)

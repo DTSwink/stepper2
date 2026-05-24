@@ -62,9 +62,20 @@ def mirror_outputs(labels: list[str]) -> None:
         run_dirs.extend(run_dirs_for_label(label))
     if not run_dirs:
         run_dirs = [path for path in RUNS_DIR.glob("*_ik_*") if path.is_dir()]
+    mirror_patterns = [
+        "checkpoints/*.pt",
+        "config*.json",
+        "run_status.json",
+        "REPORT.md",
+        "ae_research_results.csv",
+        "ae_research_results.json",
+    ]
     for run_dir in run_dirs:
         rel_root = mirror_root / run_dir.name
-        for src in list((run_dir / "checkpoints").glob("*.pt")) + list(run_dir.glob("config*.json")) + list(run_dir.glob("run_status.json")):
+        sources: list[Path] = []
+        for pattern in mirror_patterns:
+            sources.extend(run_dir.glob(pattern))
+        for src in sources:
             if not src.exists() or not src.is_file():
                 continue
             dst = rel_root / src.relative_to(run_dir)
@@ -150,7 +161,43 @@ def ae_envelope_cmd() -> tuple[list[str], list[str]]:
         value = env_text(env_name)
         if value:
             cmd.extend([arg_name, value])
+    pose_noise = env_text("STEPPER_POSE_NOISE")
+    if pose_noise:
+        cmd.extend(["--pose-noise", pose_noise])
+    if env_flag("STEPPER_DISABLE_CUDA_GRAPH", False):
+        cmd.append("--disable-cuda-graph")
     return cmd, [ae_label, baseline_label, refined_label, final_label]
+
+
+def ae_research_cmd() -> tuple[list[str], list[str]]:
+    label = env_text("STEPPER_RUN_LABEL", "kaggle_ae_research")
+    cmd = [
+        sys.executable,
+        "training/ik/kaggle_ae_research.py",
+        "--run-label",
+        label,
+        "--train-steps",
+        env_text("STEPPER_TRAIN_STEPS", "4000"),
+        "--controller-steps",
+        env_text("STEPPER_AE_RESEARCH_CONTROLLER_STEPS", "3000"),
+    ]
+    for env_name, arg_name in (
+        ("STEPPER_AE_RESEARCH_PERIODIC_NAMES", "--periodic-names"),
+        ("STEPPER_AE_RESEARCH_NONPERIODIC_NAMES", "--nonperiodic-names"),
+        ("STEPPER_AE_RESEARCH_MAX_VARIANTS", "--max-variants"),
+        ("STEPPER_AE_RESEARCH_VARIANT_NAMES", "--variant-names"),
+        ("STEPPER_AE_RESEARCH_EVAL_ROWS", "--eval-rows"),
+        ("STEPPER_AE_RESEARCH_CONTROLLER_PERIODIC_NAMES", "--controller-periodic-names"),
+        ("STEPPER_AE_RESEARCH_CONTROLLER_NONPERIODIC_NAMES", "--controller-nonperiodic-names"),
+        ("STEPPER_AE_RESEARCH_CONTROLLER_POSE_NOISE", "--controller-pose-noise"),
+        ("STEPPER_AE_RESEARCH_WINDOW_FRAMES", "--window-frames"),
+    ):
+        value = env_text(env_name)
+        if value:
+            cmd.extend([arg_name, value])
+    if env_flag("STEPPER_AE_RESEARCH_SKIP_ONE_FRAME_BASELINE", False):
+        cmd.append("--skip-one-frame-baseline")
+    return cmd, [label]
 
 
 def command_for_mode() -> tuple[list[str], list[str]]:
@@ -161,6 +208,8 @@ def command_for_mode() -> tuple[list[str], list[str]]:
         return simple_ae_cmd()
     if mode in {"ae_envelope", "envelope", "full_ae_envelope"}:
         return ae_envelope_cmd()
+    if mode in {"ae_research", "research", "auto_ae_research"}:
+        return ae_research_cmd()
     raise ValueError(f"Unknown STEPPER_IK_MODE={mode!r}")
 
 

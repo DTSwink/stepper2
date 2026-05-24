@@ -1,237 +1,216 @@
 # IK Handoff Journal
 
-Last compacted: 2026-05-23.
+Last compacted: 2026-05-24.
 
-The old full running log was copied to `training/ik/JOURNAL_OLD_20260523.md`.
-Read this file first after a context refresh. It is meant to be the short,
-current truth: what we tried, what survived, how the system works now, and the
-rules that should not be broken again.
+The older running log is archived as `training/ik/JOURNAL_OLD_20260523.md`.
+Read this file first after a context refresh. It is the current truth: what the
+IK system is, which rules are mandatory, and which recent traps must not be
+reintroduced.
 
-## Current Goal
+## Current State
 
-- Build and train a contained IK locomotion controller.
-- The controller must imitate the dataset accurately under supervised training.
-- AE and foot-slide envelope losses are still experimental and must not pollute
-  the supervised baseline path.
-- Full-dataset long-horizon supervised continuation from the temp baseline
-  degraded local Walk_F quality and should not be treated as a trusted
-  baseline.
+- Future locomotion work is IK-only.
+- The FK/non-IK root training stack is deprecated and should not be recreated.
+- The current IK representation reconstructs GT frame 0 exactly enough for
+training and viewing. If frame 0 changes before prediction, fix the data/IK
+pipeline before training.
+- The latest Walk_F simple-AE regression was caused by scoring AE loss on the
+cleaned/clamped IK output. That was fixed on 2026-05-24: AE loss must score the
+raw controller output.
+- Do not use checkpoint
+  `20260524_050034_ik_walkF_scratch_simple_ae_k32_fixedviewer_rerun_last.pt`.
+  It was trained with the bad cleaned-output AE scoring and straightened arms.
+- The corrected Walk_F simple-AE checkpoint is:
+  `training/runs/20260524_052925_ik_walkF_scratch_simple_ae_k32_rawscore_restore/checkpoints/20260524_052925_ik_walkF_scratch_simple_ae_k32_rawscore_restore_last.pt`.
+  Diagnostic:
+  - one-step avg joint error: `0.00421m`;
+  - autoregressive avg joint error: `0.02043m`;
+  - frame 24 elbows: GT `154.21/150.75`, model `151.92/146.48`.
 
 ## Hard Rules
 
-- Keep IK work contained under `training/ik`.
-- The old root-level FK/non-IK training stack has been removed. Do not recreate
-  it.
-- Do not create one-off trainer scripts for mini experiments. Change dataset,
-  checkpoint, objective weights, curriculum, or labels through the canonical
-  trainer arguments/config instead.
-- Do not use contact labels anywhere. Foot-slide work is geometry/envelope based.
-- Do not use lookahead for the AE. The AE is one-frame/current-transition only.
-- Do not make any NPZ silently fail or fall back to Walk_F. Missing paths, empty
-  folders, invalid extensions, and skeleton mismatches must raise.
-- Checkpoint/run names must start with `YYYYMMDD_HHMMSS_ik_...`.
-- `training/runs/` output must not be staged or committed.
-- Push only when the user asks. For this cleanup the user explicitly asked to
-  push after the journal is done.
-- TensorBoard must work for every experiment. Keep it simple and shared.
-- Controller TensorBoard loss cards should stay uncluttered. Mixed AE/envelope
-  controller runs should show only:
+- Keep IK work contained under `training/ik` unless the file is explicitly an
+  IK-facing viewer/app integration such as `training/model_viewer_app.py`.
+- Do not create one-off trainer files for mini experiments. Change dataset,
+  checkpoint, objective weights, curriculum, or labels through canonical trainer
+  arguments/config.
+- Do not use contact labels anywhere. Foot losses are geometry/envelope based.
+- Simple AE is one-frame/current-transition only. Do not add AE lookahead unless
+  the user explicitly changes this rule.
+- Missing NPZ paths, empty folders, invalid extensions, and skeleton mismatches
+  must raise. No silent fallback to Walk_F.
+- Run/checkpoint names must start with `YYYYMMDD_HHMMSS_ik_...`.
+- Do not stage `training/runs/` outputs or local viewer settings.
+- Push only when the user asks.
+- TensorBoard must stack runs under the shared server and stay uncluttered.
+  Controller cards should normally be only:
   - `loss/ae_score`;
   - `loss/linear_slide_weighted`;
   - `loss/angular_slide_weighted`;
   - `loss/supervised`.
-- Raw diagnostic values can go in viewers/files, but not as dashboard clutter.
-- Every new long-run trainer should write a readable config file with the most
-  important fields at the top. `train.py` already writes `config_readable.json`;
-  port the same idea before relying on other long-run entrypoints.
+- Do not rely on Codex automations/heartbeats for experiment babysitting. They
+  failed in this workflow. Use an explicit blocking sleep/timer loop in the
+  active turn if a run needs later checking.
 
 ## Canonical Files
 
-- `training/ik/ik_core.py`
-  - IK representation, data loading, input construction, output conversion, FK.
-- `training/ik/train.py`
-  - Canonical supervised controller trainer.
-- `training/ik/train_simple_autoencoder.py`
-  - Simple AE trainer.
-- `training/ik/train_full_ae_envelope.py`
-  - Canonical AE/envelope controller trainer.
-- `training/ik/excess_envelope.py`
-  - Animation-dependent foot-slide/yaw envelope.
-- `training/ik/foot_envelope_viewer.py`
-  - Viewer for GT slide, envelope, model slide, and excess.
-- `training/ik/watch_supervised_run.ps1`
-  - Guarded watchdog/restart script for the current supervised continuation.
+- `training/ik/ik_core.py`: IK representation, MotionClip, input/output layout,
+  FK/decode, supervised helpers.
+- `training/ik/train.py`: canonical supervised controller trainer.
+- `training/ik/train_simple_autoencoder.py`: vanilla one-frame AE trainer.
+- `training/ik/train_simple_ae_controller.py`: simple AE-only controller
+  trainer and fast experiment path.
+- `training/ik/train_full_ae_envelope.py`: full AE/envelope/mixed-objective
+  controller trainer.
+- `training/ik/excess_envelope.py`: animation-dependent foot-slide/yaw
+  envelope.
+- `training/ik/visualize.py`: HTML rollout viewer. Simple-AE controller
+  checkpoints must use the simple-controller vector rollout path.
+- `training/model_viewer_app.py`: standalone app integration. It must also use
+  the simple-controller vector rollout path for simple-AE controller checkpoints.
 - `training/ik/kaggle_prepare.py`, `kaggle_run.py`, `kaggle_start.ps1`,
-  `kaggle_sync_tensorboard.py`
-  - IK-only Kaggle packaging, launch, and output sync.
-- `training/ik/tensorboard_log.py` and `launch_tensorboard_latest.ps1`
-  - TensorBoard helpers.
-
-Do not add a new training file when one of these can be extended cleanly.
+  `kaggle_sync_tensorboard.py`: IK-only Kaggle packaging/run/sync.
 
 ## Datasets
 
-- Full periodic folder:
-  `ue5/animations_omni_only_full/npz_final`
+- Full periodic folder: `ue5/animations_omni_only_full/npz_final`.
 - Full nonperiodic/transition folder:
-  `ue5/animations_transitions_only_full_trimmed/npz_final`
-- Walk_F assumption:
-  `M_Neutral_Walk_Loop_F.npz`
-- TurnL45 assumption:
-  `M_Neutral_Stand_Turn_045_L.npz`
-- CircleL assumption:
-  `M_Neutral_Walk_Circle_Strafe_L.npz`
+  `ue5/animations_transitions_only_full_trimmed/npz_final`.
+- Walk_F: `M_Neutral_Walk_Loop_F.npz`.
+- TurnL45: `M_Neutral_Stand_Turn_045_L.npz`.
+- CircleL: `M_Neutral_Walk_Circle_Strafe_L.npz`.
+- Diamond test clip:
+  `M_Neutral_Walk_Diamond_BL_F_Lfoot.npz`.
 
-Periodic clips are cyclic. Transition clips are trimmed/noncyclic. The strict
-sampler must only sample starts that have the full requested rollout horizon.
+Periodic clips are cyclic. Transition clips are trimmed/noncyclic. Strict eval
+samplers require a complete rollout window. Training samplers may use any
+one-step-valid start; when a noncyclic row reaches the usable end before its
+requested K is consumed, reset that row to a random valid start inside the same
+animation and keep going. Do not shrink requested K just because a clip is short.
 
 ## IK Representation
 
-The old endpoint-only IK was rejected because it lost elbow/knee swivel and
-hand/foot orientation. Frame 0 could differ from GT before the model predicted
-anything.
+Endpoint-only IK was rejected because it loses elbow/knee swivel and
+hand/foot orientation.
 
 Current controlled limb payload is 42 dims:
 
-- left arm: hand position root-local 3 + hand rot6 root-local 6 + elbow pole 1.
-- right arm: same, 10 dims.
+- left arm: hand position root-local 3 + hand rot6 root-local 6 + elbow pole 1;
+- right arm: same, 10 dims;
 - left leg: foot position root-local 3 + foot rot6 root-local 6 + knee pole 1
-  + toe hinge 1.
+  + toe hinge 1;
 - right leg: same, 11 dims.
 
-Arms and legs use different anatomical rest poles:
+Arms and legs use different rest poles:
 
-- arms use `-character_forward`;
-- legs use `+character_forward`.
+- arms: `-character_forward`;
+- legs: `+character_forward`.
 
-Toe is intentionally a single hinge scalar, not a full rotation. The best local
-toe hinge axis is chosen from candidates by reconstruction error.
+Toe is a single hinge scalar. The best local toe hinge axis is selected by
+reconstruction error.
 
-The model output is residual-style where applicable: prediction is added to the
-current pose target vector before `output_to_pose`.
+Reach/pole rules:
 
-Important acceptance rule: encoding a GT frame into the IK payload and decoding
-through `fk_from_pose` should reconstruct tracked positions and rotations with
-near-zero frame-0 error. If frame 0 is wrong, do not train around it; fix the
-representation/pipeline.
+- pole and toe scalars are clamped to `[-1, 1]`, with alpha `pi/2`, so this is
+  +/- 90 degrees;
+- IK endpoint reach is clamped during decode/state carry so positions stay
+  physically reachable;
+- do not use a straight-through reach projection. It made Walk_F K32 blow up
+  late in training.
 
-## Supervised Controller
+## Supervised Objective
 
-`train.py` is the supervised controller path.
+`training/ik/train.py` is the supervised path.
 
-The supervised loss is MSE between the cleaned/canonical predicted vector for
-the next step and the cached GT target output for that next step. It is not an
-end-effector global delta loss.
-
-Important correction from 2026-05-23: this used to compare raw model output and
-that caused a regression. The loss must compare the cleaned/canonical
-prediction vector, not the raw model output. Raw 6D rotations are redundant: a
-raw vector can be numerically far from target while cleaning/normalizing to the
-same rotation. The broken raw loss made Walk_F degrade while raw MSE improved.
-The current rule is:
+The supervised loss compares the cleaned/canonical predicted next vector to the
+cached GT target vector:
 
 ```text
-raw = model(current_input)
+raw = model(input)
 pred_vec = predicted_state_from_raw(raw)
 loss = mse(pred_vec, target_vec)
 ```
 
-Do not change this back to `mse(raw, target_vec)`.
+Do not compare `raw` directly to `target_vec`. Raw 6D rotations are redundant:
+a raw vector can be numerically far from target but clean to the same rotation.
+The raw-MSE supervised version made Walk_F degrade while the raw MSE improved.
 
-Supervised inside the AE/envelope trainer is a ratio-gated one-step objective,
-not an added term on every step. When the ratio selects a supervised step, the
-trainer uses K=1 only and does not apply AE or envelope losses on that step.
-The intended default experiment ratio is 1 supervised step per 5 objective
-steps; the other 4 steps stay AE + weighted slide envelope.
+In the mixed AE/envelope trainer, supervised steps are ratio-gated and K=1 only.
+When the ratio selects a supervised step, the trainer uses only the supervised
+loss for that step. AE/envelope steps use the long-horizon rollout.
 
-Mixed-trainer supervised K=1 is weighted in the actual loss, not just in logs.
-On 2026-05-23 the full-dataset temp baseline
-`20260522_075816_ik_full_vanilla_ae_controller_baseline_stall_last.pt`
-measured raw cleaned-vector supervised K=1 MSE `0.0001047247` over 10687 valid
-rows. With the global controller loss scale `500`, the hard-coded
-`SUPERVISED_K1_LOSS_WEIGHT` is `9.548846199989088`, so the baseline supervised
-TensorBoard card reads about `0.5`.
+Baseline supervised K=1 scaling:
 
-Sampling:
+- temp baseline raw cleaned-vector MSE: `0.0001047247`;
+- global controller loss scale: `500`;
+- `SUPERVISED_K1_LOSS_WEIGHT = 9.548846199989088`;
+- this makes `loss/supervised` start around `0.5`.
 
-- rows are independent;
-- the dense/packed GPU-resident row layout is mandatory;
-- noncyclic rows require a complete rollout window;
-- cyclic rows wrap through root cycle logic.
+## Simple AE Objective
 
-Curriculum:
+The vanilla AE row is:
 
-- schedule is `1, 2, 8, 16, 32`;
-- when K reaches 32, effective K is mixed fractally per row:
-  half K32, half lower; of the lower half, half K16, and so on;
-- this is per-row and should be logged as effective K mean/max.
-
-Checkpointing:
-
-- save `init`, `latest`, `best`, stage checkpoints, and `last`;
-- `latest` must update often enough for crash recovery;
-- `config_readable.json` should make the important settings obvious.
-
-Current stability note:
-
-- CUDA graph supervised mode gave illegal-memory-access/hang behavior during
-  full overnight work;
-- the current full supervised continuation uses `--disable-cuda-graph`;
-- prefer stable eager mode over a faster path that risks killing the run.
-
-Current guarded run command shape:
-
-```powershell
-python -u training\ik\train.py `
-  --run-label full_supervised_from_temp_baseline_continuing `
-  --periodic-folder ue5\animations_omni_only_full\npz_final `
-  --nonperiodic-folder ue5\animations_transitions_only_full_trimmed\npz_final `
-  --init-checkpoint <latest-or-baseline-checkpoint> `
-  --resume-step-from-checkpoint `
-  --load-optimizer `
-  --train-steps 100000 `
-  --disable-cuda-graph
+```text
+controller_input + target_output
 ```
 
-Watch it with:
+When training a controller with the frozen AE, compute the AE score on:
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File training\ik\watch_supervised_run.ps1 `
-  -Label full_supervised_from_temp_baseline_continuing `
-  -StartIfMissing `
-  -KillDuplicates
+```text
+controller_input + raw_predicted_output
 ```
 
-The watcher holds a mutex, counts the process list correctly, dedupes only when
-asked, and starts from `latest`, then `last`, then the configured baseline.
+This is mandatory. Do not score `clean_output_vector(raw)`.
 
-## Autoencoder Work
+Why: if the AE sees the cleaned/clamped output, the model can predict impossible
+IK endpoints, the clamp projects them back into reach, and the AE stays happy.
+That caused the 2026-05-24 Walk_F arm-straightening regression:
 
-We rewrote a simple AE path because older files became too clogged.
+- broken run frame 24 elbows: `179.27/179.26`;
+- fixed raw-score run frame 24 elbows: `151.92/146.48`;
+- GT frame 24 elbows: `154.21/150.75`.
 
-The AE row is the same transition row the controller sees: controller input plus
-the target/output side of the transition. The controller can then be judged by
-feeding current controller input plus predicted output through the frozen AE and
-using reconstruction error as `loss/ae_score`.
+Cleaning/clamping still happens for:
 
-Important results:
+- carried rollout state;
+- decoding into visible poses;
+- viewer display.
 
-- Vanilla/simple AE reproduced Walk_F well.
-- TurnL45 was better than CircleL, but CircleL exposed reenactment weakness.
-- Negative/corruption harshness could reduce some metrics but produced hovering
-  or ghosty/statue motion in some runs.
-- Foot-delta/corruption variants did not clearly beat vanilla for reenactment.
-- Before full-dataset AE work, retry vanilla first when behavior looks wrong.
+It does not happen before AE scoring.
 
-The AE is allowed to be harsher through representation/capacity/weighted error,
-but not by adding contact labels or lookahead.
+## Sampling And Curriculum
+
+- Rows are independent.
+- Dense/packed GPU-resident layout is mandatory.
+- Current maximum schedule is `1, 2, 8, 16, 32, 64`.
+- At max K, effective K is mixed geometrically per row: half max K, half lower;
+  within the lower group, half next lower, and so on.
+- Log effective K mean/max.
+- K64 on an 8 GB GPU needs smaller batch. The simple-AE controller caps K64 at
+  batch `3328` on CUDA devices with `<=10GB` VRAM; K32 can keep batch `4096`.
+- Full-dataset long stages should generally be manual-stop. Save `latest`
+  frequently instead of trusting an aggressive stall detector.
+
+## Checkpointing And Configs
+
+Every long-run trainer must save:
+
+- `init` before training;
+- `latest` during training;
+- `best` when the tracked loss improves;
+- stage checkpoints when K changes;
+- periodic unique step snapshots for overnight work;
+- `last` at clean end.
+
+Every experiment must write an easy-to-read config file. The most important
+settings should be at the top. `training/ik/train.py` writes
+`config_readable.json`; other long-run entrypoints should follow that style.
 
 ## Foot-Slide Envelope
 
-Foot-slide losses are geometry/envelope based, no contact labels.
+No contact labels.
 
-The current situation feature is:
+Current situation feature:
 
 ```text
 [yaw_delta / pi, bend_angle / pi, horizontal_foot_distance_xz_m]
@@ -247,149 +226,90 @@ norm((foot_l - foot_r)[x,z])
 
 The envelope is animation-dependent:
 
-- current rollout rows compare against their own animation/clip;
-- lookup is by current animation plus runtime situation;
-- there is no frame-index/per-frame component in the bound key;
+- lookup is by current animation plus current situation;
 - planted side is part of the lookup;
+- there is no frame-index/per-frame component in the bound key;
 - GT must be below its own envelope by construction plus margin.
 
-Current envelope code uses cache version `12` and margin `1.05`.
+Current cache version is `12`; default margin is `1.05`.
 
-A previous version was wrong because it used a frame-index component in the
-bound lookup. That made the loss too frame-specific and violated the intended
-"same animation plus situation" design. Do not bring that back.
+Performance decisions that survived:
 
-Performance work already done:
-
-- removed full-body FK from the envelope hot path;
-- decode only IK foot/toe state needed for contact geometry;
+- no full-body FK in the envelope hot path;
+- decode only compact IK foot/toe state needed for contact geometry;
 - carry compact foot/toe state across rollout steps;
-- use one shared animation-local KNN distance pass for linear and angular bounds;
-- KNN lookup is no longer the bottleneck.
+- use one shared animation-local KNN distance pass for linear and angular
+  bounds.
 
-Current rough benchmark:
+## Viewers And Metrics
 
-- AE-only full-dataset K32 update: about `0.25s`;
-- animation-dependent envelope full-dataset K32 update: about `0.9s-1.2s`.
+HTML viewer:
 
-Remaining envelope cost is mainly compact contact geometry, decode-next state,
-and backward.
+- `training/ik/visualize.py` must detect simple-AE controller checkpoints
+  (`metadata.policy.loss == "simple_ae_output_reconstruction"`) and use
+  `train_simple_ae_controller` vector-state rollout.
+- The old generic `ik_core.build_input`/pose-dict rollout path produced bogus
+  drift for simple-AE controller checkpoints.
 
-## Metrics And Viewers
+Standalone viewer:
 
-Useful supervised metric:
+- `training/model_viewer_app.py` must use the same simple-controller vector
+  state, `model_forward`, `clean_output_vector`, and vector handoff for
+  simple-AE controller checkpoints.
+- If a viewer process was already open before code changes, restart it. It will
+  not hot-reload Python code.
 
-- one-step difference against GT catches hovering and bad local reconstruction
-  without being confused by phase drift.
+Useful metrics:
 
-Useful foot-slide metric:
-
-- compare model slide/yaw excess against the animation-dependent envelope;
-- for visual inspection use the foot envelope viewer showing GT slide,
-  envelope, model slide, and excess per frame.
-
-Be careful with full-gait averages. Landing/takeoff can look like sliding if the
-metric is not aligned with the pinned interval. For Walk_F, mean-over-interval is
-acceptable for quick checks, but do not overfit metric logic to one animation.
-
-## TensorBoard
-
-TensorBoard should stack runs under the shared server.
-
-Useful launch path:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File training\ik\launch_tensorboard_latest.ps1
-```
-
-Avoid cards that are not decision-relevant. If a scalar is only useful for a
-one-off audit, write it to a diagnostic JSON/viewer or print it, not to the main
-dashboard.
+- one-step joint/global position + rotation + velocity catches local
+  reconstruction problems without phase-drift confusion;
+- autoregressive rollout catches long-horizon drift;
+- elbow/knee angle diagnostics catch the "small hand error, huge elbow error"
+  failure mode;
+- foot-slide viewer should show GT slide, envelope, model slide, and excess per
+  frame.
 
 ## Kaggle
 
-Kaggle support is part of IK now. Do not use the old K111/FK launch path for new
-work.
+Kaggle support is IK-local. Do not use old FK/K111 Kaggle scripts.
 
-Current IK-local files:
+Modes:
 
-- `kaggle_prepare.py` builds a Kaggle dataset/kernel payload containing:
-  - `training/ik`;
-  - `fbx_npz_pipeline`;
-  - selected `npz_final` datasets;
-  - explicitly requested checkpoints/config files.
-- `kaggle_run.py` runs inside Kaggle and dispatches to canonical IK trainers:
-  - `STEPPER_IK_MODE=supervised` -> `training/ik/train.py`;
-  - `STEPPER_IK_MODE=simple_ae` -> `training/ik/train_simple_autoencoder.py`;
-  - `STEPPER_IK_MODE=ae_envelope` -> `training/ik/train_full_ae_envelope.py`.
-- `kaggle_start.ps1` is the local upload/push wrapper.
-- `kaggle_sync_tensorboard.py` downloads Kaggle outputs for local TensorBoard
-  and checkpoint review.
+- `STEPPER_IK_MODE=supervised` -> `training/ik/train.py`;
+- `STEPPER_IK_MODE=simple_ae` -> `training/ik/train_simple_autoencoder.py`;
+- `STEPPER_IK_MODE=ae_envelope` -> `training/ik/train_full_ae_envelope.py`.
 
-Defaults are supervised, full periodic/nonperiodic datasets, eager/no CUDA graph
-for stability, and checkpoint mirroring to Kaggle output. Keep future Kaggle
-changes in these IK files, not in old root training scripts.
+Kaggle packaging should include the current IK code, FBX/NPZ pipeline, selected
+NPZ datasets, and requested checkpoints/configs. Do not commit generated
+`kaggle_payload` or downloaded `kaggle_results` folders unless explicitly asked.
 
-## Tally Of Tried Paths
+## Rejected Or Dangerous Paths
 
-- Contained IK folder:
-  - kept; main trainer should stay untouched.
-- Endpoint-only IK:
-  - rejected; underdetermined elbows/knees and missing end-effector rotations.
-- 42-dim IK payload with poles, foot rotations, and toe hinge:
-  - kept.
-- NPZ cleaning/re-encoding so model can reconstruct frame 0:
-  - kept; frame-0 mismatch means the pipeline is broken.
-- Packed/dense row layout:
-  - kept and mandatory.
-- One-off K=1 trainer special case:
-  - rejected; use the same rollout loop for every K.
-- Strict full-window sampling:
-  - kept; no mid-rollout repair for noncyclic rows.
-- Cached target output tensors:
-  - kept.
-- Fused AdamW on CUDA:
-  - useful when supported, fallback otherwise.
-- Mixed K at K32:
-  - kept; fractal distribution per row.
-- AE-only controller:
-  - useful but not yet trusted as the full baseline because circle/turn behavior
-    exposed reenactment issues.
-- AE corruption/negative examples:
-  - suspicious; caused hovering/statue behavior in some probes.
-- Foot-slide envelope with frame-index lookup:
-  - rejected; explicitly wrong.
-- Global situation-only envelope across all animations:
-  - rejected; mixes incompatible motions.
-- Animation-dependent situation envelope:
-  - kept.
-- Full FK inside envelope loss:
-  - rejected as too slow and unnecessary for IK feet.
-- Compact IK foot/toe envelope path:
-  - kept.
-- CUDA graph supervised full run:
-  - disabled for now due crash/hang risk.
-- Watchdog implemented in heartbeat prompt:
-  - rejected; too easy to duplicate process logic.
-- Watchdog as one guarded script:
-  - kept.
-- Old K111 Kaggle scripts:
-  - deprecated for future work.
-- IK-local Kaggle packaging/run/sync scripts:
-  - kept.
-- Old root `training/train_locomotion*`, old AE-prior, old visual reporter,
-  old K111 Kaggle, and root inspection/sweep scripts:
-  - removed after IK became the only future training path.
+- Endpoint-only IK: rejected.
+- Contact labels: rejected.
+- Per-frame/frame-index envelope lookup: rejected.
+- Global situation-only envelope across all animations: rejected.
+- Full FK inside envelope loss: rejected for performance.
+- One-off mini trainer files: rejected.
+- K=1 special-case controller loop: rejected.
+- Raw-MSE supervised objective: rejected.
+- Cleaned/clamped-output AE scoring: rejected after Walk_F arm regression.
+- Straight-through IK reach projection: rejected after K32 blow-up.
+- Codex automations/heartbeats for babysitting: rejected.
 
-## Current Open Items
+## Next Good Default
 
-- Keep the current full supervised continuation alive and monitor it through the
-  guarded watcher.
-- Mixed objective work belongs in `training/ik/train_full_ae_envelope.py`, not
-  in a new mini harness.
-- Current mixed-objective rule: supervised ratio steps are K=1 only; do not use
-  long-horizon supervised rollout in the mixed AE/envelope controller.
-- Port `config_readable.json` style to any trainer that will be used for long
-  runs beyond `train.py`.
-- Do not trust old refined/AE-envelope runs as final baselines unless their
-  checkpoint lineage and TensorBoard scalars are verified.
+For quick sanity, use the corrected raw-score Walk_F simple-AE run as the known
+good local check:
+
+```text
+20260524_052925_ik_walkF_scratch_simple_ae_k32_rawscore_restore_last.pt
+```
+
+For future AE/controller experiments, first verify:
+
+- frame 0 matches GT;
+- one-step error is sane;
+- elbows/knees are not being hidden by small endpoint errors;
+- TensorBoard shows the expected small set of cards;
+- checkpoints are being written from the beginning.

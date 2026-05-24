@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import time
 from dataclasses import asdict, dataclass, fields
@@ -31,22 +32,27 @@ SIMPLE_CONTROLLER_AE_KIND = "simple_controller_io_autoencoder"
 LEGACY_SIMPLE_AE_KIND = "simple_" + "ag" + "ent_io_autoencoder"
 
 BATCH_SIZE = 4096
-ROLLOUT_SCHEDULE = (1, 2, 8, 16, 32)
-ROLLOUT_STAGE_STEPS = (3000, 1000, 1500, 1500, 2500)
-ROLLOUT_K = 32
+SMALL_CUDA_K64_BATCH_SIZE = 3328
+ROLLOUT_SCHEDULE = (1, 2, 8, 16, 32, 64)
+ROLLOUT_STAGE_STEPS = (3000, 1000, 1500, 1500, 2500, 2500)
+ROLLOUT_K = 64
 LEARNING_RATE = 1e-4
 STAGE_LEARNING_RATES = {
     1: 1e-4,
     2: 8e-5,
     8: 5e-5,
     16: 2e-5,
-    32: 1e-5,
+    32: 7.5e-6,
+    64: 7.5e-6,
 }
 LOG_EVERY = 250
 VALIDATION_ROWS = 256
 RUN_FK_DIAGNOSTIC = False
 AE_SCORE_OUTPUT_ONLY = True
 NAN_METRIC = float("nan")
+POSE_NOISE_POS_SIGMA_M_AT_1 = 0.12
+POSE_NOISE_ROT_SIGMA_DEG_AT_1 = 25.0
+POSE_NOISE_SCALAR_SIGMA_AT_1 = 1.0
 
 
 def refresh_tensorboard_async() -> None:
@@ -97,6 +103,36 @@ class SimpleClipStore:
         self.Jcore = int(first.Jcore)
         self.ik_payload_dim = int(getattr(first, "ik_payload_dim", 0))
         self.pelvis = int(first.pelvis)
+        prototype_tensors = first.tensors(device)
+        self.local_offsets = prototype_tensors["local_offsets"]
+        self.ik_limb_lengths = prototype_tensors["ik_limb_lengths"]
+        self.ik_rest_axis = prototype_tensors["ik_rest_axis"]
+        self.ik_base_start_indices = tuple(int(spec["start"]) for spec in first.ik_limb_specs)
+        needed_bones: set[int] = set()
+        for start in self.ik_base_start_indices:
+            bone = int(start)
+            while bone >= 0:
+                needed_bones.add(bone)
+                bone = int(first.parents_body_list[bone])
+        self.ik_base_eval_order = tuple(bone for bone in range(first.J) if bone in needed_bones)
+        fast_base_names = (
+            "spine_01",
+            "spine_02",
+            "spine_03",
+            "spine_04",
+            "spine_05",
+            "clavicle_l",
+            "clavicle_r",
+            "upperarm_l",
+            "upperarm_r",
+            "thigh_l",
+            "thigh_r",
+        )
+        self.ik_fast_base_indices = (
+            {name: first.body_names.index(name) for name in fast_base_names}
+            if all(name in first.body_names for name in fast_base_names)
+            else None
+        )
 
         tensors = [clip.tensors(device) for clip in clips]
         lengths = [int(clip.T) for clip in clips]
@@ -379,6 +415,12 @@ def max_start_for_clip(clip: tl.MotionClip, cfg: tl.TrainConfig, rollout_k: int)
     return int(clip.T) - transition_feature_horizon(cfg) - max(1, int(rollout_k))
 
 
+def max_training_start_for_clip(clip: tl.MotionClip, cfg: tl.TrainConfig) -> int:
+    if clip.cyclic_animation:
+        return int(clip.cyclic_period) - 1
+    return int(clip.T) - transition_feature_horizon(cfg) - 1
+
+
 def build_start_pool(store: SimpleClipStore, rollout_k: int) -> StartPool:
     clip_chunks: list[torch.Tensor] = []
     start_chunks: list[torch.Tensor] = []
@@ -391,6 +433,21 @@ def build_start_pool(store: SimpleClipStore, rollout_k: int) -> StartPool:
         start_chunks.append(starts)
     if not start_chunks:
         raise ValueError(f"No valid full-window rollout starts found for K={rollout_k}")
+    return StartPool(torch.cat(clip_chunks, dim=0), torch.cat(start_chunks, dim=0))
+
+
+def build_training_start_pool(store: SimpleClipStore, rollout_k: int) -> StartPool:
+    clip_chunks: list[torch.Tensor] = []
+    start_chunks: list[torch.Tensor] = []
+    for clip_id, clip in enumerate(store.clips):
+        max_start = max_training_start_for_clip(clip, store.cfg)
+        if max_start < 1:
+            continue
+        starts = torch.arange(1, max_start + 1, dtype=torch.long, device=store.device)
+        clip_chunks.append(torch.full_like(starts, int(clip_id)))
+        start_chunks.append(starts)
+    if not start_chunks:
+        raise ValueError(f"No valid rollout starts found for K={rollout_k}")
     return StartPool(torch.cat(clip_chunks, dim=0), torch.cat(start_chunks, dim=0))
 
 
@@ -410,6 +467,10 @@ def mixed_rollout_enabled(rollout_k: int) -> bool:
 
 def build_start_pools(store: SimpleClipStore, rollout_values: tuple[int, ...]) -> dict[int, StartPool]:
     return {int(k): build_start_pool(store, int(k)) for k in rollout_values}
+
+
+def build_training_start_pools(store: SimpleClipStore, rollout_values: tuple[int, ...]) -> dict[int, StartPool]:
+    return {int(k): build_training_start_pool(store, int(k)) for k in rollout_values}
 
 
 def sample_from_pool(pool: StartPool, count: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -437,6 +498,44 @@ def sample_effective_rollout_k(batch_size: int, rollout_k: int, device: torch.de
     chunks.append(torch.full((remaining,), int(values[-1]), dtype=torch.long, device=device))
     effective_k = torch.cat(chunks, dim=0)
     return effective_k.index_select(0, torch.randperm(batch_size, device=device))
+
+
+def max_training_start_for_clip_ids(store: SimpleClipStore, clip_ids: torch.Tensor) -> torch.Tensor:
+    clip_ids = clip_ids.to(store.device).long()
+    cyclic = store.cyclic.index_select(0, clip_ids)
+    periods = store.periods.index_select(0, clip_ids).clamp_min(1)
+    lengths = store.lengths.index_select(0, clip_ids)
+    horizon = int(transition_feature_horizon(store.cfg))
+    noncyclic_max = (lengths - horizon - 1).clamp_min(1)
+    return torch.where(cyclic, periods - 1, noncyclic_max).clamp_min(1)
+
+
+def sample_same_clip_training_starts(store: SimpleClipStore, clip_ids: torch.Tensor) -> torch.Tensor:
+    max_start = max_training_start_for_clip_ids(store, clip_ids)
+    noise = torch.rand(max_start.shape, dtype=torch.float32, device=store.device)
+    return (torch.floor(noise * max_start.float()).long() + 1).clamp_min(1)
+
+
+def sample_same_clip_training_starts_by_step(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    steps: int,
+) -> torch.Tensor:
+    steps = max(1, int(steps))
+    max_start = max_training_start_for_clip_ids(store, clip_ids).float().unsqueeze(0)
+    noise = torch.rand((steps, int(clip_ids.numel())), dtype=torch.float32, device=store.device)
+    return (torch.floor(noise * max_start).long() + 1).clamp_min(1)
+
+
+def training_reset_rows(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    continuing: torch.Tensor,
+) -> torch.Tensor:
+    cyclic = store.cyclic.index_select(0, clip_ids)
+    max_start = max_training_start_for_clip_ids(store, clip_ids)
+    return continuing & (~cyclic) & (cur_idx >= max_start)
 
 
 def rollout_stat_summary(batch_size: int, rollout_k: int) -> dict[str, float]:
@@ -501,9 +600,79 @@ def make_adamw(params, lr: float, device: torch.device, capturable: bool = False
         return torch.optim.AdamW(params, **kwargs)
 
 
+def batch_size_for_stage(store: SimpleClipStore, rollout_k: int, row_count: int) -> int:
+    cap = int(BATCH_SIZE)
+    if store.device.type == "cuda" and int(rollout_k) >= 64:
+        total_gb = torch.cuda.get_device_properties(store.device).total_memory / float(1024**3)
+        if total_gb <= 10.0:
+            cap = min(cap, int(SMALL_CUDA_K64_BATCH_SIZE))
+    return max(1, min(int(row_count), cap))
+
+
 def payload_slice(store: SimpleClipStore) -> slice:
     start = 3 + 6 + store.Jcore * 6
     return slice(start, start + store.ik_payload_dim)
+
+
+def vector_position_slices(store: SimpleClipStore) -> list[slice]:
+    slices = [slice(0, 3)]
+    payload_start = payload_slice(store).start
+    for spec in tl.IK_PAYLOAD_SLICES:
+        pos_slice = spec["pos"]
+        assert isinstance(pos_slice, slice)
+        slices.append(slice(payload_start + pos_slice.start, payload_start + pos_slice.stop))
+    return slices
+
+
+def vector_rot6_slices(store: SimpleClipStore) -> list[slice]:
+    slices = [slice(3, 9)]
+    cursor = 9
+    for _ in range(store.Jcore):
+        slices.append(slice(cursor, cursor + 6))
+        cursor += 6
+    payload_start = cursor
+    for spec in tl.IK_PAYLOAD_SLICES:
+        rot_slice = spec["rot6"]
+        assert isinstance(rot_slice, slice)
+        slices.append(slice(payload_start + rot_slice.start, payload_start + rot_slice.stop))
+    return slices
+
+
+def vector_scalar_slices(store: SimpleClipStore) -> list[slice]:
+    slices: list[slice] = []
+    payload_start = payload_slice(store).start
+    for spec in tl.IK_PAYLOAD_SLICES:
+        pole_slice = spec["pole"]
+        toe_slice = spec["toe_float"]
+        assert isinstance(pole_slice, slice)
+        slices.append(slice(payload_start + pole_slice.start, payload_start + pole_slice.stop))
+        if toe_slice is not None:
+            assert isinstance(toe_slice, slice)
+            slices.append(slice(payload_start + toe_slice.start, payload_start + toe_slice.stop))
+    return slices
+
+
+def add_pose_noise_to_vector(store: SimpleClipStore, vec: torch.Tensor, amount: float) -> torch.Tensor:
+    amount = float(amount)
+    if amount <= 0.0:
+        return vec
+    out = vec.clone()
+    pos_sigma = amount * float(POSE_NOISE_POS_SIGMA_M_AT_1)
+    rot_sigma = amount * float(POSE_NOISE_ROT_SIGMA_DEG_AT_1) * math.pi / 180.0
+    scalar_sigma = amount * float(POSE_NOISE_SCALAR_SIGMA_AT_1)
+    for sl in vector_position_slices(store):
+        out[:, sl] = out[:, sl] + torch.randn_like(out[:, sl]) * pos_sigma
+    if scalar_sigma > 0.0:
+        for sl in vector_scalar_slices(store):
+            out[:, sl] = out[:, sl] + torch.randn_like(out[:, sl]) * scalar_sigma
+    if rot_sigma > 0.0:
+        for sl in vector_rot6_slices(store):
+            base_rot = tl.rotation_6d_to_matrix(vec[:, sl])
+            axis = torch.randn((vec.shape[0], 3), dtype=vec.dtype, device=vec.device)
+            angle = torch.randn((vec.shape[0],), dtype=vec.dtype, device=vec.device) * rot_sigma
+            delta = tl.axis_angle_to_row_matrix(axis, angle)
+            out[:, sl] = tl.rotmat_to_6d(delta @ base_rot)
+    return clean_output_vector(out, store)
 
 
 def target_state(store: SimpleClipStore, clip_ids: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -531,10 +700,133 @@ def fast_clean_ik_payload(payload: torch.Tensor) -> torch.Tensor:
         assert isinstance(pole_slice, slice)
         parts.append(payload[:, pos_slice])
         parts.append(fast_clean_6d(payload[:, rot_slice]))
-        parts.append(payload[:, pole_slice])
+        parts.append(payload[:, pole_slice].clamp(-1.0, 1.0))
         if toe_slice is not None:
             assert isinstance(toe_slice, slice)
-            parts.append(payload[:, toe_slice])
+            parts.append(payload[:, toe_slice].clamp(-1.0, 1.0))
+    return torch.cat(parts, dim=-1)
+
+
+def _ik_base_positions_root(
+    store: SimpleClipStore,
+    pelvis_pos: torch.Tensor,
+    pelvis_rot: torch.Tensor,
+    core_rot6: torch.Tensor,
+) -> torch.Tensor:
+    clip = store.prototype
+    b = int(pelvis_pos.shape[0])
+    dtype = pelvis_pos.dtype
+    offsets = store.local_offsets.to(dtype=dtype)
+    fast_indices = store.ik_fast_base_indices
+    if fast_indices is not None:
+        def core_rot_for_name(bone_name: str) -> torch.Tensor:
+            bone = int(fast_indices[bone_name])
+            slot = int(clip.core_nonpelvis_map[bone])
+            return tl.rotation_6d_to_matrix(core_rot6[:, slot])
+
+        def child_pos(parent_pos: torch.Tensor, parent_rot: torch.Tensor, bone_name: str) -> torch.Tensor:
+            offset = offsets[int(fast_indices[bone_name])].reshape(1, 3).expand(b, 3)
+            return torch.matmul(offset.unsqueeze(1), parent_rot).squeeze(1) + parent_pos
+
+        def child_rot(parent_rot: torch.Tensor, bone_name: str) -> torch.Tensor:
+            return core_rot_for_name(bone_name) @ parent_rot
+
+        pos = pelvis_pos
+        rot = pelvis_rot
+        for spine_name in ("spine_01", "spine_02", "spine_03", "spine_04", "spine_05"):
+            pos = child_pos(pos, rot, spine_name)
+            rot = child_rot(rot, spine_name)
+        spine_pos = pos
+        spine_rot = rot
+        clav_l_pos = child_pos(spine_pos, spine_rot, "clavicle_l")
+        clav_l_rot = child_rot(spine_rot, "clavicle_l")
+        clav_r_pos = child_pos(spine_pos, spine_rot, "clavicle_r")
+        clav_r_rot = child_rot(spine_rot, "clavicle_r")
+        base_by_bone = {
+            int(fast_indices["upperarm_l"]): child_pos(clav_l_pos, clav_l_rot, "upperarm_l"),
+            int(fast_indices["upperarm_r"]): child_pos(clav_r_pos, clav_r_rot, "upperarm_r"),
+            int(fast_indices["thigh_l"]): child_pos(pelvis_pos, pelvis_rot, "thigh_l"),
+            int(fast_indices["thigh_r"]): child_pos(pelvis_pos, pelvis_rot, "thigh_r"),
+        }
+        return torch.stack([base_by_bone[int(start)] for start in store.ik_base_start_indices], dim=1)
+
+    core_rot = tl.rotation_6d_to_matrix(core_rot6.reshape(-1, 6)).reshape(b, store.Jcore, 3, 3)
+    identity = torch.eye(3, dtype=dtype, device=store.device).expand(b, 3, 3)
+    pos_root: list[torch.Tensor | None] = [None] * int(clip.J)
+    rot_root: list[torch.Tensor | None] = [None] * int(clip.J)
+    for j in store.ik_base_eval_order:
+        if j == int(clip.pelvis):
+            local_pos = pelvis_pos
+            local_rot = pelvis_rot
+        else:
+            local_pos = offsets[j].reshape(1, 3).expand(b, 3)
+            local_rot = core_rot[:, int(clip.core_nonpelvis_map[j])] if j in clip.core_nonpelvis_map else identity
+        parent = int(clip.parents_body_list[j])
+        if parent < 0:
+            pos_j = local_pos
+            rot_j = local_rot
+        else:
+            parent_pos = pos_root[parent]
+            parent_rot = rot_root[parent]
+            assert parent_pos is not None and parent_rot is not None
+            pos_j = torch.matmul(local_pos.unsqueeze(1), parent_rot).squeeze(1) + parent_pos
+            rot_j = local_rot @ parent_rot
+        pos_root[j] = pos_j
+        rot_root[j] = rot_j
+    starts = store.ik_base_start_indices
+    return torch.stack([pos_root[start] for start in starts], dim=1)  # type: ignore[index]
+
+
+def clamp_clean_ik_payload(
+    payload: torch.Tensor,
+    store: SimpleClipStore,
+    pelvis_pos: torch.Tensor,
+    pelvis_rot: torch.Tensor,
+    core_rot6: torch.Tensor,
+) -> torch.Tensor:
+    cleaned = fast_clean_ik_payload(payload)
+    if not store.prototype.ik_limb_specs:
+        return cleaned
+    base_root = _ik_base_positions_root(store, pelvis_pos, pelvis_rot, core_rot6)
+    lengths = store.ik_limb_lengths.to(dtype=cleaned.dtype)
+    rest_axis = store.ik_rest_axis.to(dtype=cleaned.dtype)
+    end_parts: list[torch.Tensor] = []
+    rot_parts: list[torch.Tensor] = []
+    pole_parts: list[torch.Tensor] = []
+    toe_parts: list[torch.Tensor | None] = []
+    for spec in tl.IK_PAYLOAD_SLICES:
+        pos_slice = spec["pos"]
+        rot_slice = spec["rot6"]
+        pole_slice = spec["pole"]
+        toe_slice = spec["toe_float"]
+        assert isinstance(pos_slice, slice)
+        assert isinstance(rot_slice, slice)
+        assert isinstance(pole_slice, slice)
+        end_parts.append(cleaned[:, pos_slice])
+        rot_parts.append(cleaned[:, rot_slice])
+        pole_parts.append(cleaned[:, pole_slice])
+        if toe_slice is not None:
+            assert isinstance(toe_slice, slice)
+            toe_parts.append(cleaned[:, toe_slice])
+        else:
+            toe_parts.append(None)
+    end_root = torch.stack(end_parts, dim=1)
+    delta = end_root - base_root
+    d = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    fallback_axis = rest_axis.reshape(1, -1, 3).expand_as(delta)
+    axis = torch.where(d > 1e-8, tl.normalize(delta), tl.normalize(fallback_axis))
+    l1 = lengths[:, 0].reshape(1, -1, 1)
+    l2 = lengths[:, 1].reshape(1, -1, 1)
+    min_d = torch.abs(l1 - l2) + 1e-5
+    max_d = l1 + l2 - 1e-5
+    clamped_pos = base_root + axis * d.clamp_min(1e-8).clamp(min=min_d, max=max_d)
+    parts: list[torch.Tensor] = []
+    for limb_i, toe in enumerate(toe_parts):
+        parts.append(clamped_pos[:, limb_i])
+        parts.append(rot_parts[limb_i])
+        parts.append(pole_parts[limb_i])
+        if toe is not None:
+            parts.append(toe)
     return torch.cat(parts, dim=-1)
 
 
@@ -548,7 +840,8 @@ def clean_output_vector(raw: torch.Tensor, store: SimpleClipStore) -> torch.Tens
     core_dim = store.Jcore * 6
     core_rot6 = fast_clean_6d(raw[:, cursor : cursor + core_dim].reshape(-1, 6)).reshape(b, store.Jcore, 6)
     cursor += core_dim
-    payload = fast_clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim])
+    pelvis_rot = tl.rotation_6d_to_matrix(pelvis_rot6)
+    payload = clamp_clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim], store, pelvis_pos, pelvis_rot, core_rot6)
     return torch.cat((pelvis_pos, pelvis_rot6, core_rot6.reshape(b, -1), payload), dim=-1)
 
 
@@ -627,7 +920,7 @@ def pure_ae_rollout_loss(
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
-        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight).sum()
+        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, raw) * row_weight).sum()
         if step + 1 >= max_k:
             break
 
@@ -635,13 +928,21 @@ def pure_ae_rollout_loss(
         rows = continuing.nonzero(as_tuple=False).flatten()
         if rows.numel() == 0:
             break
-        pred_vec = pred_vec.index_select(0, rows)
         clip_ids = clip_ids.index_select(0, rows)
-        prev_vec = cur_vec.index_select(0, rows)
-        prev_pelvis = cur_pelvis.index_select(0, rows)
-        prev_payload = cur_payload.index_select(0, rows)
-        cur_vec, cur_pelvis, cur_payload = predicted_state_from_vector(pred_vec, store)
-        cur_idx = cur_idx.index_select(0, rows) + 1
+        reset = training_reset_rows(store, clip_ids, cur_idx.index_select(0, rows), torch.ones_like(rows, dtype=torch.bool))
+        next_vec, next_pelvis, next_payload = predicted_state_from_vector(pred_vec.index_select(0, rows), store)
+        next_idx = cur_idx.index_select(0, rows) + 1
+        reset_starts = sample_same_clip_training_starts(store, clip_ids)
+        reset_prev_vec, reset_prev_pelvis, reset_prev_payload = target_state(store, clip_ids, reset_starts - 1)
+        reset_cur_vec, reset_cur_pelvis, reset_cur_payload = target_state(store, clip_ids, reset_starts)
+        reset_mask = reset[:, None]
+        prev_vec = torch.where(reset_mask, reset_prev_vec, cur_vec.index_select(0, rows))
+        prev_pelvis = torch.where(reset_mask, reset_prev_pelvis, cur_pelvis.index_select(0, rows))
+        prev_payload = torch.where(reset_mask, reset_prev_payload, cur_payload.index_select(0, rows))
+        cur_vec = torch.where(reset_mask, reset_cur_vec, next_vec)
+        cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, next_pelvis)
+        cur_payload = torch.where(reset_mask, reset_cur_payload, next_payload)
+        cur_idx = torch.where(reset, reset_starts, next_idx)
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
     return total_loss
@@ -658,6 +959,7 @@ def pure_ae_rollout_loss_static(
     effective_k: torch.Tensor,
     clip_ids: torch.Tensor,
     starts: torch.Tensor,
+    reset_starts_by_step: torch.Tensor | None = None,
 ) -> torch.Tensor:
     max_k = max(1, int(rollout_k))
     cur_idx = starts
@@ -673,20 +975,30 @@ def pure_ae_rollout_loss_static(
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
         active = effective_k > step
-        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight * active.float()).sum()
+        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, raw) * row_weight * active.float()).sum()
         if step + 1 >= max_k:
             break
 
         continuing = effective_k > (step + 1)
         next_vec, next_pelvis, next_payload = predicted_state_from_vector(pred_vec, store)
-        mask = continuing[:, None]
-        prev_vec = torch.where(mask, cur_vec, prev_vec)
-        prev_pelvis = torch.where(mask, cur_pelvis, prev_pelvis)
-        prev_payload = torch.where(mask, cur_payload, prev_payload)
-        cur_vec = torch.where(mask, next_vec, cur_vec)
-        cur_pelvis = torch.where(mask, next_pelvis, cur_pelvis)
-        cur_payload = torch.where(mask, next_payload, cur_payload)
-        cur_idx = torch.where(continuing, cur_idx + 1, cur_idx)
+        reset = training_reset_rows(store, clip_ids, cur_idx, continuing)
+        advance = continuing & (~reset)
+        reset_starts = (
+            reset_starts_by_step[step]
+            if reset_starts_by_step is not None
+            else sample_same_clip_training_starts(store, clip_ids)
+        )
+        reset_prev_vec, reset_prev_pelvis, reset_prev_payload = target_state(store, clip_ids, reset_starts - 1)
+        reset_cur_vec, reset_cur_pelvis, reset_cur_payload = target_state(store, clip_ids, reset_starts)
+        reset_mask = reset[:, None]
+        advance_mask = advance[:, None]
+        prev_vec = torch.where(reset_mask, reset_prev_vec, torch.where(advance_mask, cur_vec, prev_vec))
+        prev_pelvis = torch.where(reset_mask, reset_prev_pelvis, torch.where(advance_mask, cur_pelvis, prev_pelvis))
+        prev_payload = torch.where(reset_mask, reset_prev_payload, torch.where(advance_mask, cur_payload, prev_payload))
+        cur_vec = torch.where(reset_mask, reset_cur_vec, torch.where(advance_mask, next_vec, cur_vec))
+        cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, torch.where(advance_mask, next_pelvis, cur_pelvis))
+        cur_payload = torch.where(reset_mask, reset_cur_payload, torch.where(advance_mask, next_payload, cur_payload))
+        cur_idx = torch.where(reset, reset_starts, torch.where(continuing, cur_idx + 1, cur_idx))
     return total_loss
 
 
@@ -719,6 +1031,9 @@ class CudaGraphPureAEStep:
         self.effective_k = torch.empty((self.batch_size,), dtype=torch.long, device=store.device)
         self.clip_ids = torch.empty_like(self.effective_k)
         self.starts = torch.empty_like(self.effective_k)
+        self.reset_starts_by_step = torch.empty(
+            (max(1, int(self.rollout_k)), self.batch_size), dtype=torch.long, device=store.device
+        )
         self.loss = torch.zeros((), dtype=torch.float32, device=store.device)
         self.graph = torch.cuda.CUDAGraph()
         self._capture()
@@ -729,6 +1044,9 @@ class CudaGraphPureAEStep:
         self.effective_k.copy_(effective_k)
         self.clip_ids.copy_(clip_ids)
         self.starts.copy_(starts)
+        self.reset_starts_by_step.copy_(
+            sample_same_clip_training_starts_by_step(self.store, clip_ids, self.reset_starts_by_step.shape[0])
+        )
 
     def _loss(self) -> torch.Tensor:
         return pure_ae_rollout_loss_static(
@@ -742,6 +1060,7 @@ class CudaGraphPureAEStep:
             self.effective_k,
             self.clip_ids,
             self.starts,
+            self.reset_starts_by_step,
         )
 
     def _capture(self) -> None:
@@ -857,7 +1176,7 @@ def validation_ae_score(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
-        score = ae_score_rows(ae, mean, std, inp, clean_output_vector(raw, store))
+        score = ae_score_rows(ae, mean, std, inp, raw)
         total += float(score.sum().detach().cpu())
         count += int(score.numel())
         if step + 1 >= int(rollout_k):
@@ -984,9 +1303,9 @@ def main() -> None:
     stage_cache: dict[int, dict[str, object]] = {}
     for stage_k in ROLLOUT_SCHEDULE:
         rollout_values = rollout_values_for(stage_k) if mixed_rollout_enabled(stage_k) else (int(stage_k),)
-        start_pools = build_start_pools(store, rollout_values)
+        start_pools = build_training_start_pools(store, rollout_values)
         max_pool = start_pools[int(stage_k)]
-        batch_size = min(BATCH_SIZE, max_pool.row_count)
+        batch_size = batch_size_for_stage(store, int(stage_k), max_pool.row_count)
         stage_cache[int(stage_k)] = {
             "rollout_values": rollout_values,
             "start_pools": start_pools,

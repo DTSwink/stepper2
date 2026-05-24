@@ -13,7 +13,6 @@ from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from OpenGL import GL, GLU
 from pyopengltk import OpenGLFrame
@@ -40,7 +39,6 @@ tl = ik_tl
 from ik import contact_physics as cp
 from ik import excess_envelope as ik_env
 from ik import train_simple_ae_controller as ik_ctl
-from ik import transition_autoencoder as tae
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
     FootContactConfig,
@@ -102,7 +100,8 @@ TARGET_RENDER_FPS = 60.0
 TARGET_RENDER_INTERVAL_MS = max(1, int(round(1000.0 / TARGET_RENDER_FPS)))
 TARGET_PLAYBACK_FPS = 120.0
 MAX_PLAYBACK_SUBSTEPS = 3
-AE_VALUE_OVERLAY_ENABLED = False
+AE_VALUE_OVERLAY_ENABLED = True
+AE_VALUE_REFRESH_SECONDS = 0.15
 XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE = 7849
 XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE = 8689
 XINPUT_THUMB_MAX = 32767.0
@@ -503,6 +502,14 @@ class Actor:
     cur_idx: torch.Tensor | None = None
     prev_pose: dict[str, torch.Tensor] | None = None
     cur_pose: dict[str, torch.Tensor] | None = None
+    simple_store: ik_ctl.SimpleClipStore | None = field(default=None, repr=False)
+    simple_clip_ids: torch.Tensor | None = field(default=None, repr=False)
+    prev_simple_vec: torch.Tensor | None = None
+    cur_simple_vec: torch.Tensor | None = None
+    prev_simple_pelvis: torch.Tensor | None = None
+    cur_simple_pelvis: torch.Tensor | None = None
+    prev_simple_payload: torch.Tensor | None = None
+    cur_simple_payload: torch.Tensor | None = None
     generation_lock: object = field(default_factory=threading.Lock, repr=False)
     generation_target: int = 0
     generation_thread: threading.Thread | None = field(default=None, repr=False)
@@ -529,6 +536,13 @@ class Actor:
 
     def backend(self):
         return ik_tl
+
+    def is_simple_controller_checkpoint(self) -> bool:
+        if not isinstance(self.checkpoint, dict):
+            return False
+        metadata = self.checkpoint.get("metadata", {})
+        policy = metadata.get("policy", {}) if isinstance(metadata, dict) else {}
+        return isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction"
 
     def has_initial_pelvis_offset(self) -> bool:
         return bool(np.linalg.norm(self.initial_pelvis_offset) > 1e-7)
@@ -579,6 +593,75 @@ class Actor:
         out[: min(2, values.shape[0])] = values[:2].astype(np.float32)
         return out
 
+    def clear_simple_state(self) -> None:
+        self.simple_clip_ids = None
+        self.prev_simple_vec = None
+        self.cur_simple_vec = None
+        self.prev_simple_pelvis = None
+        self.cur_simple_pelvis = None
+        self.prev_simple_payload = None
+        self.cur_simple_payload = None
+
+    def ensure_simple_store(self) -> None:
+        if self.clip is None or self.cfg is None or self.device is None or not self.is_simple_controller_checkpoint():
+            self.simple_store = None
+            self.clear_simple_state()
+            return
+        if self.simple_store is None or self.simple_store.prototype is not self.clip:
+            self.simple_store = ik_ctl.SimpleClipStore([self.clip], self.cfg, self.device)
+        if self.simple_clip_ids is None or self.simple_clip_ids.device != self.device:
+            self.simple_clip_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+
+    def pose_to_simple_state(self, pose: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.ensure_simple_store()
+        if self.simple_store is None:
+            raise RuntimeError("simple controller state requested for a non-simple checkpoint")
+        vec = self.backend().pose_target_output(pose).to(device=self.device, dtype=torch.float32)
+        vec = ik_ctl.clean_output_vector(vec, self.simple_store)
+        return ik_ctl.predicted_state_from_vector(vec, self.simple_store)
+
+    def set_simple_state_from_poses(
+        self,
+        prev_pose: dict[str, torch.Tensor],
+        cur_pose: dict[str, torch.Tensor],
+    ) -> None:
+        if not self.is_simple_controller_checkpoint():
+            self.clear_simple_state()
+            return
+        (
+            self.prev_simple_vec,
+            self.prev_simple_pelvis,
+            self.prev_simple_payload,
+        ) = self.pose_to_simple_state(prev_pose)
+        (
+            self.cur_simple_vec,
+            self.cur_simple_pelvis,
+            self.cur_simple_payload,
+        ) = self.pose_to_simple_state(cur_pose)
+
+    def has_simple_state(self) -> bool:
+        return (
+            self.is_simple_controller_checkpoint()
+            and self.simple_store is not None
+            and self.simple_clip_ids is not None
+            and self.prev_simple_vec is not None
+            and self.cur_simple_vec is not None
+            and self.prev_simple_pelvis is not None
+            and self.cur_simple_pelvis is not None
+            and self.prev_simple_payload is not None
+            and self.cur_simple_payload is not None
+        )
+
+    def advance_simple_state(self, pred_vec: torch.Tensor) -> None:
+        if self.simple_store is None:
+            return
+        self.prev_simple_vec = self.cur_simple_vec
+        self.prev_simple_pelvis = self.cur_simple_pelvis
+        self.prev_simple_payload = self.cur_simple_payload
+        self.cur_simple_vec, self.cur_simple_pelvis, self.cur_simple_payload = ik_ctl.predicted_state_from_vector(
+            pred_vec, self.simple_store
+        )
+
     def load_npz(self, path: Path, cfg: object | None = None) -> None:
         self.ragdoll_overrides.clear()
         self.root_pos_np_cache = None
@@ -592,6 +675,8 @@ class Actor:
         self.cfg.use_torch_compile = False
         self.clip = ik_tl.MotionClip(path, self.cfg)
         self.clip_tensors = None
+        self.simple_store = None
+        self.clear_simple_state()
         self.source_contacts = self.load_source_contacts(path)
         self.status = f"{self.clip.T} frames, {self.clip.J} bones"
 
@@ -637,6 +722,9 @@ class Actor:
             ) from exc
         self.model.eval()
         self.clip_tensors = self.clip.tensors(device)
+        self.simple_store = None
+        self.clear_simple_state()
+        self.ensure_simple_store()
         self.reset_generation()
         self.status = f"on-demand IK model, source {source_npz_path.name}"
 
@@ -713,9 +801,11 @@ class Actor:
                         if len(self.generated_pos) > 1:
                             self.generated_pos[1] = cur_pos[0].detach().cpu().numpy().astype(np.float32)
                             self.generated_rot[1] = cur_rot[0].detach().cpu().numpy().astype(np.float32)
+                    self.set_simple_state_from_poses(self.prev_pose, self.cur_pose)
                     self.refresh_seed_global_pose(0, self.prev_pose, device, 0)
                     self.refresh_seed_global_pose(1, self.cur_pose, device, 1)
             else:
+                self.clear_simple_state()
                 for clip_index in range(first_count):
                     self.generated_pos.append(self.clip.global_pos[clip_index].detach().cpu().numpy().astype(np.float32))
                     self.generated_rot.append(self.clip.global_rot[clip_index].detach().cpu().numpy().astype(np.float32))
@@ -763,6 +853,9 @@ class Actor:
                 self.cur_idx = torch.tensor([seed_cur], dtype=torch.long)
                 self.prev_pose = backend.get_pose_from_clip(self.clip, self.prev_idx, device)
                 self.cur_pose = backend.get_pose_from_clip(self.clip, self.cur_idx, device)
+                self.set_simple_state_from_poses(self.prev_pose, self.cur_pose)
+            else:
+                self.clear_simple_state()
             return seed_cur
 
     def seed_local_pose_at_current_root(
@@ -845,6 +938,7 @@ class Actor:
             self.cur_idx = torch.tensor([frame_i], dtype=torch.long)
             self.prev_pose = prev_pose
             self.cur_pose = cur_pose
+            self.set_simple_state_from_poses(self.prev_pose, self.cur_pose)
             self.generation_target = frame_i
             self.authored_extension_active = bool(extend_authored and not self.controller_active)
             return pose_cur_index
@@ -991,9 +1085,13 @@ class Actor:
             return
         backend = self.backend()
         tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(self.device)
+        simple_mode = self.is_simple_controller_checkpoint()
+        if simple_mode and not self.has_simple_state():
+            self.set_simple_state_from_poses(self.prev_pose, self.cur_pose)
         extend_authored = bool(self.authored_extension_active and not self.controller_active)
         while len(self.generated_pos) <= frame and (self.controller_active or extend_authored or len(self.generated_pos) < self.clip.T):
             target = len(self.generated_pos)
+            pred_vec: torch.Tensor | None = None
             if self.controller_active:
                 target_idx = torch.tensor([target], dtype=torch.long)
                 source_target_idx = torch.tensor([min(target, self.clip.T - 1)], dtype=torch.long, device=self.device)
@@ -1012,18 +1110,45 @@ class Actor:
                 if not self.cfg.cyclic_animation:
                     next_idx = torch.clamp(next_idx, max=self.clip.T - 1)
                 target_idx = next_idx.detach().cpu()
-                root_pos, root_rot, _root_yaw, _heading = backend.root_state(self.clip, next_idx, self.cfg, self.device)
-                inp = backend.build_input(
-                    self.clip,
-                    self.prev_idx,
-                    self.cur_idx,
-                    self.prev_pose,
-                    self.cur_pose,
-                    self.cfg,
-                    self.device,
-                )
-            raw_out = backend.predict_next_raw(self.model, inp, self.cur_pose, self.cfg)
-            pred_pose, _ = backend.output_to_pose(raw_out, self.clip)
+                if simple_mode and self.has_simple_state():
+                    assert self.simple_store is not None
+                    assert self.simple_clip_ids is not None
+                    assert self.prev_simple_vec is not None and self.cur_simple_vec is not None
+                    assert self.prev_simple_pelvis is not None and self.cur_simple_pelvis is not None
+                    assert self.prev_simple_payload is not None and self.cur_simple_payload is not None
+                    root_pos, root_rot, _root_yaw, _heading = self.simple_store.root_state(
+                        self.simple_clip_ids, next_idx
+                    )
+                    inp = ik_ctl.build_controller_input(
+                        self.simple_store,
+                        self.simple_clip_ids,
+                        self.cur_idx.to(self.device),
+                        self.prev_simple_vec,
+                        self.cur_simple_vec,
+                        self.prev_simple_pelvis,
+                        self.cur_simple_pelvis,
+                        self.prev_simple_payload,
+                        self.cur_simple_payload,
+                    )
+                else:
+                    root_pos, root_rot, _root_yaw, _heading = backend.root_state(self.clip, next_idx, self.cfg, self.device)
+                    inp = backend.build_input(
+                        self.clip,
+                        self.prev_idx,
+                        self.cur_idx,
+                        self.prev_pose,
+                        self.cur_pose,
+                        self.cfg,
+                        self.device,
+                    )
+            if simple_mode and self.has_simple_state():
+                assert self.cur_simple_vec is not None and self.simple_store is not None
+                raw_out = ik_ctl.model_forward(self.model, inp, self.cur_simple_vec, self.cfg)
+                pred_vec = ik_ctl.clean_output_vector(raw_out, self.simple_store)
+                pred_pose, _ = backend.output_to_pose(pred_vec, self.clip)
+            else:
+                raw_out = backend.predict_next_raw(self.model, inp, self.cur_pose, self.cfg)
+                pred_pose, _ = backend.output_to_pose(raw_out, self.clip)
             global_pos, global_rot, canon_pos = backend.fk_from_pose(
                 self.clip, root_pos, root_rot, pred_pose, self.device
             )
@@ -1032,6 +1157,8 @@ class Actor:
             self.generated_contacts.append(self.pose_contacts_numpy(pred_pose))
             self.prev_pose = self.cur_pose
             self.cur_pose = self.next_pose_from_prediction(pred_pose, canon_pos)
+            if pred_vec is not None:
+                self.advance_simple_state(pred_vec)
             self.prev_idx = self.cur_idx
             self.cur_idx = target_idx
 
@@ -1294,8 +1421,10 @@ class ModelViewerApp(tk.Tk):
         self.ae_prior_load_attempted = False
         self.ae_prior_error = ""
         self.ae_value_cache: dict[str, object] = {}
+        self.ae_value_display_cache: dict[str, object] = {}
         self.foot_envelope_info: dict[str, object] | None = None
         self.foot_envelope_by_source: dict[str, dict[str, object] | None] = {}
+        self.foot_envelope_store_by_source: dict[str, object] = {}
         self.foot_envelope_load_attempted = False
         self.foot_envelope_error = ""
         self.xinput = load_xinput()
@@ -1842,7 +1971,7 @@ class ModelViewerApp(tk.Tk):
         ttk.Label(content, text="Startup Model Source").pack(anchor=tk.W)
         startup_form = ttk.Frame(content)
         startup_form.pack(fill=tk.X, pady=(8, 6))
-        ttk.Label(startup_form, text="NPZ Path", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Label(startup_form, text="Starting Anim", style="Muted.TLabel").grid(row=0, column=0, sticky=tk.W, pady=3)
         ttk.Entry(startup_form, textvariable=self.startup_npz_path_var).grid(row=0, column=1, sticky=tk.EW, pady=3)
         ttk.Label(startup_form, text="Checkpoint", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=3)
         ttk.Combobox(
@@ -1856,6 +1985,9 @@ class ModelViewerApp(tk.Tk):
         startup_buttons = ttk.Frame(content)
         startup_buttons.pack(fill=tk.X, pady=(0, 4))
         ttk.Button(startup_buttons, text="Browse NPZ...", command=self.browse_startup_npz).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(startup_buttons, text="Use Highlighted", command=self.use_highlighted_startup_npz).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
+        )
         ttk.Button(startup_buttons, text="Use Latest", command=self.use_latest_startup_npz).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0)
         )
@@ -1944,6 +2076,14 @@ class ModelViewerApp(tk.Tk):
             return
         self.startup_npz_path_var.set(str(latest))
         self.settings_status_var.set("Startup NPZ set to latest npz_final file.")
+
+    def use_highlighted_startup_npz(self) -> None:
+        path = self.highlighted_animation_path()
+        if path is None:
+            self.settings_status_var.set("Highlight an animation first.")
+            return
+        self.startup_npz_path_var.set(str(path.resolve()))
+        self.settings_status_var.set(f"Starting anim set to {path.name}.")
 
     def startup_source_npz(self) -> Path | None:
         path_text = self.startup_npz_path_var.get().strip()
@@ -5189,38 +5329,103 @@ class ModelViewerApp(tk.Tk):
             return None
         self.ae_prior_load_attempted = True
         self.ae_prior_error = ""
-        try:
-            candidates = sorted(
-                (path for path in DEFAULT_RUNS_DIR.rglob("*.pt") if "cache" not in path.parts),
-                key=lambda path: path.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError as exc:
-            self.ae_prior_error = str(exc)
-            return None
+        candidates: list[Path] = []
+        for pattern in (
+            "20*_ik*/checkpoints/*current_simple_ae*.pt",
+            "20*_ik*/checkpoints/*simple_ae*.pt",
+            "*/checkpoints/*current_simple_ae*.pt",
+            "*/checkpoints/*simple_ae*.pt",
+        ):
+            try:
+                candidates.extend(DEFAULT_RUNS_DIR.glob(pattern))
+            except OSError:
+                continue
+        if not candidates:
+            stack = [DEFAULT_RUNS_DIR]
+            while stack:
+                folder = stack.pop()
+                try:
+                    children = list(folder.iterdir())
+                except OSError:
+                    continue
+                for child in children:
+                    if "cache" in {part.lower() for part in child.parts}:
+                        continue
+                    try:
+                        if child.is_dir():
+                            stack.append(child)
+                        elif child.suffix.lower() == ".pt":
+                            candidates.append(child)
+                    except OSError:
+                        continue
+        candidates = list(dict.fromkeys(path.resolve() for path in candidates))
+        def candidate_mtime(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
 
-        for path in candidates[:300]:
+        def candidate_sort_key(path: Path) -> tuple[int, float]:
+            lower = str(path).lower()
+            if "current_simple_ae" in lower:
+                priority = 0
+            elif "simple_ae" in lower or "simple-autoencoder" in lower:
+                priority = 1
+            else:
+                priority = 2
+            return (priority, -candidate_mtime(path))
+
+        candidates.sort(key=candidate_sort_key)
+
+        accepted_kinds = {ik_ctl.SIMPLE_CONTROLLER_AE_KIND, ik_ctl.LEGACY_SIMPLE_AE_KIND}
+        for path in candidates[:600]:
             try:
                 ckpt = torch.load(path, map_location="cpu", weights_only=False)
             except Exception:
                 continue
-            schema = ckpt.get("schema") if isinstance(ckpt, dict) else None
-            if not (
-                isinstance(schema, dict)
-                and "total_dim" in schema
-                and "mean" in ckpt
-                and "std" in ckpt
-                and "model" in ckpt
-                and "config" in ckpt
-            ):
+            if not isinstance(ckpt, dict):
                 continue
+            kind = ckpt.get("kind")
+            schema = ckpt.get("schema")
+            if not isinstance(schema, dict) or int(schema.get("window_frames", 1) or 1) != 1:
+                continue
+            if kind not in accepted_kinds:
+                if kind != "ik_ae_research_variant":
+                    continue
+                variant = ckpt.get("variant")
+                if not isinstance(variant, dict) or str(variant.get("name", "")) != "current_simple_ae":
+                    continue
             try:
-                ae_cfg = tae.ae_config_from_dict(ckpt["config"])
-                model = tae.TransitionAutoencoder(int(schema["total_dim"]), ae_cfg, schema)
-                model.load_state_dict(ckpt["model"])
-                model.eval()
-                for param in model.parameters():
-                    param.requires_grad_(False)
+                if kind in accepted_kinds:
+                    model, mean, std, loaded = ik_ctl.load_simple_ae(path, torch.device("cpu"))
+                    ckpt = loaded
+                    schema = dict(ckpt["schema"])
+                else:
+                    variant = ckpt["variant"]
+                    ae_cfg = ik_ctl.SimpleAEConfig(
+                        latent_dim=int(variant.get("latent_dim", 32)),
+                        hidden_dim=int(variant.get("hidden_dim", 512)),
+                        num_hidden_layers=int(variant.get("layers", 2)),
+                    )
+                    model = ik_ctl.SimpleAutoencoder(int(schema["total_dim"]), ae_cfg)
+                    model.load_state_dict(ckpt["model"])
+                    model.eval()
+                    for param in model.parameters():
+                        param.requires_grad_(False)
+                    mean = ckpt["mean"].detach().cpu().float()
+                    std = ckpt["std"].detach().cpu().float().clamp_min(1e-8)
+                schema = dict(schema)
+                if str(schema.get("feature", "")) not in {
+                    "controller_input_plus_target_output",
+                    "1x_controller_input_plus_target_output",
+                }:
+                    continue
+                if "total_dim" not in schema or "input_dim" not in schema:
+                    continue
+                if kind in accepted_kinds:
+                    model.eval()
+                    for param in model.parameters():
+                        param.requires_grad_(False)
                 loco_cfg = ik_tl.TrainConfig()
                 apply_config_dict_generic(loco_cfg, ckpt.get("locomotion_config", {}))
                 if hasattr(loco_cfg, "pose_representation"):
@@ -5229,11 +5434,12 @@ class ModelViewerApp(tk.Tk):
                 self.ae_prior_info = {
                     "path": path,
                     "model": model,
-                    "mean": ckpt["mean"].detach().cpu().float(),
-                    "std": ckpt["std"].detach().cpu().float(),
+                    "mean": mean,
+                    "std": std,
                     "schema": schema,
                     "locomotion_config": loco_cfg,
-                    "compatibility_weight": float(ckpt.get("config", {}).get("compatibility_weight", 0.0) or 0.0),
+                    "kind": kind,
+                    "variant": ckpt.get("variant", {}),
                 }
                 return self.ae_prior_info
             except Exception as exc:
@@ -5415,24 +5621,7 @@ class ModelViewerApp(tk.Tk):
         future_feat = self.ae_future_root_features(actor, cur_idx, cfg, device)
         model_input = torch.cat((current, previous, pelvis_vel, joint_vel, root_feat, future_feat), dim=-1)
         next_output = ik_tl.pose_target_output(next_pose)
-        pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
-        if "ik_payload" in next_pose:
-            joint_next_vel = (next_pose["ik_payload"] - cur_pose["ik_payload"]).reshape(cur_idx.shape[0], -1)
-        else:
-            joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
-        joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
-        parts = [
-            model_input,
-            next_output,
-            next_pose["canon_pos"].reshape(cur_idx.shape[0], -1),
-            pelvis_next_vel,
-            joint_next_vel,
-        ]
-        if getattr(cfg, "include_transition_foot_motion", False):
-            parts.append(self.ae_transition_foot_motion_features(actor, cur_idx, cur_pose, next_pose, cfg, device))
-        if max(0, int(getattr(cfg, "root_lookahead_steps", 0))) > 0:
-            parts.append(self.ae_root_lookahead_features(actor, cur_idx, cfg, device))
-        return torch.cat(parts, dim=-1)
+        return torch.cat((model_input, next_output), dim=-1)
 
     def ae_pose_from_generated_frame(
         self,
@@ -5565,7 +5754,8 @@ class ModelViewerApp(tk.Tk):
                 features = self.ae_transition_feature_from_next_pose(
                     actor, prev_idx, cur_idx, prev_pose, cur_pose, next_pose, cfg, device
                 )
-                total_dim = int(prior["schema"]["total_dim"]) if isinstance(prior.get("schema"), dict) else 0
+                schema = prior.get("schema")
+                total_dim = int(schema["total_dim"]) if isinstance(schema, dict) else 0
                 if total_dim > 0 and int(features.shape[-1]) != total_dim:
                     self.ae_value_cache = {"key": cache_key, "value": None}
                     return None
@@ -5574,11 +5764,15 @@ class ModelViewerApp(tk.Tk):
                 model = prior["model"]
                 x = (features - mean) / std
                 recon = model(x)
-                target = model.target(x) if hasattr(model, "target") else x
-                score = torch.mean((recon - target).square(), dim=-1)
-                compat_weight = float(prior.get("compatibility_weight", 0.0) or 0.0)
-                if compat_weight > 0.0 and hasattr(model, "has_compatibility_head") and model.has_compatibility_head():
-                    score = score + compat_weight * F.softplus(-model.compatibility_logits(x))
+                if isinstance(schema, dict):
+                    output_start = int(schema.get("target_output_start", schema.get("input_dim", 0)))
+                    output_end = int(schema.get("target_output_end", total_dim))
+                else:
+                    output_start = 0
+                    output_end = total_dim
+                output_start = max(0, min(output_start, total_dim))
+                output_end = max(output_start + 1, min(output_end, total_dim))
+                score = torch.mean((recon[:, output_start:output_end] - x[:, output_start:output_end]).square(), dim=-1)
                 value = float(score.mean().detach().cpu())
         except Exception:
             value = None
@@ -5608,7 +5802,11 @@ class ModelViewerApp(tk.Tk):
         accepted_lookup = {
             "animation_dependent_nearest_same_planted_side_foot_ball_points_foot_yaw_no_frame_index",
             "animation_dependent_exact_knn_foot_ball_points_foot_yaw_no_frame_index",
+            "animation_dependent_nearest_same_planted_side_exact_tie_max_foot_ball_points_foot_yaw_no_frame_index",
+            "animation_dependent_nearest_same_planted_side_foot_ball_points_foot_yaw",
         }
+        best_envelope: dict[str, object] | None = None
+        best_score: tuple[int, int, int] | None = None
         for path in candidates:
             try:
                 envelope = torch.load(path, map_location="cpu", weights_only=False)
@@ -5628,8 +5826,20 @@ class ModelViewerApp(tk.Tk):
                     envelope[key] = value.float() if value.is_floating_point() else value
             metadata["cache_path"] = str(path)
             metadata["cache_hit"] = 1
-            self.foot_envelope_info = envelope
-            return envelope
+            clip_features = envelope.get("clip_source_features")
+            clip_count = int(clip_features.shape[0]) if isinstance(clip_features, torch.Tensor) else 0
+            source_count = int(metadata.get("source_transitions", 0) or 0)
+            try:
+                mtime_ns = int(path.stat().st_mtime_ns)
+            except OSError:
+                mtime_ns = 0
+            score = (clip_count, source_count, mtime_ns)
+            if best_score is None or score > best_score:
+                best_envelope = envelope
+                best_score = score
+        if best_envelope is not None:
+            self.foot_envelope_info = best_envelope
+            return best_envelope
         if not self.foot_envelope_error:
             self.foot_envelope_error = "no animation-dependent IK excess envelope cache"
         return None
@@ -5638,26 +5848,21 @@ class ModelViewerApp(tk.Tk):
         if actor.clip is None:
             return self.latest_ik_envelope()
         cfg = self.foot_loss_config_for_actor(actor)
-        clip_path = actor.source_npz_path or actor.npz_path or actor.clip.path
-        try:
-            stat = clip_path.stat()
-            cache_key = (
-                f"{clip_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}:"
-                f"{getattr(cfg, 'future_window', 8)}:{getattr(cfg, 'position_unit_scale', 1.0)}:"
-                f"{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
-            )
-        except OSError:
-            cache_key = f"{actor.actor_id}:{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+        cache_key = self.foot_envelope_cache_key_for_actor(actor, cfg)
         if cache_key in self.foot_envelope_by_source:
             return self.foot_envelope_by_source[cache_key]
         try:
-            store = ik_ctl.SimpleClipStore([actor.clip], cfg, torch.device("cpu"))
+            store = self.ik_envelope_store_for_actor(actor, cfg, torch.device("cpu"))
+            if store is None:
+                self.foot_envelope_by_source[cache_key] = None
+                return None
             envelope = ik_env.load_or_build_excess_envelope(store)
             if not isinstance(envelope, dict):
                 self.foot_envelope_by_source[cache_key] = None
                 return None
             metadata = envelope.get("metadata")
             if isinstance(metadata, dict):
+                clip_path = actor.source_npz_path or actor.npz_path or actor.clip.path
                 metadata["viewer_source_path"] = str(clip_path.resolve())
             for key, value in list(envelope.items()):
                 if isinstance(value, torch.Tensor):
@@ -5669,6 +5874,39 @@ class ModelViewerApp(tk.Tk):
             self.foot_envelope_error = str(exc)
             self.foot_envelope_by_source[cache_key] = None
             return self.latest_ik_envelope()
+
+    def foot_envelope_cache_key_for_actor(self, actor: Actor, cfg: object) -> str:
+        if actor.clip is None:
+            return f"no-clip:{actor.actor_id}:{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+        clip_path = actor.source_npz_path or actor.npz_path or actor.clip.path
+        try:
+            stat = clip_path.stat()
+            return (
+                f"{clip_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}:"
+                f"{getattr(cfg, 'future_window', 8)}:{getattr(cfg, 'position_unit_scale', 1.0)}:"
+                f"{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+            )
+        except OSError:
+            return f"{actor.actor_id}:{getattr(ik_env, 'CACHE_VERSION', 'unknown')}"
+
+    def ik_envelope_store_for_actor(
+        self,
+        actor: Actor,
+        cfg: object,
+        device: torch.device,
+    ) -> object | None:
+        if actor.clip is None:
+            return None
+        cache = getattr(self, "foot_envelope_store_by_source", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.foot_envelope_store_by_source = cache
+        cache_key = f"{self.foot_envelope_cache_key_for_actor(actor, cfg)}:{device}"
+        store = cache.get(cache_key)
+        if store is None:
+            store = ik_ctl.SimpleClipStore([actor.clip], cfg, device)  # type: ignore[arg-type]
+            cache[cache_key] = store
+        return store
 
     def envelope_clip_id_for_actor(self, envelope: dict[str, object], actor: Actor) -> int | None:
         features = envelope.get("clip_source_features")
@@ -5706,6 +5944,22 @@ class ModelViewerApp(tk.Tk):
         )
         return None
 
+    def envelope_flat_frame_index(self, envelope: dict[str, object], actor: Actor, clip_id: int, frame: int) -> torch.Tensor | None:
+        frame_clip_ids = envelope.get("frame_clip_ids")
+        if not isinstance(frame_clip_ids, torch.Tensor) or actor.clip is None:
+            return None
+        rows = (frame_clip_ids.long() == int(clip_id)).nonzero(as_tuple=False).flatten()
+        if rows.numel() <= 0:
+            return None
+        first_valid = int(rows.min().item())
+        offset = max(0, first_valid - 1)
+        if actor.clip.cyclic_animation:
+            logical = int(frame) % max(1, int(actor.clip.cyclic_period))
+        else:
+            logical = max(0, min(int(actor.clip.T) - 1, int(frame)))
+        index = max(0, min(int(frame_clip_ids.numel()) - 1, offset + logical))
+        return torch.tensor([index], dtype=torch.long)
+
     def foot_envelope_values_for_actor(
         self,
         actor: Actor,
@@ -5741,12 +5995,7 @@ class ModelViewerApp(tk.Tk):
             fut_idx = torch.clamp(fut_idx, max=actor.clip.T - 1)
         try:
             with torch.no_grad():
-                prev_pos, _prev_rot, prev_yaw, _prev_heading = self.ae_root_state_for_actor(actor, prev_idx, cfg, device)
-                cur_pos, _cur_rot, _cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
-                fut_pos, _fut_rot, fut_yaw, _fut_heading = self.ae_root_state_for_actor(actor, fut_idx, cfg, device)
-                yaw_delta = ik_tl.wrap_angle(fut_yaw - prev_yaw) / torch.pi
-                bend = ik_env.signed_horizontal_angle(cur_pos - prev_pos, fut_pos - cur_pos) / torch.pi
-                order = (foot_indices[0], toe_indices[0], foot_indices[1], toe_indices[1])
+                order = [foot_indices[0], toe_indices[0], foot_indices[1], toe_indices[1]]
                 cur_pos_t = torch.as_tensor(cur_positions[order][None, :, :], dtype=torch.float32, device=device)
                 cur_rot_t = torch.as_tensor(cur_rotations[order][None, :, :, :], dtype=torch.float32, device=device)
                 next_pos_t = torch.as_tensor(next_positions[order][None, :, :], dtype=torch.float32, device=device)
@@ -5758,20 +6007,57 @@ class ModelViewerApp(tk.Tk):
                     next_rot_t,
                     actor.clip.fps,
                 )
-                foot_dx = cur_pos_t[:, 0, 0] - cur_pos_t[:, 2, 0]
-                foot_dz = cur_pos_t[:, 0, 2] - cur_pos_t[:, 2, 2]
-                foot_distance = torch.sqrt(foot_dx.square() + foot_dz.square() + 1e-12)
-                feature = torch.stack((yaw_delta.reshape(1), bend.reshape(1), foot_distance.reshape(1)), dim=-1)
-                clip_ids = torch.tensor([clip_id], dtype=torch.long, device=device)
-                linear_bound, angular_bound = ik_env._animation_upper_bounds(  # type: ignore[attr-defined]
-                    envelope,  # type: ignore[arg-type]
-                    feature,
-                    clip_ids,
-                    planted,
-                )
-                margin = float(metadata.get("margin", 1.05))
-                linear_bound = linear_bound * margin
-                angular_bound = angular_bound * margin
+                clip_features = envelope.get("clip_source_features")
+                if isinstance(clip_features, torch.Tensor) and int(clip_features.shape[0]) == 1:
+                    store = self.ik_envelope_store_for_actor(actor, cfg, device)
+                    if store is None:
+                        return None
+                    helper_idx = cur_idx
+                    if actor.clip is not None and not actor.clip.cyclic_animation:
+                        helper_idx = torch.clamp(cur_idx, min=1, max=max(1, actor.clip.T - 2))
+                    linear_selected, angular_selected, linear_bound, angular_bound = ik_env.envelope_values_ik_state_rows(
+                        store,  # type: ignore[arg-type]
+                        envelope,  # type: ignore[arg-type]
+                        cur_pos_t,
+                        cur_rot_t,
+                        next_pos_t,
+                        next_rot_t,
+                        torch.tensor([0], dtype=torch.long, device=device),
+                        helper_idx,
+                    )
+                else:
+                    foot_dx = cur_pos_t[:, 0, 0] - cur_pos_t[:, 2, 0]
+                    foot_dz = cur_pos_t[:, 0, 2] - cur_pos_t[:, 2, 2]
+                    foot_distance = torch.sqrt(foot_dx.square() + foot_dz.square() + 1e-12)
+                    if "root_yaw_bend" in envelope:
+                        flat_frame = self.envelope_flat_frame_index(envelope, actor, clip_id, int(cur_idx[0].item()))
+                        root_yaw_bend = envelope["root_yaw_bend"]  # type: ignore[index]
+                        if flat_frame is None or not isinstance(root_yaw_bend, torch.Tensor):
+                            return None
+                        feature = torch.cat(
+                            (
+                                root_yaw_bend.index_select(0, flat_frame.to(root_yaw_bend.device)).to(device=device, dtype=torch.float32),
+                                foot_distance.reshape(1, 1),
+                            ),
+                            dim=-1,
+                        )
+                    else:
+                        prev_pos, _prev_rot, prev_yaw, _prev_heading = self.ae_root_state_for_actor(actor, prev_idx, cfg, device)
+                        cur_pos, _cur_rot, _cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+                        fut_pos, _fut_rot, fut_yaw, _fut_heading = self.ae_root_state_for_actor(actor, fut_idx, cfg, device)
+                        yaw_delta = ik_tl.wrap_angle(fut_yaw - prev_yaw) / torch.pi
+                        bend = ik_env.signed_horizontal_angle(cur_pos - prev_pos, fut_pos - cur_pos) / torch.pi
+                        feature = torch.stack((yaw_delta.reshape(1), bend.reshape(1), foot_distance.reshape(1)), dim=-1)
+                    clip_ids = torch.tensor([clip_id], dtype=torch.long, device=device)
+                    linear_bound, angular_bound = ik_env._animation_upper_bounds(  # type: ignore[attr-defined]
+                        envelope,  # type: ignore[arg-type]
+                        feature,
+                        clip_ids,
+                        planted,
+                    )
+                    margin = float(metadata.get("margin", 1.05))
+                    linear_bound = linear_bound * margin
+                    angular_bound = angular_bound * margin
             return {
                 "slide_speed": float(linear_selected[0].detach().cpu()),
                 "yaw_speed": float(angular_selected[0].detach().cpu()),
@@ -6136,13 +6422,26 @@ class ModelViewerApp(tk.Tk):
         actor = self.ae_overlay_actor(actor_poses)
         if actor is None:
             return ""
+        frame = max(0, int(math.floor(float(self.frame))))
+        generated_count = min(len(actor.generated_pos), len(actor.generated_rot)) if actor.kind == "model" else 0
+        display_key = (actor.actor_id, actor.kind, frame, generated_count)
+        now = time.perf_counter()
+        if self.playing:
+            cached_key = self.ae_value_display_cache.get("key")
+            cached_time = float(self.ae_value_display_cache.get("time", 0.0) or 0.0)
+            cached_text = self.ae_value_display_cache.get("text")
+            if cached_key == display_key[:2] and isinstance(cached_text, str) and now - cached_time < AE_VALUE_REFRESH_SECONDS:
+                return cached_text
         value = self.ae_score_for_actor(actor)
         name = actor.name
         if len(name) > 32:
             name = name[:29] + "..."
         if value is None:
-            return f"ae value n/a\n{name}"
-        return f"ae value {value:.5f}\n{name}"
+            text = f"ae value n/a\n{name}"
+        else:
+            text = f"ae value {value:.5f}\n{name}"
+        self.ae_value_display_cache = {"key": display_key[:2] if self.playing else display_key, "time": now, "text": text}
+        return text
 
     def gl_draw_ae_value_overlay(
         self, width: int, height: int, actor_poses: list[tuple[Actor, np.ndarray, np.ndarray]]
