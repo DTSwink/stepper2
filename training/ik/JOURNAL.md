@@ -193,6 +193,63 @@ Controller cards should stay uncluttered. Normally use:
 Every long run should save `init`, `latest`, `best`, stage checkpoints when K
 changes, and `last` at clean end.
 
+## Pure-RL gait + no-hover run (2026-05-25, v8 -> v14)
+
+Goal: pure RL controller showing gait-like motion on `walkF` and no hover on
+`turn45_L/R`, without imitation or dataset poses driving motion.
+
+What worked (final v14 config):
+
+- Disable kinematic foot clamping in `clean_output_vector` (use
+  `fast_clean_ik_payload` instead of `clamp_clean_ik_payload`) so the planted
+  foot is not dragged by the pelvis. RL terms must then enforce reach.
+- Fix `pelvis_root_horizontal_excess_rows` to use local (X, Y) instead of
+  (X, Z). Local Z is "up" in this IK convention (see `IK_CHARACTER_FORWARD =
+  (0, -1, 0)`). Using (X, Z) silently allowed unbounded local-Y drift.
+- Add `rl_pelvis_height`: penalises absolute deviation of pelvis-local Z from
+  `pelvis_height_target_m` (~0.886, the walkF mean) outside `tolerance_m`.
+  Closes the "crouch to keep planted foot within EE reach" loophole.
+- Add `rl_foot_ceiling`: squared excess above `foot_ceiling_y_m` (use 0.30 m).
+  Without this the optimiser parks one foot permanently in the air. 0.30 m
+  leaves enough headroom for a real swing arc.
+- Raise `foot_floor_loss_weight` to 50 to prevent floor-piercing as a foot-pin
+  shortcut. 5 was not enough.
+- Raise `pelvis_velocity_limit_mps` to 2.5 (walkF root is ~1.98 m/s); 1.34 was
+  too tight and plateaued tracking.
+- Train at `K=64` (rollout horizon ~2 s). At `K=32` the rollout is shorter than
+  the gait cycle (~2 s) and the optimiser settles into asymmetric local
+  minima. Bumping to K=64 immediately exposed the asymmetric "anchor foot"
+  drift as a large `rl_end_effector_location` cost (2.6 at step 1), which the
+  optimiser quickly dissolved into a symmetric gait period.
+
+Final diagnostic at v14 step ~175:
+
+- walkF: gait period l=r=1.98 s, slide <=0.02 m/s, hover_ratio 0.008, pelvis
+  world Y 0.82 m.
+- turn45_L/R: contact_duty l=r=1.0, hover_ratio 0.000, no slide, pelvis world
+  Y 0.84-0.88 m.
+
+Open quirk: walkF dwell asymmetry (left foot in air 77% vs right 23%, both at
+the same period). Period is symmetric; dwell time is not. Not a hover / not a
+slide / not a goal violation. Likely needs an explicit left/right balance term
+if a fully symmetric step duty is required.
+
+Useful diagnostic command (uses 25-bone NPZ pair to match training skeleton):
+
+```text
+python -m training.ik.rl_kin_diagnostic
+  --checkpoint <run>/checkpoints/<run>_latest.pt
+  --npz <walkF> <turnL> <turnR>
+  --cyclic 1 0 0 --frames 120 --contact-threshold-m 0.10
+```
+
+Do not switch to the 77-bone `Walk_Loop_F.npz` mid-run; the diagnostic will
+mismatch the 25-bone training skeleton. Sources used:
+
+- walkF: `stepper/ue5/animations_omni_only/npz_final/M_Neutral_Walk_Loop_F.npz`
+- turn45 L/R:
+  `stepper/ue5/animation_transitions_only_full/npz_final_trimmed/M_Neutral_Stand_Turn_045_{L,R}.npz`
+
 ## Removed / Rejected
 
 - `training/ik/window_buffer_ae_experiment.py` was removed from the active code.

@@ -20,6 +20,11 @@ RL_TERM_NAMES = (
     "rl_pelvis_velocity",
     "rl_pelvis_angular_velocity",
     "rl_core_angular_velocity",
+    "rl_foot_pin",
+    "rl_no_hover",
+    "rl_foot_floor",
+    "rl_foot_ceiling",
+    "rl_pelvis_height",
 )
 
 _LIMIT_TENSOR_CACHE: dict[tuple[tuple[float, ...], str, torch.dtype], torch.Tensor] = {}
@@ -55,6 +60,34 @@ class RLLossConfig:
     pelvis_angular_velocity_limit_deg_s: float = 550.908289
     core_angular_velocity_weight: float = 0.0
     core_angular_velocity_limit_deg_s: float = 315.824318
+    # Foot-pinning / no-hover terms operate on world-space foot positions and use a
+    # purely geometric soft-contact mask (sigmoid of foot height above ground).
+    # No dataset contact labels are used; this is consistent with the IK journal
+    # rule "No contact labels anywhere. Foot losses are geometry/envelope based."
+    foot_pin_weight: float = 0.0
+    foot_pin_height_threshold_m: float = 0.08
+    foot_pin_height_temp_m: float = 0.025
+    foot_pin_speed_floor_mps: float = 0.0
+    no_hover_weight: float = 0.0
+    no_hover_height_threshold_m: float = 0.10
+    no_hover_height_temp_m: float = 0.03
+    foot_floor_weight: float = 0.0
+    foot_floor_y_m: float = 0.0
+    # Foot-ceiling term: penalises a foot whose world-y exceeds a ceiling.
+    # Combined with no_hover and foot_pin this prevents the "kangaroo skip"
+    # local minimum in which one foot stays permanently in the air and the
+    # other shuffles. The squared-excess shape keeps short, low swings cheap
+    # while making sustained high carriage expensive.
+    foot_ceiling_weight: float = 0.0
+    foot_ceiling_y_m: float = 0.15
+    # Pelvis-height-in-root-local term. Closes the "crouch" loophole where the
+    # agent lowers the pelvis (pelvis_local.Z) so the planted foot's distance to
+    # root stays within end_effector_location_limit_m even as it drifts backward
+    # in local-Y. Penalises absolute deviation of pelvis_local.Z from the
+    # target. (Recall: root-local Z is "up" in this IK convention.)
+    pelvis_height_weight: float = 0.0
+    pelvis_height_target_m: float = 0.886
+    pelvis_height_tolerance_m: float = 0.05
     fps: float = 30.0
 
     @property
@@ -73,6 +106,20 @@ class RLLossConfig:
             "pelvis_velocity_weight",
             "pelvis_angular_velocity_weight",
             "core_angular_velocity_weight",
+            "foot_pin_weight",
+            "no_hover_weight",
+            "foot_floor_weight",
+            "foot_ceiling_weight",
+            "pelvis_height_weight",
+        )
+
+    @property
+    def world_foot_enabled(self) -> bool:
+        return (
+            float(self.foot_pin_weight) != 0.0
+            or float(self.no_hover_weight) != 0.0
+            or float(self.foot_floor_weight) != 0.0
+            or float(self.foot_ceiling_weight) != 0.0
         )
 
     def enabled_terms(self) -> tuple[str, ...]:
@@ -95,6 +142,16 @@ class RLLossConfig:
             terms.append("rl_pelvis_angular_velocity")
         if float(self.core_angular_velocity_weight) != 0.0:
             terms.append("rl_core_angular_velocity")
+        if float(self.foot_pin_weight) != 0.0:
+            terms.append("rl_foot_pin")
+        if float(self.no_hover_weight) != 0.0:
+            terms.append("rl_no_hover")
+        if float(self.foot_floor_weight) != 0.0:
+            terms.append("rl_foot_floor")
+        if float(self.foot_ceiling_weight) != 0.0:
+            terms.append("rl_foot_ceiling")
+        if float(self.pelvis_height_weight) != 0.0:
+            terms.append("rl_pelvis_height")
         return tuple(terms)
 
     def to_dict(self) -> dict[str, float]:
@@ -116,10 +173,13 @@ def pelvis_root_horizontal_excess_rows(
     predicted_output: torch.Tensor,
     limit_m: float,
 ) -> torch.Tensor:
-    # The controller output is already root-local; this term measures pelvis
-    # distance from the root in root-local horizontal XZ.
+    # Root-local convention in this IK pipeline: local +Z is "up" (vertical),
+    # local -Y is character forward (see IK_CHARACTER_FORWARD). The horizontal
+    # plane is therefore (X, Y), not (X, Z). Using (X, Z) silently lets the
+    # pelvis drift unbounded along local-Y when the root translates forward,
+    # which is exactly the failure mode this term is meant to prevent.
     pelvis_pos = predicted_output[:, :3]
-    horizontal = torch.linalg.vector_norm(torch.stack((pelvis_pos[:, 0], pelvis_pos[:, 2]), dim=-1), dim=-1)
+    horizontal = torch.linalg.vector_norm(pelvis_pos[:, :2], dim=-1)
     return torch.relu(horizontal - float(limit_m))
 
 
@@ -240,12 +300,136 @@ def angular_velocity_excess_rows(
     return torch.relu(angle * float(fps) - limit_rad_s)
 
 
+def _leg_pos_slices() -> tuple[slice, slice]:
+    leg_specs = tuple(spec for spec in tl.IK_PAYLOAD_SLICES if str(spec["kind"]) == "leg")
+    assert len(leg_specs) == 2, f"expected 2 legs in IK_PAYLOAD_SLICES, got {len(leg_specs)}"
+    left = leg_specs[0]["pos"]
+    right = leg_specs[1]["pos"]
+    assert isinstance(left, slice) and isinstance(right, slice)
+    return left, right
+
+
+def foot_world_positions(
+    output_vec: torch.Tensor,
+    root_pos: torch.Tensor,
+    root_rot: torch.Tensor,
+) -> torch.Tensor:
+    """Return foot world positions, shape (B, 2, 3) ordered (left, right).
+
+    `output_vec` is an IK output vector expressed in the current root frame.
+    Foot positions are read from the IK payload (root-local) and transformed
+    to world via the supplied root transform: world = local @ root_rot + root_pos.
+    """
+
+    payload_start = _payload_start(output_vec)
+    left_slice, right_slice = _leg_pos_slices()
+    left_local = output_vec[:, payload_start + left_slice.start : payload_start + left_slice.stop]
+    right_local = output_vec[:, payload_start + right_slice.start : payload_start + right_slice.stop]
+    local = torch.stack((left_local, right_local), dim=1)
+    world = torch.einsum("blk,bkj->blj", local, root_rot) + root_pos[:, None, :]
+    return world
+
+
+def _soft_contact(height_above_ground: torch.Tensor, threshold_m: float, temp_m: float) -> torch.Tensor:
+    temp = max(float(temp_m), 1e-4)
+    return torch.sigmoid((float(threshold_m) - height_above_ground) / temp)
+
+
+def foot_pin_excess_rows(
+    foot_world_cur: torch.Tensor,
+    foot_world_pred: torch.Tensor,
+    threshold_m: float,
+    temp_m: float,
+    speed_floor_mps: float,
+    fps: float,
+) -> torch.Tensor:
+    """Per-row, per-foot squared horizontal world-velocity weighted by soft contact.
+
+    Returns a tensor shaped (B, 2) holding `c * relu(speed_h - floor)^2` for the
+    left and right foot. `c` is a sigmoid contact mask computed from world-y of
+    `foot_world_cur` (i.e. the foot we *previously* planted is the one we forbid
+    from sliding). `floor` allows ignoring tiny numerical drift below a floor.
+    """
+
+    height_cur = foot_world_cur[..., 1]
+    contact = _soft_contact(height_cur, threshold_m, temp_m)
+    horiz_delta = foot_world_pred[..., (0, 2)] - foot_world_cur[..., (0, 2)]
+    speed_h = torch.linalg.vector_norm(horiz_delta, dim=-1) * float(fps)
+    excess = torch.relu(speed_h - float(speed_floor_mps))
+    return contact * excess.square()
+
+
+def no_hover_excess_rows(
+    foot_world: torch.Tensor,
+    threshold_m: float,
+    temp_m: float,
+) -> torch.Tensor:
+    """Per-row hover penalty: large when BOTH feet are above the contact band.
+
+    Returns a tensor shaped (B,) holding `(1 - c_l) * (1 - c_r)`, computed
+    from `foot_world` (B, 2, 3). Use the predicted next-frame foot world
+    positions so the model is graded on its *committed* next pose.
+    """
+
+    height = foot_world[..., 1]
+    c_l = _soft_contact(height[..., 0], threshold_m, temp_m)
+    c_r = _soft_contact(height[..., 1], threshold_m, temp_m)
+    return (1.0 - c_l) * (1.0 - c_r)
+
+
+def foot_floor_excess_rows(
+    foot_world: torch.Tensor,
+    floor_y_m: float,
+) -> torch.Tensor:
+    """Per-row, per-foot squared distance the foot sinks below `floor_y_m`."""
+
+    below = torch.relu(float(floor_y_m) - foot_world[..., 1])
+    return below.square()
+
+
+def foot_ceiling_excess_rows(
+    foot_world: torch.Tensor,
+    ceiling_y_m: float,
+) -> torch.Tensor:
+    """Per-row, per-foot squared distance the foot rises above `ceiling_y_m`.
+
+    Acts as a soft "max swing height" cap. Without it the optimiser can park
+    one foot permanently in the air and shuffle the other one, satisfying
+    no_hover/foot_pin/EE_location while never walking. Penalising sustained
+    high carriage forces both feet to spend most of the rollout near the
+    ground, which in turn forces alternation when the root keeps translating.
+    """
+
+    above = torch.relu(foot_world[..., 1] - float(ceiling_y_m))
+    return above.square()
+
+
+def pelvis_height_excess_rows(
+    predicted_output: torch.Tensor,
+    target_m: float,
+    tolerance_m: float,
+) -> torch.Tensor:
+    """Per-row deviation of pelvis-local Z (root-local up axis) from a target
+    height, ignoring deviations inside the tolerance band. Returns shape (B,).
+
+    This is the "stand at natural height" constraint. Combined with the foot
+    end_effector_location limit, it forces the agent to lift and swing feet
+    instead of crouching to keep a planted foot within reach.
+    """
+
+    pelvis_z = predicted_output[:, 2]
+    deviation = (pelvis_z - float(target_m)).abs()
+    return torch.relu(deviation - float(tolerance_m))
+
+
 def compute_rl_loss(
     predicted_output: torch.Tensor,
     current_output: torch.Tensor,
     row_weight: torch.Tensor,
     active: torch.Tensor,
     cfg: RLLossConfig,
+    root_pos: torch.Tensor | None = None,
+    root_rot: torch.Tensor | None = None,
 ) -> RLLossResult:
     if not cfg.enabled:
         return zero_result(predicted_output.device, predicted_output.dtype)
@@ -340,6 +524,45 @@ def compute_rl_loss(
     if core_ang_excess.numel() > 0:
         terms["rl_core_angular_velocity"] = (
             (core_ang_excess.square().mean(dim=-1) * weights).sum() * float(cfg.core_angular_velocity_weight)
+        )
+
+    if cfg.world_foot_enabled and root_pos is not None and root_rot is not None:
+        foot_world_cur = foot_world_positions(current_output, root_pos, root_rot)
+        foot_world_pred = foot_world_positions(predicted_output, root_pos, root_rot)
+        if float(cfg.foot_pin_weight) != 0.0:
+            pin_rows = foot_pin_excess_rows(
+                foot_world_cur,
+                foot_world_pred,
+                cfg.foot_pin_height_threshold_m,
+                cfg.foot_pin_height_temp_m,
+                cfg.foot_pin_speed_floor_mps,
+                cfg.fps,
+            )
+            terms["rl_foot_pin"] = (pin_rows.mean(dim=-1) * weights).sum() * float(cfg.foot_pin_weight)
+        if float(cfg.no_hover_weight) != 0.0:
+            hover_rows = no_hover_excess_rows(
+                foot_world_pred,
+                cfg.no_hover_height_threshold_m,
+                cfg.no_hover_height_temp_m,
+            )
+            terms["rl_no_hover"] = (hover_rows * weights).sum() * float(cfg.no_hover_weight)
+        if float(cfg.foot_floor_weight) != 0.0:
+            floor_rows = foot_floor_excess_rows(foot_world_pred, cfg.foot_floor_y_m)
+            terms["rl_foot_floor"] = (floor_rows.mean(dim=-1) * weights).sum() * float(cfg.foot_floor_weight)
+        if float(cfg.foot_ceiling_weight) != 0.0:
+            ceiling_rows = foot_ceiling_excess_rows(foot_world_pred, cfg.foot_ceiling_y_m)
+            terms["rl_foot_ceiling"] = (
+                (ceiling_rows.mean(dim=-1) * weights).sum() * float(cfg.foot_ceiling_weight)
+            )
+
+    if float(cfg.pelvis_height_weight) != 0.0:
+        pelvis_h_rows = pelvis_height_excess_rows(
+            predicted_output,
+            cfg.pelvis_height_target_m,
+            cfg.pelvis_height_tolerance_m,
+        )
+        terms["rl_pelvis_height"] = (
+            (pelvis_h_rows.square() * weights).sum() * float(cfg.pelvis_height_weight)
         )
 
     return RLLossResult(

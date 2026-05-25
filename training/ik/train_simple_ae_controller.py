@@ -17,7 +17,7 @@ try:
     from . import checkpoint_runtime as ckpt_runtime
     from . import excess_envelope as env
     from . import ik_core as tl
-    from .rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
+    from .rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss, foot_world_positions
     from .train_simple_autoencoder import SimpleAEConfig, SimpleAutoencoder
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
@@ -25,7 +25,7 @@ except ImportError:
     import checkpoint_runtime as ckpt_runtime
     import excess_envelope as env
     import ik_core as tl
-    from rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
+    from rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss, foot_world_positions
     from train_simple_autoencoder import SimpleAEConfig, SimpleAutoencoder
 
 ensure_paths()
@@ -1026,8 +1026,13 @@ def clean_output_vector(raw: torch.Tensor, store: SimpleClipStore) -> torch.Tens
     core_dim = store.Jcore * 6
     core_rot6 = fast_clean_6d(raw[:, cursor : cursor + core_dim].reshape(-1, 6)).reshape(b, store.Jcore, 6)
     cursor += core_dim
-    pelvis_rot = tl.rotation_6d_to_matrix(pelvis_rot6)
-    payload = clamp_clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim], store, pelvis_pos, pelvis_rot, core_rot6)
+    # IK end-effector position clamping is intentionally disabled here:
+    # clamping projected the foot back onto the reachable sphere of its leg
+    # base, which forcefully dragged a "planted" foot along with the pelvis
+    # whenever the pelvis moved forward, defeating any foot-pin RL term. We
+    # still clean 6D rotations and pole/toe scalars in `fast_clean_ik_payload`
+    # so the rest of the pose layout stays valid.
+    payload = fast_clean_ik_payload(raw[:, cursor : cursor + store.ik_payload_dim])
     return torch.cat((pelvis_pos, pelvis_rot6, core_rot6.reshape(b, -1), payload), dim=-1)
 
 
@@ -1171,7 +1176,20 @@ def pure_ae_rollout_loss(
             ).sum() * float(identity_pelvis_pos_weight)
         else:
             identity_pelvis_pos_loss = torch.zeros_like(total_loss)
-        rl_loss = compute_rl_loss(pred_vec, cur_output_vec, row_weight, active, rl_cfg)
+        if rl_cfg.world_foot_enabled:
+            cur_root_pos_for_rl, cur_root_rot_for_rl, _yaw_for_rl, _heading_for_rl = store.root_state(clip_ids, cur_idx)
+        else:
+            cur_root_pos_for_rl = None
+            cur_root_rot_for_rl = None
+        rl_loss = compute_rl_loss(
+            pred_vec,
+            cur_output_vec,
+            row_weight,
+            active,
+            rl_cfg,
+            root_pos=cur_root_pos_for_rl,
+            root_rot=cur_root_rot_for_rl,
+        )
         ae_total = ae_total + ae_loss
         identity_total = identity_total + identity_loss
         identity_maxabs_total = identity_maxabs_total + identity_maxabs_loss
@@ -1330,7 +1348,20 @@ def pure_ae_rollout_loss_static(
             ).sum() * float(identity_pelvis_pos_weight)
         else:
             identity_pelvis_pos_loss = torch.zeros_like(total_loss)
-        rl_loss = compute_rl_loss(pred_vec, cur_output_vec, row_weight, active, rl_cfg)
+        if rl_cfg.world_foot_enabled:
+            cur_root_pos_for_rl, cur_root_rot_for_rl, _yaw_for_rl, _heading_for_rl = store.root_state(clip_ids, cur_idx)
+        else:
+            cur_root_pos_for_rl = None
+            cur_root_rot_for_rl = None
+        rl_loss = compute_rl_loss(
+            pred_vec,
+            cur_output_vec,
+            row_weight * active.to(dtype=row_weight.dtype),
+            torch.ones_like(active, dtype=torch.bool),
+            rl_cfg,
+            root_pos=cur_root_pos_for_rl,
+            root_rot=cur_root_rot_for_rl,
+        )
         ae_total = ae_total + ae_loss
         identity_total = identity_total + identity_loss
         identity_maxabs_total = identity_maxabs_total + identity_maxabs_loss
@@ -1632,7 +1663,14 @@ def make_pure_ae_stepper(
 ) -> CudaGraphPureAEStep | EagerPureAEStep:
     # The FK-based identity terms currently allocate small constants inside FK;
     # CUDA graph capture forbids that, so keep this diagnostic loss on eager.
-    if store.device.type == "cuda" and float(identity_world_pos_weight) == 0.0:
+    # The world-foot RL terms (foot pin / no-hover / foot floor) need
+    # store.root_state per step and call into torch ops that have not been
+    # graph-tested; keep them on eager too.
+    if (
+        store.device.type == "cuda"
+        and float(identity_world_pos_weight) == 0.0
+        and not rl_cfg.world_foot_enabled
+    ):
         return CudaGraphPureAEStep(
             model,
             optimizer,
@@ -1883,6 +1921,34 @@ def main() -> None:
     parser.add_argument("--pelvis-angular-velocity-limit-deg-s", type=float, default=RLLossConfig().pelvis_angular_velocity_limit_deg_s)
     parser.add_argument("--core-angular-velocity-loss-weight", type=float, default=0.0)
     parser.add_argument("--core-angular-velocity-limit-deg-s", type=float, default=RLLossConfig().core_angular_velocity_limit_deg_s)
+    parser.add_argument("--foot-pin-loss-weight", type=float, default=0.0,
+                        help="Weight for soft-contact-masked foot world-velocity penalty (pinned foot must not slide).")
+    parser.add_argument("--foot-pin-height-threshold-m", type=float, default=RLLossConfig().foot_pin_height_threshold_m,
+                        help="World-y of the foot bone at which soft contact = 0.5.")
+    parser.add_argument("--foot-pin-height-temp-m", type=float, default=RLLossConfig().foot_pin_height_temp_m,
+                        help="Sigmoid temperature (meters) for the soft contact mask.")
+    parser.add_argument("--foot-pin-speed-floor-mps", type=float, default=RLLossConfig().foot_pin_speed_floor_mps,
+                        help="Foot horizontal world speed (m/s) below which slide is not penalised.")
+    parser.add_argument("--no-hover-loss-weight", type=float, default=0.0,
+                        help="Weight for the both-feet-off-the-ground hover penalty.")
+    parser.add_argument("--no-hover-height-threshold-m", type=float, default=RLLossConfig().no_hover_height_threshold_m,
+                        help="World-y where the per-foot contact-band sigmoid is at 0.5 for the no-hover term.")
+    parser.add_argument("--no-hover-height-temp-m", type=float, default=RLLossConfig().no_hover_height_temp_m,
+                        help="Sigmoid temperature (meters) for the no-hover soft mask.")
+    parser.add_argument("--foot-floor-loss-weight", type=float, default=0.0,
+                        help="Weight for penalising foot world-y dipping below the floor plane.")
+    parser.add_argument("--foot-floor-y-m", type=float, default=RLLossConfig().foot_floor_y_m,
+                        help="World-y of the floor plane (default 0).")
+    parser.add_argument("--foot-ceiling-loss-weight", type=float, default=0.0,
+                        help="Weight for penalising foot world-y above the ceiling height (caps swing height).")
+    parser.add_argument("--foot-ceiling-y-m", type=float, default=RLLossConfig().foot_ceiling_y_m,
+                        help="World-y of the foot ceiling (default 0.15m). Feet rising above this are penalised.")
+    parser.add_argument("--pelvis-height-loss-weight", type=float, default=0.0,
+                        help="Weight for penalising deviation of pelvis-local Z (root-local up axis) from the target height.")
+    parser.add_argument("--pelvis-height-target-m", type=float, default=RLLossConfig().pelvis_height_target_m,
+                        help="Target pelvis-local Z (m) for the pelvis-height constraint. Default is walkF mean (~0.886).")
+    parser.add_argument("--pelvis-height-tolerance-m", type=float, default=RLLossConfig().pelvis_height_tolerance_m,
+                        help="Tolerance band around the pelvis-height target before the penalty engages.")
     args = parser.parse_args()
 
     if args.rollout_schedule is not None:
@@ -1950,6 +2016,20 @@ def main() -> None:
         pelvis_angular_velocity_limit_deg_s=float(args.pelvis_angular_velocity_limit_deg_s),
         core_angular_velocity_weight=float(args.core_angular_velocity_loss_weight),
         core_angular_velocity_limit_deg_s=float(args.core_angular_velocity_limit_deg_s),
+        foot_pin_weight=float(args.foot_pin_loss_weight),
+        foot_pin_height_threshold_m=float(args.foot_pin_height_threshold_m),
+        foot_pin_height_temp_m=float(args.foot_pin_height_temp_m),
+        foot_pin_speed_floor_mps=float(args.foot_pin_speed_floor_mps),
+        no_hover_weight=float(args.no_hover_loss_weight),
+        no_hover_height_threshold_m=float(args.no_hover_height_threshold_m),
+        no_hover_height_temp_m=float(args.no_hover_height_temp_m),
+        foot_floor_weight=float(args.foot_floor_loss_weight),
+        foot_floor_y_m=float(args.foot_floor_y_m),
+        foot_ceiling_weight=float(args.foot_ceiling_loss_weight),
+        foot_ceiling_y_m=float(args.foot_ceiling_y_m),
+        pelvis_height_weight=float(args.pelvis_height_loss_weight),
+        pelvis_height_target_m=float(args.pelvis_height_target_m),
+        pelvis_height_tolerance_m=float(args.pelvis_height_tolerance_m),
         fps=float(cfg.fps),
     )
     identity_enabled = (
