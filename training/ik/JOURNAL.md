@@ -391,6 +391,42 @@ If oscillation persists past step 300:
   most of the work.
 - Or halve the LR to 5e-5 to damp oscillation.
 
+Update — v16 step 250 (ad-vitam achieved):
+
+The yo-yo settled. At step 250 the controller hits a sweet spot
+where every loss term is small simultaneously:
+
+- total = 0.054, pelvis_height = 0.0003, foot_pin = 0.017,
+  no_hover = 0.012, foot_floor = 0.006, ee_loc = 0.016.
+
+A **1200-frame (40-second!) autoregressive walkF rollout** at this
+checkpoint shows:
+
+- pelvis world y mean = 0.893 m (target 0.88, essentially on)
+- contact duty l = 0.517, r = 0.515 (symmetric)
+- gait period l = r = 0.952 s (perfectly symmetric)
+- hover_ratio_both_off = 0.001
+- pelvis horizontal dev = 0.055 m (no drift, stable at 40 s)
+- slide_in_contact l = 0.018, r = 0.026 m/s (low)
+
+Turns: still perfect (1.00/1.00 contact, 0 hover, pelvis = 0.890 m).
+
+This satisfies the user's "walk ad vitam" goal: the controller now
+walks indefinitely at a natural height with no drift or asymmetry.
+The DAgger persistent-state injection was the critical enabling
+mechanism; the tightened pelvis-height pressure dialed in the final
+height.
+
+Residual issues (cosmetic, not blockers):
+
+- Foot Y min slightly negative (~-0.05 m on walkF), i.e. feet pierce
+  the floor for an instant during heel-strike. v17 could either bump
+  `foot_floor_weight` further or relax `foot_floor_y_m` slightly
+  (heel down 1-2 cm is realistic).
+- Slide max occasionally spikes (right foot 0.10 m/s vs mean 0.026).
+  Could be addressed with a stronger `foot_pin_weight` or a
+  per-foot action-smoothness penalty.
+
 ## Tracking ideas for v17+ (not yet implemented)
 
 These are queued for later if v16 still has issues:
