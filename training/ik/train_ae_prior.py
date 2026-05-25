@@ -3668,8 +3668,8 @@ def main() -> None:
         action="store_true",
         help="Synchronize CUDA around timed sections for stricter timing. Slower, but more precise.",
     )
-    parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--contact-physics-losses",
         dest="contact_physics_losses",

@@ -36,6 +36,7 @@ if str(IK_DIR) not in sys.path:
 
 import ik_core as ik_tl
 tl = ik_tl
+from ik import checkpoint_runtime as ik_runtime
 from ik import contact_physics as cp
 from ik import excess_envelope as ik_env
 from ik import train_simple_ae_controller as ik_ctl
@@ -293,12 +294,7 @@ def checkpoint_uses_ik(path: Path) -> bool:
         return False
     if not isinstance(ckpt, dict):
         return False
-    config = ckpt.get("config", {})
-    metadata = ckpt.get("metadata", {})
-    for values in (config, metadata):
-        if isinstance(values, dict) and ik_tl.uses_ik_markers(values.get("pose_representation", "")):
-            return True
-    return False
+    return ik_runtime.checkpoint_uses_ik(ckpt)
 
 
 def load_controller_model(
@@ -537,12 +533,8 @@ class Actor:
     def backend(self):
         return ik_tl
 
-    def is_simple_controller_checkpoint(self) -> bool:
-        if not isinstance(self.checkpoint, dict):
-            return False
-        metadata = self.checkpoint.get("metadata", {})
-        policy = metadata.get("policy", {}) if isinstance(metadata, dict) else {}
-        return isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction"
+    def is_current_ik_controller_checkpoint(self) -> bool:
+        return ik_runtime.is_current_ik_controller_checkpoint(self.checkpoint)
 
     def has_initial_pelvis_offset(self) -> bool:
         return bool(np.linalg.norm(self.initial_pelvis_offset) > 1e-7)
@@ -603,7 +595,7 @@ class Actor:
         self.cur_simple_payload = None
 
     def ensure_simple_store(self) -> None:
-        if self.clip is None or self.cfg is None or self.device is None or not self.is_simple_controller_checkpoint():
+        if self.clip is None or self.cfg is None or self.device is None or not self.is_current_ik_controller_checkpoint():
             self.simple_store = None
             self.clear_simple_state()
             return
@@ -615,7 +607,7 @@ class Actor:
     def pose_to_simple_state(self, pose: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.ensure_simple_store()
         if self.simple_store is None:
-            raise RuntimeError("simple controller state requested for a non-simple checkpoint")
+            raise RuntimeError("current IK controller state requested for an unsupported checkpoint")
         vec = self.backend().pose_target_output(pose).to(device=self.device, dtype=torch.float32)
         vec = ik_ctl.clean_output_vector(vec, self.simple_store)
         return ik_ctl.predicted_state_from_vector(vec, self.simple_store)
@@ -625,7 +617,7 @@ class Actor:
         prev_pose: dict[str, torch.Tensor],
         cur_pose: dict[str, torch.Tensor],
     ) -> None:
-        if not self.is_simple_controller_checkpoint():
+        if not self.is_current_ik_controller_checkpoint():
             self.clear_simple_state()
             return
         (
@@ -641,7 +633,7 @@ class Actor:
 
     def has_simple_state(self) -> bool:
         return (
-            self.is_simple_controller_checkpoint()
+            self.is_current_ik_controller_checkpoint()
             and self.simple_store is not None
             and self.simple_clip_ids is not None
             and self.prev_simple_vec is not None
@@ -661,6 +653,23 @@ class Actor:
         self.cur_simple_vec, self.cur_simple_pelvis, self.cur_simple_payload = ik_ctl.predicted_state_from_vector(
             pred_vec, self.simple_store
         )
+
+    def build_current_ik_controller_input(self) -> torch.Tensor:
+        self.ensure_simple_store()
+        if not self.has_simple_state():
+            raise RuntimeError("current IK controller input requested without initialized vector state")
+        assert self.cfg is not None
+        assert self.cur_idx is not None
+        assert self.prev_simple_vec is not None and self.cur_simple_vec is not None
+        assert self.prev_simple_pelvis is not None and self.cur_simple_pelvis is not None
+        assert self.prev_simple_payload is not None and self.cur_simple_payload is not None
+        pelvis_vel = (self.cur_simple_pelvis - self.prev_simple_pelvis) / self.cfg.pose_delta_scale_final
+        payload_vel = (
+            self.cur_simple_payload - self.prev_simple_payload
+        ).reshape(self.cur_idx.shape[0], -1) / self.cfg.pose_delta_scale_final
+        root_feat = self.controller_root_delta_feature()
+        future_feat = self.controller_future_root_features()
+        return torch.cat((self.cur_simple_vec, self.prev_simple_vec, pelvis_vel, payload_vel, root_feat, future_feat), dim=-1)
 
     def load_npz(self, path: Path, cfg: object | None = None) -> None:
         self.ragdoll_overrides.clear()
@@ -702,6 +711,7 @@ class Actor:
         self.ik_mode = True
         backend = self.backend()
         self.checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ik_runtime.require_current_ik_controller_checkpoint(self.checkpoint, checkpoint_path)
         self.cfg = backend.TrainConfig()
         apply_config_dict_generic(self.cfg, self.checkpoint.get("config", {}))
         if hasattr(self.cfg, "pose_representation"):
@@ -1085,8 +1095,8 @@ class Actor:
             return
         backend = self.backend()
         tensors = self.clip_tensors if self.clip_tensors is not None else self.clip.tensors(self.device)
-        simple_mode = self.is_simple_controller_checkpoint()
-        if simple_mode and not self.has_simple_state():
+        ik_runtime.require_current_ik_controller_checkpoint(self.checkpoint, self.checkpoint_path)
+        if not self.has_simple_state():
             self.set_simple_state_from_poses(self.prev_pose, self.cur_pose)
         extend_authored = bool(self.authored_extension_active and not self.controller_active)
         while len(self.generated_pos) <= frame and (self.controller_active or extend_authored or len(self.generated_pos) < self.clip.T):
@@ -1097,58 +1107,40 @@ class Actor:
                 source_target_idx = torch.tensor([min(target, self.clip.T - 1)], dtype=torch.long, device=self.device)
                 root_pos = tensors["root_pos"].index_select(0, source_target_idx)
                 root_rot = tensors["root_rot"].index_select(0, source_target_idx)
-                inp = self.build_controller_input()
+                inp = self.build_current_ik_controller_input()
             elif extend_authored:
                 prev_frame = int(self.prev_idx.reshape(-1)[0].item())
                 cur_frame = int(self.cur_idx.reshape(-1)[0].item())
                 target_idx = torch.tensor([cur_frame + 1], dtype=torch.long)
                 self.set_authored_extension_root_plan(prev_frame, cur_frame)
                 root_pos, root_rot, _root_yaw, _heading = self.authored_root_state(cur_frame + 1, self.device, True)
-                inp = self.build_controller_input()
+                inp = self.build_current_ik_controller_input()
             else:
                 next_idx = self.cur_idx.to(self.device) + 1
                 if not self.cfg.cyclic_animation:
                     next_idx = torch.clamp(next_idx, max=self.clip.T - 1)
                 target_idx = next_idx.detach().cpu()
-                if simple_mode and self.has_simple_state():
-                    assert self.simple_store is not None
-                    assert self.simple_clip_ids is not None
-                    assert self.prev_simple_vec is not None and self.cur_simple_vec is not None
-                    assert self.prev_simple_pelvis is not None and self.cur_simple_pelvis is not None
-                    assert self.prev_simple_payload is not None and self.cur_simple_payload is not None
-                    root_pos, root_rot, _root_yaw, _heading = self.simple_store.root_state(
-                        self.simple_clip_ids, next_idx
-                    )
-                    inp = ik_ctl.build_controller_input(
-                        self.simple_store,
-                        self.simple_clip_ids,
-                        self.cur_idx.to(self.device),
-                        self.prev_simple_vec,
-                        self.cur_simple_vec,
-                        self.prev_simple_pelvis,
-                        self.cur_simple_pelvis,
-                        self.prev_simple_payload,
-                        self.cur_simple_payload,
-                    )
-                else:
-                    root_pos, root_rot, _root_yaw, _heading = backend.root_state(self.clip, next_idx, self.cfg, self.device)
-                    inp = backend.build_input(
-                        self.clip,
-                        self.prev_idx,
-                        self.cur_idx,
-                        self.prev_pose,
-                        self.cur_pose,
-                        self.cfg,
-                        self.device,
-                    )
-            if simple_mode and self.has_simple_state():
-                assert self.cur_simple_vec is not None and self.simple_store is not None
-                raw_out = ik_ctl.model_forward(self.model, inp, self.cur_simple_vec, self.cfg)
-                pred_vec = ik_ctl.clean_output_vector(raw_out, self.simple_store)
-                pred_pose, _ = backend.output_to_pose(pred_vec, self.clip)
-            else:
-                raw_out = backend.predict_next_raw(self.model, inp, self.cur_pose, self.cfg)
-                pred_pose, _ = backend.output_to_pose(raw_out, self.clip)
+                assert self.simple_store is not None
+                assert self.simple_clip_ids is not None
+                assert self.prev_simple_vec is not None and self.cur_simple_vec is not None
+                assert self.prev_simple_pelvis is not None and self.cur_simple_pelvis is not None
+                assert self.prev_simple_payload is not None and self.cur_simple_payload is not None
+                root_pos, root_rot, _root_yaw, _heading = self.simple_store.root_state(self.simple_clip_ids, next_idx)
+                inp = ik_ctl.build_controller_input(
+                    self.simple_store,
+                    self.simple_clip_ids,
+                    self.cur_idx.to(self.device),
+                    self.prev_simple_vec,
+                    self.cur_simple_vec,
+                    self.prev_simple_pelvis,
+                    self.cur_simple_pelvis,
+                    self.prev_simple_payload,
+                    self.cur_simple_payload,
+                )
+            assert self.cur_simple_vec is not None and self.simple_store is not None
+            raw_out = ik_ctl.model_forward(self.model, inp, self.cur_simple_vec, self.cfg)
+            pred_vec = ik_ctl.clean_output_vector(raw_out, self.simple_store)
+            pred_pose, _ = backend.output_to_pose(pred_vec, self.clip)
             global_pos, global_rot, canon_pos = backend.fk_from_pose(
                 self.clip, root_pos, root_rot, pred_pose, self.device
             )

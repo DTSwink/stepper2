@@ -79,8 +79,8 @@ class TrainConfig:
     save_last_every_epochs: int = 5
     save_best_every_epochs: int = 0
     writer_flush_every_epochs: int = 5
-    predict_residual: bool = True
-    zero_init_output: bool = True
+    predict_residual: bool = False
+    zero_init_output: bool = False
     target_loss_reduction: float = 0.98
     stop_at_target_loss_reduction: bool = False
     max_train_seconds: float = 0.0

@@ -9,11 +9,15 @@ from pathlib import Path
 import torch
 
 try:
+    from . import checkpoint_runtime as ckpt_runtime
     from . import contact_physics as cp
     from . import ik_core as tl
+    from . import train_simple_ae_controller as simple_ctl
 except ImportError:
+    import checkpoint_runtime as ckpt_runtime
     import contact_physics as cp
     import ik_core as tl
+    import train_simple_ae_controller as simple_ctl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -53,11 +57,13 @@ def load_model(checkpoint_path: Path, clip: tl.MotionClip, device: torch.device)
 @torch.no_grad()
 def rollout_autoreg(
     model: torch.nn.Module,
+    checkpoint: dict,
     clip: tl.MotionClip,
     cfg: tl.TrainConfig,
     device: torch.device,
     frame_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    ckpt_runtime.require_current_ik_controller_checkpoint(checkpoint)
     pred_pos = torch.zeros((frame_count, clip.J, 3), dtype=torch.float32, device=device)
     pred_rot = torch.zeros((frame_count, clip.J, 3, 3), dtype=torch.float32, device=device)
     gt_pos = clip.global_pos[:frame_count].to(device)
@@ -65,23 +71,36 @@ def rollout_autoreg(
     pred_pos[:2] = gt_pos[:2]
     pred_rot[:2] = gt_rot[:2]
 
-    prev_idx = torch.tensor([0], dtype=torch.long, device=device)
+    store = simple_ctl.SimpleClipStore([clip], cfg, device)
+    clip_ids = torch.zeros(1, dtype=torch.long, device=device)
     cur_idx = torch.tensor([1], dtype=torch.long, device=device)
-    prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
-    cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
+    prev_vec, prev_pelvis, prev_payload = simple_ctl.target_state(store, clip_ids, cur_idx - 1)
+    cur_vec, cur_pelvis, cur_payload = simple_ctl.target_state(store, clip_ids, cur_idx)
 
     for target in range(2, frame_count):
         target_idx = torch.tensor([target], dtype=torch.long, device=device)
-        root_pos, root_rot, _root_yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
-        inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
-        raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
-        pred_pose, _raw_pose = tl.output_to_pose(raw_out, clip)
+        root_pos, root_rot, _root_yaw, _heading = store.root_state(clip_ids, target_idx)
+        inp = simple_ctl.build_controller_input(
+            store,
+            clip_ids,
+            cur_idx,
+            prev_vec,
+            cur_vec,
+            prev_pelvis,
+            cur_pelvis,
+            prev_payload,
+            cur_payload,
+        )
+        raw_out = simple_ctl.model_forward(model, inp, cur_vec, cfg)
+        pred_vec = simple_ctl.clean_output_vector(raw_out, store)
+        pred_pose, _raw_pose = tl.output_to_pose(pred_vec, clip)
         global_pos, global_rot, canon_pos = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
         pred_pos[target] = global_pos[0]
         pred_rot[target] = global_rot[0]
-        prev_pose = cur_pose
-        cur_pose = tl.next_pose_from_prediction(pred_pose, canon_pos)
-        prev_idx = cur_idx
+        prev_vec = cur_vec
+        prev_pelvis = cur_pelvis
+        prev_payload = cur_payload
+        cur_vec, cur_pelvis, cur_payload = simple_ctl.predicted_state_from_vector(pred_vec, store)
         cur_idx = target_idx
     return pred_pos, pred_rot
 
@@ -301,8 +320,8 @@ def main() -> None:
         cfg = tl.TrainConfig()
         apply_config_dict(cfg, torch.load(checkpoint_path, map_location="cpu", weights_only=False).get("config", {}))
         clip_for_model = tl.MotionClip(npz_path, cfg)
-        model, cfg, _ckpt = load_model(checkpoint_path, clip_for_model, device)
-        pred_pos, pred_rot = rollout_autoreg(model, clip_for_model, cfg, device, frame_count)
+        model, cfg, ckpt = load_model(checkpoint_path, clip_for_model, device)
+        pred_pos, pred_rot = rollout_autoreg(model, ckpt, clip_for_model, cfg, device, frame_count)
         pred_slide, pred_height = foot_series(pred_pos, pred_rot, clip_for_model)
         rows.append(summarize(f"{label} [full]", pred_slide, pred_height, gt_slide, gt_height, source_contacts))
         if safe_frame_count < frame_count:

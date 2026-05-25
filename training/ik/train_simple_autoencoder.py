@@ -104,8 +104,8 @@ def make_locomotion_cfg(device: torch.device) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     cfg.pose_representation = tl.IK_POSE_REPRESENTATION
     cfg.cyclic_animation = True
-    cfg.predict_residual = True
-    cfg.zero_init_output = True
+    cfg.predict_residual = False
+    cfg.zero_init_output = False
     cfg.live_viewer = False
     cfg.visual_reporter = False
     cfg.update_comparison_on_exit = False

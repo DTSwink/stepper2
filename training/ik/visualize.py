@@ -18,9 +18,13 @@ import torch
 
 try:
     from . import ik_core as tl
+    from . import checkpoint_runtime as ckpt_runtime
+    from . import excess_envelope as env
     from . import train_simple_ae_controller as simple_ctl
 except ImportError:
     import ik_core as tl
+    import checkpoint_runtime as ckpt_runtime
+    import excess_envelope as env
     import train_simple_ae_controller as simple_ctl
 
 
@@ -50,6 +54,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       --volume: rgba(223, 203, 186, 0.30);
       --volume-line: rgba(255, 238, 222, 0.48);
       --foot: rgba(236, 218, 202, 0.40);
+      --foot-pinned: #ff6464;
+      --foot-pinned-fill: rgba(255, 78, 78, 0.40);
+      --foot-unpinned: #55d67f;
+      --foot-unpinned-fill: rgba(85, 214, 127, 0.32);
     }}
     * {{ box-sizing: border-box; }}
     html, body {{ margin: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg); }}
@@ -129,6 +137,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         <div class="pill"><span id="boneCountText">{bone_count}</span> bones</div>
         <div class="pill"><span class="legend-dot" style="background:var(--gt)"></span>ground truth</div>
         <div class="pill"><span class="legend-dot" style="background:var(--pred)"></span>model <strong id="rolloutText">autoregressive</strong></div>
+        <div class="pill"><span class="legend-dot" style="background:var(--foot-pinned)"></span>pinned <span class="legend-dot" style="background:var(--foot-unpinned); margin-left:8px"></span>unpinned</div>
         <div class="pill">mean joint error <strong id="errText">0.000</strong> m</div>
       </div>
       <div id="tooltip"></div>
@@ -159,6 +168,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       item.predArBasis = new Float32Array(Uint8Array.from(atob(item.pred_ar_basis_b64), c => c.charCodeAt(0)).buffer);
       item.errOne = new Float32Array(Uint8Array.from(atob(item.err_one_step_b64), c => c.charCodeAt(0)).buffer);
       item.errAr = new Float32Array(Uint8Array.from(atob(item.err_ar_b64), c => c.charCodeAt(0)).buffer);
+      item.pinnedGt = new Int8Array(Uint8Array.from(atob(item.pinned_gt_b64), c => c.charCodeAt(0)).buffer);
+      item.pinnedOne = new Int8Array(Uint8Array.from(atob(item.pinned_one_step_b64), c => c.charCodeAt(0)).buffer);
+      item.pinnedAr = new Int8Array(Uint8Array.from(atob(item.pinned_ar_b64), c => c.charCodeAt(0)).buffer);
       delete item.gt_b64;
       delete item.gt_basis_b64;
       delete item.pred_one_step_b64;
@@ -167,6 +179,9 @@ HTML_TEMPLATE = r"""<!doctype html>
       delete item.pred_ar_basis_b64;
       delete item.err_one_step_b64;
       delete item.err_ar_b64;
+      delete item.pinned_gt_b64;
+      delete item.pinned_one_step_b64;
+      delete item.pinned_ar_b64;
     }}
 
     const canvas = document.getElementById("canvas");
@@ -262,8 +277,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         ["pelvis", "thigh_r", 9.5], ["thigh_r", "calf_r", 8.3], ["calf_r", "foot_r", 6.2]
       ].map(([a, b, r]) => ({{ a: nameToIndex.get(a), b: nameToIndex.get(b), r }})).filter(v => v.a !== undefined && v.b !== undefined);
       footSpecs = [
-        {{ ankle: nameToIndex.get("foot_l"), toe: nameToIndex.get("ball_l") }},
-        {{ ankle: nameToIndex.get("foot_r"), toe: nameToIndex.get("ball_r") }}
+        {{ ankle: nameToIndex.get("foot_l"), toe: nameToIndex.get("ball_l"), side: 0 }},
+        {{ ankle: nameToIndex.get("foot_r"), toe: nameToIndex.get("ball_r"), side: 1 }}
       ].filter(v => v.ankle !== undefined && v.toe !== undefined);
       handSpecs = [
         {{ bone: nameToIndex.get("hand_l"), mid: nameToIndex.get("middle_03_l") }},
@@ -416,7 +431,7 @@ HTML_TEMPLATE = r"""<!doctype html>
       ctx.restore();
     }}
 
-    function drawFootBlock(arr, basis, ankle, toe, offsetX, color, alpha) {{
+    function footBlockSpec(arr, basis, ankle, toe, offsetX) {{
       const foot = posAt(arr, frame, ankle, offsetX);
       const toePos = posAt(arr, frame, toe, offsetX);
       let up = basisAxisAt(basis, frame, ankle, 0);
@@ -433,11 +448,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       const ballBack = add3(toePos, mul3(forward, -ballDistance));
       const heelBack = add3(ballBack, mul3(forward, -heelLength));
       const c = add3(add3(heelBack, mul3(forward, length * 0.5)), mul3(up, -0.006));
-      drawOrientedBox(c, forward, sideAxis, up, [length, width, height], color, getComputedStyle(document.documentElement).getPropertyValue("--foot").trim(), alpha);
-      drawAxisTick(c, forward, length * 0.5, color);
+      return {{ center: c, forward, sideAxis, up, dims: [length, width, height] }};
     }}
 
-    function drawToeBlock(arr, basis, ankle, toe, offsetX, color, alpha) {{
+    function toeBlockSpec(arr, basis, ankle, toe, offsetX) {{
       const foot = posAt(arr, frame, ankle, offsetX);
       const toePos = posAt(arr, frame, toe, offsetX);
       let forward = basisAxisAt(basis, frame, toe, 0);
@@ -448,8 +462,38 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (up[1] < 0) up = mul3(up, -1);
       const toeLength = 0.065;
       const c = add3(add3(toePos, mul3(forward, toeLength * 0.5)), mul3(up, -0.006));
-      drawOrientedBox(c, forward, sideAxis, up, [toeLength, 0.11, 0.064], color, "rgba(236, 218, 202, 0.34)", alpha);
-      drawAxisTick(c, forward, toeLength * 0.5, color);
+      return {{ center: c, forward, sideAxis, up, dims: [toeLength, 0.11, 0.064] }};
+    }}
+
+    function colliderBottomY(spec) {{
+      return spec.center[1] - Math.abs(spec.up[1]) * spec.dims[2] * 0.5;
+    }}
+
+    function pinnedFootSide(arr, basis, offsetX) {{
+      let bestSide = -1;
+      let bestY = Infinity;
+      for (const f of footSpecs) {{
+        const footSpec = footBlockSpec(arr, basis, f.ankle, f.toe, offsetX);
+        const toeSpec = toeBlockSpec(arr, basis, f.ankle, f.toe, offsetX);
+        const y = Math.min(colliderBottomY(footSpec), colliderBottomY(toeSpec));
+        if (y < bestY) {{
+          bestY = y;
+          bestSide = f.side;
+        }}
+      }}
+      return bestSide;
+    }}
+
+    function drawFootBlock(arr, basis, ankle, toe, offsetX, color, fill, alpha) {{
+      const spec = footBlockSpec(arr, basis, ankle, toe, offsetX);
+      drawOrientedBox(spec.center, spec.forward, spec.sideAxis, spec.up, spec.dims, color, fill, alpha);
+      drawAxisTick(spec.center, spec.forward, spec.dims[0] * 0.5, color);
+    }}
+
+    function drawToeBlock(arr, basis, ankle, toe, offsetX, color, fill, alpha) {{
+      const spec = toeBlockSpec(arr, basis, ankle, toe, offsetX);
+      drawOrientedBox(spec.center, spec.forward, spec.sideAxis, spec.up, spec.dims, color, fill, alpha);
+      drawAxisTick(spec.center, spec.forward, spec.dims[0] * 0.5, color);
     }}
 
     function drawHandBox(arr, basis, spec, offsetX, color, alpha) {{
@@ -468,14 +512,21 @@ HTML_TEMPLATE = r"""<!doctype html>
       drawAxisTick(c, forward, 0.08, color);
     }}
 
-    function drawVolumesFor(arr, basis, color, offsetX, alpha) {{
+    function drawVolumesFor(arr, basis, color, offsetX, alpha, pinnedByFrame) {{
       if (!showVolumes) return;
       const fill = getComputedStyle(document.documentElement).getPropertyValue("--volume").trim();
+      const pinnedSide = pinnedByFrame && pinnedByFrame.length > frame ? pinnedByFrame[frame] : pinnedFootSide(arr, basis, offsetX);
+      const pinnedColor = getComputedStyle(document.documentElement).getPropertyValue("--foot-pinned").trim();
+      const pinnedFill = getComputedStyle(document.documentElement).getPropertyValue("--foot-pinned-fill").trim();
+      const unpinnedColor = getComputedStyle(document.documentElement).getPropertyValue("--foot-unpinned").trim();
+      const unpinnedFill = getComputedStyle(document.documentElement).getPropertyValue("--foot-unpinned-fill").trim();
       for (const v of volumeSpecs) drawCapsule(arr, v.a, v.b, v.r * 0.01, offsetX, fill, color, alpha);
       for (const h of handSpecs) drawHandBox(arr, basis, h, offsetX, color, alpha);
       for (const f of footSpecs) {{
-        drawFootBlock(arr, basis, f.ankle, f.toe, offsetX, color, alpha);
-        drawToeBlock(arr, basis, f.ankle, f.toe, offsetX, color, alpha);
+        const footColor = f.side === pinnedSide ? pinnedColor : unpinnedColor;
+        const footFill = f.side === pinnedSide ? pinnedFill : unpinnedFill;
+        drawFootBlock(arr, basis, f.ankle, f.toe, offsetX, footColor, footFill, alpha);
+        drawToeBlock(arr, basis, f.ankle, f.toe, offsetX, footColor, footFill, alpha);
       }}
     }}
 
@@ -529,12 +580,13 @@ HTML_TEMPLATE = r"""<!doctype html>
       const predColor = getComputedStyle(document.documentElement).getPropertyValue("--pred").trim();
       const pred = predictionMode === "autoregressive" ? motion.predAr : motion.predOne;
       const predBasis = predictionMode === "autoregressive" ? motion.predArBasis : motion.predOneBasis;
+      const predPinned = predictionMode === "autoregressive" ? motion.pinnedAr : motion.pinnedOne;
       const err = predictionMode === "autoregressive" ? motion.errAr : motion.errOne;
       const sep = splitMode ? extent * 0.42 : 0;
       drawTrailsFor(motion.gt, gtColor, -sep);
       drawTrailsFor(pred, predColor, sep);
-      drawVolumesFor(motion.gt, motion.gtBasis, gtColor, -sep, splitMode ? 0.36 : 0.22);
-      drawVolumesFor(pred, predBasis, predColor, sep, 0.42);
+      drawVolumesFor(motion.gt, motion.gtBasis, gtColor, -sep, splitMode ? 0.36 : 0.22, motion.pinnedGt);
+      drawVolumesFor(pred, predBasis, predColor, sep, 0.42, predPinned);
       const gtPoints = drawSkeleton(motion.gt, gtColor, -sep, splitMode ? 0.9 : 0.54, splitMode ? 4.0 : 5.0);
       const predPoints = drawSkeleton(pred, predColor, sep, 0.92, 3.2);
 
@@ -728,9 +780,9 @@ def infer_npz_cyclic_flag(ckpt: dict, npz: Path) -> bool | None:
     for path_text in metadata.get("npz_paths", []):
         try:
             if resolve_path(str(path_text)) == npz_resolved:
-                # The simple controller records one-off --npz paths as cyclic.
-                policy = metadata.get("policy", {})
-                if isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction":
+                # The current IK controller trainer records one-off --npz
+                # paths as cyclic.
+                if ckpt_runtime.is_current_ik_controller_checkpoint(ckpt):
                     return True
         except Exception:
             continue
@@ -756,14 +808,12 @@ def load_model(checkpoint: dict, clip: tl.MotionClip, cfg: tl.TrainConfig, devic
     return model
 
 
-def is_simple_controller_checkpoint(checkpoint: dict) -> bool:
-    metadata = checkpoint.get("metadata", {})
-    policy = metadata.get("policy", {})
-    return isinstance(policy, dict) and policy.get("loss") == "simple_ae_output_reconstruction"
+def is_current_ik_controller_checkpoint(checkpoint: dict) -> bool:
+    return ckpt_runtime.is_current_ik_controller_checkpoint(checkpoint)
 
 
 @torch.no_grad()
-def rollout_simple_controller_model(
+def rollout_ik_controller_model(
     model: torch.nn.Module,
     clip: tl.MotionClip,
     cfg: tl.TrainConfig,
@@ -852,79 +902,22 @@ def rollout_simple_controller_model(
     )
 
 
-@torch.no_grad()
-def rollout_model(
-    model: torch.nn.Module,
-    clip: tl.MotionClip,
-    cfg: tl.TrainConfig,
-    device: torch.device,
-    max_frames: int | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    frame_count = clip.T if max_frames is None else min(clip.T, max(3, max_frames))
-    frame_idx = torch.arange(frame_count, dtype=torch.long, device=device)
-    gt_pos_t, gt_rot_t = tl.global_from_clip(clip, frame_idx, cfg, device)
-    gt_pos = gt_pos_t.detach().cpu().numpy().astype(np.float32)
-    gt_rot = gt_rot_t.detach().cpu().numpy().astype(np.float32)
-    pred_ar_pos = np.zeros_like(gt_pos)
-    pred_one_step_pos = np.zeros_like(gt_pos)
-    pred_ar_rot = np.zeros_like(gt_rot)
-    pred_one_step_rot = np.zeros_like(gt_rot)
-
-    pred_ar_pos[:2] = gt_pos[:2]
-    pred_one_step_pos[:2] = gt_pos[:2]
-    pred_ar_rot[:2] = gt_rot[:2]
-    pred_one_step_rot[:2] = gt_rot[:2]
-
-    prev_idx = torch.tensor([0], dtype=torch.long)
-    cur_idx = torch.tensor([1], dtype=torch.long)
-    prev_pose = tl.get_pose_from_clip(clip, prev_idx, device)
-    cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
-    prev_pose, cur_pose = tl.maybe_apply_initial_offsets(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
-    if cfg.freefall_body_height_offset_m != 0.0:
-        tensors = clip.tensors(device)
-        prev_root_pos = tensors["root_pos"].index_select(0, prev_idx.to(device))
-        prev_root_rot = tensors["root_rot"].index_select(0, prev_idx.to(device))
-        cur_root_pos = tensors["root_pos"].index_select(0, cur_idx.to(device))
-        cur_root_rot = tensors["root_rot"].index_select(0, cur_idx.to(device))
-        init_prev_pos, init_prev_rot, _ = tl.fk_from_pose(clip, prev_root_pos, prev_root_rot, prev_pose, device)
-        init_cur_pos, init_cur_rot, _ = tl.fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
-        pred_ar_pos[0] = init_prev_pos[0].detach().cpu().numpy()
-        pred_ar_rot[0] = init_prev_rot[0].detach().cpu().numpy()
-        if frame_count > 1:
-            pred_ar_pos[1] = init_cur_pos[0].detach().cpu().numpy()
-            pred_ar_rot[1] = init_cur_rot[0].detach().cpu().numpy()
-
-    for target in range(2, frame_count):
-        target_idx = torch.tensor([target], dtype=torch.long)
-        root_pos, root_rot, _yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
-
-        one_prev_idx = torch.tensor([target - 2], dtype=torch.long)
-        one_cur_idx = torch.tensor([target - 1], dtype=torch.long)
-        one_prev_pose = tl.get_pose_from_clip(clip, one_prev_idx, device)
-        one_cur_pose = tl.get_pose_from_clip(clip, one_cur_idx, device)
-        one_inp = tl.build_input(clip, one_prev_idx, one_cur_idx, one_prev_pose, one_cur_pose, cfg, device)
-        one_raw_out = tl.predict_next_raw(model, one_inp, one_cur_pose, cfg)
-        one_pose, _ = tl.output_to_pose(one_raw_out, clip)
-        one_global_pos, one_global_rot, _ = tl.fk_from_pose(clip, root_pos, root_rot, one_pose, device)
-        pred_one_step_pos[target] = one_global_pos[0].detach().cpu().numpy()
-        pred_one_step_rot[target] = one_global_rot[0].detach().cpu().numpy()
-
-        inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
-        raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
-        pred_pose, _ = tl.output_to_pose(raw_out, clip)
-        global_pos, global_rot, canon_pos = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
-
-        pred_ar_pos[target] = global_pos[0].detach().cpu().numpy()
-        pred_ar_rot[target] = global_rot[0].detach().cpu().numpy()
-
-        prev_pose = cur_pose
-        cur_pose = tl.next_pose_from_prediction(pred_pose, canon_pos)
-        prev_idx = cur_idx
-        cur_idx = target_idx
-
-    error_ar = np.linalg.norm(pred_ar_pos - gt_pos, axis=-1).mean(axis=-1).astype(np.float32)
-    error_one_step = np.linalg.norm(pred_one_step_pos - gt_pos, axis=-1).mean(axis=-1).astype(np.float32)
-    return gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar
+def pinned_sides_from_motion(clip: tl.MotionClip, positions: np.ndarray, rotations: np.ndarray) -> np.ndarray:
+    frame_count = int(positions.shape[0])
+    if frame_count < 2:
+        return np.zeros((frame_count,), dtype=np.int8)
+    order = tuple(int(clip.body_names.index(name)) for name in ("foot_l", "ball_l", "foot_r", "ball_r"))
+    pos_t = torch.from_numpy(np.ascontiguousarray(positions[:, order], dtype=np.float32))
+    rot_t = torch.from_numpy(np.ascontiguousarray(rotations[:, order], dtype=np.float32))
+    _linear, _angular, planted = env.compact_slide_yaw_selected_with_planted(
+        pos_t[:-1],
+        rot_t[:-1],
+        pos_t[1:],
+        rot_t[1:],
+        clip.fps,
+    )
+    sides = planted.detach().cpu().numpy().astype(np.int8)
+    return np.concatenate((sides, sides[-1:]), axis=0)
 
 
 def make_payload(
@@ -941,6 +934,9 @@ def make_payload(
     both = np.concatenate((gt_pos, pred_one_step_pos, pred_ar_pos), axis=1)
     bounds_min = both.reshape(-1, 3).min(axis=0)
     bounds_max = both.reshape(-1, 3).max(axis=0)
+    pinned_gt = pinned_sides_from_motion(clip, gt_pos, gt_rot)
+    pinned_one_step = pinned_sides_from_motion(clip, pred_one_step_pos, pred_one_step_rot)
+    pinned_ar = pinned_sides_from_motion(clip, pred_ar_pos, pred_ar_rot)
     return {
         "title": "",
         "frame_count": int(gt_pos.shape[0]),
@@ -959,6 +955,9 @@ def make_payload(
         "pred_ar_basis_b64": base64.b64encode(np.ascontiguousarray(pred_ar_rot, dtype=np.float32).tobytes()).decode("ascii"),
         "err_one_step_b64": base64.b64encode(np.ascontiguousarray(error_one_step, dtype=np.float32).tobytes()).decode("ascii"),
         "err_ar_b64": base64.b64encode(np.ascontiguousarray(error_ar, dtype=np.float32).tobytes()).decode("ascii"),
+        "pinned_gt_b64": base64.b64encode(np.ascontiguousarray(pinned_gt, dtype=np.int8).tobytes()).decode("ascii"),
+        "pinned_one_step_b64": base64.b64encode(np.ascontiguousarray(pinned_one_step, dtype=np.int8).tobytes()).decode("ascii"),
+        "pinned_ar_b64": base64.b64encode(np.ascontiguousarray(pinned_ar, dtype=np.int8).tobytes()).decode("ascii"),
     }
 
 
@@ -989,6 +988,7 @@ def main() -> None:
     device = torch.device(args.device)
 
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    ckpt_runtime.require_current_ik_controller_checkpoint(ckpt, checkpoint)
     npz = resolve_optional_path(args.npz_path) or infer_npz_path(ckpt, checkpoint)
     cfg = tl.TrainConfig()
     apply_config_dict(cfg, ckpt.get("config", {}))
@@ -997,14 +997,9 @@ def main() -> None:
 
     clip = tl.MotionClip(npz, cfg, cyclic_animation=infer_npz_cyclic_flag(ckpt, npz))
     model = load_model(ckpt, clip, cfg, device)
-    if is_simple_controller_checkpoint(ckpt):
-        gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = (
-            rollout_simple_controller_model(model, clip, cfg, device, args.max_frames)
-        )
-    else:
-        gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = rollout_model(
-            model, clip, cfg, device, args.max_frames
-        )
+    gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = (
+        rollout_ik_controller_model(model, clip, cfg, device, args.max_frames)
+    )
     payload = make_payload(
         clip,
         gt_pos,
@@ -1023,6 +1018,7 @@ def main() -> None:
     print(f"wrote {output}")
     print(f"checkpoint {checkpoint}")
     print(f"npz {npz}")
+    print(f"runtime {ckpt_runtime.runtime_name(ckpt)}")
     print(f"frames {payload['frame_count']} bones {payload['bone_count']} fps {payload['fps']:.0f}")
     print(f"one_step_mean_joint_error_start {float(error_one_step[0]):.6f}")
     print(f"one_step_mean_joint_error_end {float(error_one_step[-1]):.6f}")

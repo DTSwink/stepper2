@@ -14,12 +14,16 @@ from torch.utils.tensorboard import SummaryWriter
 try:
     from .bootstrap import PROJECT_ROOT, ensure_paths
     from .naming import checkpoint_path, ik_run_id
+    from . import excess_envelope as env
     from . import ik_core as tl
+    from .rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
     from .train_simple_autoencoder import SimpleAEConfig, SimpleAutoencoder
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
     from naming import checkpoint_path, ik_run_id
+    import excess_envelope as env
     import ik_core as tl
+    from rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
     from train_simple_autoencoder import SimpleAEConfig, SimpleAutoencoder
 
 ensure_paths()
@@ -30,12 +34,14 @@ RUNS_DIR = PROJECT_ROOT / "training" / "runs"
 DEFAULT_AE_GLOB = "*_ik_simple_ae_*"
 SIMPLE_CONTROLLER_AE_KIND = "simple_controller_io_autoencoder"
 LEGACY_SIMPLE_AE_KIND = "simple_" + "ag" + "ent_io_autoencoder"
+ENVELOPE_TERM_NAMES = ("linear_slide_weighted", "angular_slide_weighted")
 
 BATCH_SIZE = 4096
 SMALL_CUDA_K64_BATCH_SIZE = 3328
 ROLLOUT_SCHEDULE = (1, 2, 8, 16, 32, 64)
 ROLLOUT_STAGE_STEPS = (3000, 1000, 1500, 1500, 2500, 2500)
 ROLLOUT_K = 64
+MIXED_ROLLOUT_AT_MAX = True
 LEARNING_RATE = 1e-4
 STAGE_LEARNING_RATES = {
     1: 1e-4,
@@ -53,6 +59,8 @@ NAN_METRIC = float("nan")
 POSE_NOISE_POS_SIGMA_M_AT_1 = 0.12
 POSE_NOISE_ROT_SIGMA_DEG_AT_1 = 25.0
 POSE_NOISE_SCALAR_SIGMA_AT_1 = 1.0
+RL_GRAD_CLIP_NORM = 1.0
+ZERO_LOSS_STOP_THRESHOLD = 0.0
 
 
 def refresh_tensorboard_async() -> None:
@@ -84,6 +92,40 @@ class StartPool:
     @property
     def row_count(self) -> int:
         return int(self.starts.numel())
+
+
+@dataclass(frozen=True)
+class ControllerLossResult:
+    total: torch.Tensor
+    terms: dict[str, torch.Tensor]
+
+
+def detach_loss_result(result: ControllerLossResult) -> ControllerLossResult:
+    return ControllerLossResult(
+        total=result.total.detach(),
+        terms={key: value.detach() for key, value in result.terms.items()},
+    )
+
+
+def maybe_clip_rl_gradients(model: torch.nn.Module, rl_cfg: RLLossConfig) -> None:
+    if rl_cfg.enabled:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), float(RL_GRAD_CLIP_NORM))
+
+
+def envelope_loss_enabled(linear_weight: float, angular_weight: float) -> bool:
+    return float(linear_weight) != 0.0 or float(angular_weight) != 0.0
+
+
+def wake_on_zero_loss(run_id: str, step: int, loss: float) -> None:
+    print(f"\a\a\aZERO_LOSS_STOP run={run_id} step={step} loss={loss:.6g}", flush=True)
+    try:
+        import winsound
+
+        for _ in range(3):
+            winsound.Beep(880, 350)
+            winsound.Beep(1175, 350)
+    except Exception:
+        pass
 
 
 class SimpleClipStore:
@@ -261,13 +303,23 @@ class SimpleClipStore:
         rel_rot = base_rot @ root0_inv
         cycle_pos = self.cycle_pos.index_select(0, clip_ids)
         cycle_rot = self.cycle_rot.index_select(0, clip_ids)
-        max_cycles = int(cycles.max().detach().cpu()) if cycles.numel() else 0
-        for cycle in range(max_cycles):
-            mask = (cycles > cycle).reshape(-1, 1)
-            next_pos = torch.matmul(rel_pos.unsqueeze(1), cycle_rot).squeeze(1) + cycle_pos
-            next_rot = rel_rot @ cycle_rot
-            rel_pos = torch.where(mask, next_pos, rel_pos)
-            rel_rot = torch.where(mask.unsqueeze(-1), next_rot, rel_rot)
+        acc_pos = torch.zeros_like(cycle_pos)
+        identity = torch.eye(3, dtype=cycle_rot.dtype, device=self.device).expand_as(cycle_rot)
+        acc_rot = identity
+        base_pos = cycle_pos
+        base_rot = cycle_rot
+        for bit in range(16):
+            use = torch.remainder(torch.div(cycles, 1 << bit, rounding_mode="floor"), 2).bool()
+            use_pos = use.reshape(-1, 1)
+            use_rot = use.reshape(-1, 1, 1)
+            next_acc_pos = torch.matmul(acc_pos.unsqueeze(1), base_rot).squeeze(1) + base_pos
+            next_acc_rot = acc_rot @ base_rot
+            acc_pos = torch.where(use_pos, next_acc_pos, acc_pos)
+            acc_rot = torch.where(use_rot, next_acc_rot, acc_rot)
+            base_pos = torch.matmul(base_pos.unsqueeze(1), base_rot).squeeze(1) + base_pos
+            base_rot = base_rot @ base_rot
+        rel_pos = torch.matmul(rel_pos.unsqueeze(1), acc_rot).squeeze(1) + acc_pos
+        rel_rot = rel_rot @ acc_rot
 
         pos = torch.matmul(rel_pos.unsqueeze(1), root0_rot).squeeze(1) + root0_pos
         rot = rel_rot @ root0_rot
@@ -308,8 +360,8 @@ def make_cfg(device: torch.device, ae_ckpt: dict) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     apply_config_dict(cfg, ae_ckpt.get("locomotion_config", {}))
     cfg.pose_representation = tl.IK_POSE_REPRESENTATION
-    cfg.predict_residual = True
-    cfg.zero_init_output = True
+    cfg.predict_residual = False
+    cfg.zero_init_output = False
     cfg.hidden_dim = 512
     cfg.num_hidden_layers = 2
     cfg.learning_rate = LEARNING_RATE
@@ -462,7 +514,7 @@ def rollout_values_for(max_k: int) -> tuple[int, ...]:
 
 
 def mixed_rollout_enabled(rollout_k: int) -> bool:
-    return int(rollout_k) >= int(ROLLOUT_K)
+    return bool(MIXED_ROLLOUT_AT_MAX) and int(rollout_k) >= int(ROLLOUT_K)
 
 
 def build_start_pools(store: SimpleClipStore, rollout_values: tuple[int, ...]) -> dict[int, StartPool]:
@@ -903,7 +955,12 @@ def pure_ae_rollout_loss(
     rollout_k: int,
     batch_size: int,
     start_pools: dict[int, StartPool],
-) -> torch.Tensor:
+    rl_cfg: RLLossConfig,
+    ae_loss_weight: float,
+    envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
+    linear_slide_weight: float = 0.0,
+    angular_slide_weight: float = 0.0,
+) -> ControllerLossResult:
     max_k = max(1, int(rollout_k))
     original_batch_size = max(1, int(batch_size))
     effective_k = sample_effective_rollout_k(original_batch_size, max_k, store.device)
@@ -913,6 +970,10 @@ def pure_ae_rollout_loss(
     cur_vec, cur_pelvis, cur_payload = target_state(store, clip_ids, cur_idx)
     row_weight = (1.0 / effective_k.float()) / float(original_batch_size)
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
+    ae_total = torch.zeros_like(total_loss)
+    rl_terms = {name: torch.zeros_like(total_loss) for name in RL_TERM_NAMES}
+    envelope_terms = {name: torch.zeros_like(total_loss) for name in ENVELOPE_TERM_NAMES}
+    has_envelope = envelope is not None and (float(linear_slide_weight) != 0.0 or float(angular_slide_weight) != 0.0)
 
     for step in range(max_k):
         inp = build_controller_input(
@@ -920,7 +981,37 @@ def pure_ae_rollout_loss(
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
-        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, raw) * row_weight).sum()
+        active = torch.ones_like(row_weight, dtype=torch.bool)
+        if float(ae_loss_weight) != 0.0:
+            ae_loss = (ae_score_rows(ae, mean, std, inp, raw) * row_weight).sum() * float(ae_loss_weight)
+        else:
+            ae_loss = torch.zeros_like(total_loss)
+        rl_loss = compute_rl_loss(pred_vec, cur_vec, row_weight, active, rl_cfg)
+        ae_total = ae_total + ae_loss
+        for key, value in rl_loss.terms.items():
+            rl_terms[key] = rl_terms.get(key, torch.zeros_like(total_loss)) + value
+        envelope_loss = torch.zeros_like(total_loss)
+        if has_envelope:
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+            next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+            cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
+            next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
+            linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
+                store,
+                envelope,  # type: ignore[arg-type]
+                cur_foot_pos,
+                cur_foot_rot,
+                next_foot_pos,
+                next_foot_rot,
+                clip_ids,
+                cur_idx,
+            )
+            linear_loss = (linear_rows * row_weight).sum() * float(linear_slide_weight)
+            angular_loss = (angular_rows * row_weight).sum() * float(angular_slide_weight)
+            envelope_terms["linear_slide_weighted"] = envelope_terms["linear_slide_weighted"] + linear_loss
+            envelope_terms["angular_slide_weighted"] = envelope_terms["angular_slide_weighted"] + angular_loss
+            envelope_loss = linear_loss + angular_loss
+        total_loss = total_loss + ae_loss + rl_loss.total + envelope_loss
         if step + 1 >= max_k:
             break
 
@@ -945,7 +1036,7 @@ def pure_ae_rollout_loss(
         cur_idx = torch.where(reset, reset_starts, next_idx)
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
-    return total_loss
+    return ControllerLossResult(total=total_loss, terms={"ae_score": ae_total, **rl_terms, **envelope_terms})
 
 
 def pure_ae_rollout_loss_static(
@@ -960,13 +1051,23 @@ def pure_ae_rollout_loss_static(
     clip_ids: torch.Tensor,
     starts: torch.Tensor,
     reset_starts_by_step: torch.Tensor | None = None,
-) -> torch.Tensor:
+    rl_cfg: RLLossConfig | None = None,
+    ae_loss_weight: float = 1.0,
+    envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
+    linear_slide_weight: float = 0.0,
+    angular_slide_weight: float = 0.0,
+) -> ControllerLossResult:
+    rl_cfg = rl_cfg or RLLossConfig()
     max_k = max(1, int(rollout_k))
     cur_idx = starts
     prev_vec, prev_pelvis, prev_payload = target_state(store, clip_ids, cur_idx - 1)
     cur_vec, cur_pelvis, cur_payload = target_state(store, clip_ids, cur_idx)
     row_weight = (1.0 / effective_k.float()) / float(max(1, int(batch_size)))
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
+    ae_total = torch.zeros_like(total_loss)
+    rl_terms = {name: torch.zeros_like(total_loss) for name in RL_TERM_NAMES}
+    envelope_terms = {name: torch.zeros_like(total_loss) for name in ENVELOPE_TERM_NAMES}
+    has_envelope = envelope is not None and (float(linear_slide_weight) != 0.0 or float(angular_slide_weight) != 0.0)
 
     for step in range(max_k):
         inp = build_controller_input(
@@ -975,7 +1076,37 @@ def pure_ae_rollout_loss_static(
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
         active = effective_k > step
-        total_loss = total_loss + (ae_score_rows(ae, mean, std, inp, raw) * row_weight * active.float()).sum()
+        if float(ae_loss_weight) != 0.0:
+            ae_loss = (ae_score_rows(ae, mean, std, inp, raw) * row_weight * active.float()).sum() * float(ae_loss_weight)
+        else:
+            ae_loss = torch.zeros_like(total_loss)
+        rl_loss = compute_rl_loss(pred_vec, cur_vec, row_weight, active, rl_cfg)
+        ae_total = ae_total + ae_loss
+        for key, value in rl_loss.terms.items():
+            rl_terms[key] = rl_terms.get(key, torch.zeros_like(total_loss)) + value
+        envelope_loss = torch.zeros_like(total_loss)
+        if has_envelope:
+            active_f = active.float()
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+            next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+            cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
+            next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
+            linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
+                store,
+                envelope,  # type: ignore[arg-type]
+                cur_foot_pos,
+                cur_foot_rot,
+                next_foot_pos,
+                next_foot_rot,
+                clip_ids,
+                cur_idx,
+            )
+            linear_loss = (linear_rows * row_weight * active_f).sum() * float(linear_slide_weight)
+            angular_loss = (angular_rows * row_weight * active_f).sum() * float(angular_slide_weight)
+            envelope_terms["linear_slide_weighted"] = envelope_terms["linear_slide_weighted"] + linear_loss
+            envelope_terms["angular_slide_weighted"] = envelope_terms["angular_slide_weighted"] + angular_loss
+            envelope_loss = linear_loss + angular_loss
+        total_loss = total_loss + ae_loss + rl_loss.total + envelope_loss
         if step + 1 >= max_k:
             break
 
@@ -999,7 +1130,7 @@ def pure_ae_rollout_loss_static(
         cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, torch.where(advance_mask, next_pelvis, cur_pelvis))
         cur_payload = torch.where(reset_mask, reset_cur_payload, torch.where(advance_mask, next_payload, cur_payload))
         cur_idx = torch.where(reset, reset_starts, torch.where(continuing, cur_idx + 1, cur_idx))
-    return total_loss
+    return ControllerLossResult(total=total_loss, terms={"ae_score": ae_total, **rl_terms, **envelope_terms})
 
 
 class CudaGraphPureAEStep:
@@ -1016,6 +1147,11 @@ class CudaGraphPureAEStep:
         rollout_k: int,
         batch_size: int,
         start_pools: dict[int, StartPool],
+        rl_cfg: RLLossConfig,
+        ae_loss_weight: float,
+        envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None,
+        linear_slide_weight: float,
+        angular_slide_weight: float,
     ):
         if store.device.type != "cuda":
             raise RuntimeError("CudaGraphPureAEStep requires CUDA")
@@ -1028,6 +1164,11 @@ class CudaGraphPureAEStep:
         self.rollout_k = int(rollout_k)
         self.batch_size = int(batch_size)
         self.start_pools = start_pools
+        self.rl_cfg = rl_cfg
+        self.ae_loss_weight = float(ae_loss_weight)
+        self.envelope = envelope
+        self.linear_slide_weight = float(linear_slide_weight)
+        self.angular_slide_weight = float(angular_slide_weight)
         self.effective_k = torch.empty((self.batch_size,), dtype=torch.long, device=store.device)
         self.clip_ids = torch.empty_like(self.effective_k)
         self.starts = torch.empty_like(self.effective_k)
@@ -1035,6 +1176,8 @@ class CudaGraphPureAEStep:
             (max(1, int(self.rollout_k)), self.batch_size), dtype=torch.long, device=store.device
         )
         self.loss = torch.zeros((), dtype=torch.float32, device=store.device)
+        self.term_names = ("ae_score", *RL_TERM_NAMES, *ENVELOPE_TERM_NAMES)
+        self.term_tensors = {name: torch.zeros_like(self.loss) for name in self.term_names}
         self.graph = torch.cuda.CUDAGraph()
         self._capture()
 
@@ -1048,7 +1191,7 @@ class CudaGraphPureAEStep:
             sample_same_clip_training_starts_by_step(self.store, clip_ids, self.reset_starts_by_step.shape[0])
         )
 
-    def _loss(self) -> torch.Tensor:
+    def _loss(self) -> ControllerLossResult:
         return pure_ae_rollout_loss_static(
             self.model,
             self.ae,
@@ -1061,6 +1204,11 @@ class CudaGraphPureAEStep:
             self.clip_ids,
             self.starts,
             self.reset_starts_by_step,
+            self.rl_cfg,
+            self.ae_loss_weight,
+            self.envelope,
+            self.linear_slide_weight,
+            self.angular_slide_weight,
         )
 
     def _capture(self) -> None:
@@ -1071,23 +1219,31 @@ class CudaGraphPureAEStep:
             for _ in range(2):
                 self._sample_into_static_buffers()
                 self.optimizer.zero_grad(set_to_none=False)
-                loss = self._loss()
-                loss.backward()
+                loss_result = self._loss()
+                loss_result.total.backward()
+                maybe_clip_rl_gradients(self.model, self.rl_cfg)
                 self.optimizer.step()
-                del loss
+                del loss_result
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
         self.optimizer.zero_grad(set_to_none=False)
         with torch.cuda.graph(self.graph):
             self.optimizer.zero_grad(set_to_none=False)
-            self.loss = self._loss()
+            loss_result = self._loss()
+            self.loss = loss_result.total
+            for name in self.term_names:
+                self.term_tensors[name] = loss_result.terms[name]
             self.loss.backward()
+            maybe_clip_rl_gradients(self.model, self.rl_cfg)
             self.optimizer.step()
 
-    def step(self) -> torch.Tensor:
+    def step(self) -> ControllerLossResult:
         self._sample_into_static_buffers()
         self.graph.replay()
-        return self.loss.detach()
+        return ControllerLossResult(
+            total=self.loss.detach(),
+            terms={name: self.term_tensors[name].detach() for name in self.term_names},
+        )
 
 
 class EagerPureAEStep:
@@ -1104,6 +1260,11 @@ class EagerPureAEStep:
         rollout_k: int,
         batch_size: int,
         start_pools: dict[int, StartPool],
+        rl_cfg: RLLossConfig,
+        ae_loss_weight: float,
+        envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None,
+        linear_slide_weight: float,
+        angular_slide_weight: float,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -1114,9 +1275,14 @@ class EagerPureAEStep:
         self.rollout_k = int(rollout_k)
         self.batch_size = int(batch_size)
         self.start_pools = start_pools
+        self.rl_cfg = rl_cfg
+        self.ae_loss_weight = float(ae_loss_weight)
+        self.envelope = envelope
+        self.linear_slide_weight = float(linear_slide_weight)
+        self.angular_slide_weight = float(angular_slide_weight)
 
-    def step(self) -> torch.Tensor:
-        loss = pure_ae_rollout_loss(
+    def step(self) -> ControllerLossResult:
+        loss_result = pure_ae_rollout_loss(
             self.model,
             self.ae,
             self.mean,
@@ -1125,11 +1291,17 @@ class EagerPureAEStep:
             self.rollout_k,
             self.batch_size,
             self.start_pools,
+            self.rl_cfg,
+            self.ae_loss_weight,
+            self.envelope,
+            self.linear_slide_weight,
+            self.angular_slide_weight,
         )
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_result.total.backward()
+        maybe_clip_rl_gradients(self.model, self.rl_cfg)
         self.optimizer.step()
-        return loss.detach()
+        return detach_loss_result(loss_result)
 
 
 def make_pure_ae_stepper(
@@ -1142,10 +1314,45 @@ def make_pure_ae_stepper(
     rollout_k: int,
     batch_size: int,
     start_pools: dict[int, StartPool],
+    rl_cfg: RLLossConfig,
+    ae_loss_weight: float,
+    envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
+    linear_slide_weight: float = 0.0,
+    angular_slide_weight: float = 0.0,
 ) -> CudaGraphPureAEStep | EagerPureAEStep:
     if store.device.type == "cuda":
-        return CudaGraphPureAEStep(model, optimizer, ae, mean, std, store, rollout_k, batch_size, start_pools)
-    return EagerPureAEStep(model, optimizer, ae, mean, std, store, rollout_k, batch_size, start_pools)
+        return CudaGraphPureAEStep(
+            model,
+            optimizer,
+            ae,
+            mean,
+            std,
+            store,
+            rollout_k,
+            batch_size,
+            start_pools,
+            rl_cfg,
+            ae_loss_weight,
+            envelope,
+            linear_slide_weight,
+            angular_slide_weight,
+        )
+    return EagerPureAEStep(
+        model,
+        optimizer,
+        ae,
+        mean,
+        std,
+        store,
+        rollout_k,
+        batch_size,
+        start_pools,
+        rl_cfg,
+        ae_loss_weight,
+        envelope,
+        linear_slide_weight,
+        angular_slide_weight,
+    )
 
 
 def validation_rows(pool: StartPool, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1272,13 +1479,82 @@ def save_controller_checkpoint(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train IK controller with only the simple AE prior loss.")
+    global LOG_EVERY, MIXED_ROLLOUT_AT_MAX, ROLLOUT_K, ROLLOUT_SCHEDULE, ROLLOUT_STAGE_STEPS, STAGE_LEARNING_RATES
+
+    parser = argparse.ArgumentParser(description="Train IK controller with simple AE and optional separated RL losses.")
     parser.add_argument("--npz", default=None)
     parser.add_argument("--periodic-folder", default=None)
     parser.add_argument("--nonperiodic-folder", default=None)
     parser.add_argument("--ae-checkpoint", default=None)
     parser.add_argument("--run-label", default="walkF_simple_ae_controller")
+    parser.add_argument("--ae-loss-weight", type=float, default=1.0)
+    parser.add_argument("--rollout-schedule", type=int, nargs="+", default=None)
+    parser.add_argument("--rollout-stage-steps", type=int, nargs="+", default=None)
+    parser.add_argument("--rollout-k", type=int, default=None)
+    parser.add_argument("--mixed-rollout-at-max", dest="mixed_rollout_at_max", action="store_true", default=None)
+    parser.add_argument("--no-mixed-rollout-at-max", dest="mixed_rollout_at_max", action="store_false")
+    parser.add_argument("--stage-learning-rate", type=float, default=None)
+    parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument("--linear-slide-loss-weight", type=float, default=0.0)
+    parser.add_argument("--angular-slide-loss-weight", type=float, default=0.0)
+    parser.add_argument("--envelope-margin", type=float, default=env.ExcessEnvelopeConfig().margin)
+    parser.add_argument("--envelope-knn", type=int, default=env.ExcessEnvelopeConfig().knn)
+    parser.add_argument("--pelvis-root-horizontal-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pelvis-root-horizontal-limit-m", type=float, default=RLLossConfig().pelvis_root_horizontal_limit_m)
+    parser.add_argument("--pelvis-root-rotation-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pelvis-root-rotation-limit-deg", type=float, default=RLLossConfig().pelvis_root_rotation_limit_deg)
+    parser.add_argument("--end-effector-location-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--end-effector-location-limit-m",
+        type=float,
+        nargs=4,
+        default=RLLossConfig().end_effector_location_limit_m,
+        metavar=("HAND_L", "HAND_R", "FOOT_L", "FOOT_R"),
+    )
+    parser.add_argument("--end-effector-rotation-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--end-effector-rotation-limit-deg",
+        type=float,
+        nargs=4,
+        default=RLLossConfig().end_effector_rotation_limit_deg,
+        metavar=("HAND_L", "HAND_R", "FOOT_L", "FOOT_R"),
+    )
+    parser.add_argument("--end-effector-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--end-effector-velocity-limit-mps", type=float, default=RLLossConfig().end_effector_velocity_limit_mps)
+    parser.add_argument("--end-effector-angular-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--end-effector-angular-velocity-limit-deg-s",
+        type=float,
+        default=RLLossConfig().end_effector_angular_velocity_limit_deg_s,
+    )
+    parser.add_argument("--pelvis-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pelvis-velocity-limit-mps", type=float, default=RLLossConfig().pelvis_velocity_limit_mps)
+    parser.add_argument("--pelvis-angular-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--pelvis-angular-velocity-limit-deg-s", type=float, default=RLLossConfig().pelvis_angular_velocity_limit_deg_s)
+    parser.add_argument("--core-angular-velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--core-angular-velocity-limit-deg-s", type=float, default=RLLossConfig().core_angular_velocity_limit_deg_s)
     args = parser.parse_args()
+
+    if args.rollout_schedule is not None:
+        ROLLOUT_SCHEDULE = tuple(max(1, int(k)) for k in args.rollout_schedule)
+        if args.rollout_k is None:
+            ROLLOUT_K = int(ROLLOUT_SCHEDULE[-1])
+    if args.rollout_stage_steps is not None:
+        ROLLOUT_STAGE_STEPS = tuple(max(1, int(n)) for n in args.rollout_stage_steps)
+    if args.rollout_k is not None:
+        ROLLOUT_K = max(1, int(args.rollout_k))
+    if len(ROLLOUT_SCHEDULE) != len(ROLLOUT_STAGE_STEPS):
+        raise ValueError(
+            f"rollout schedule length {len(ROLLOUT_SCHEDULE)} must match stage steps length {len(ROLLOUT_STAGE_STEPS)}"
+        )
+    if int(ROLLOUT_K) not in {int(k) for k in ROLLOUT_SCHEDULE}:
+        raise ValueError(f"rollout_k {ROLLOUT_K} must appear in rollout_schedule {ROLLOUT_SCHEDULE}")
+    if args.mixed_rollout_at_max is not None:
+        MIXED_ROLLOUT_AT_MAX = bool(args.mixed_rollout_at_max)
+    if args.stage_learning_rate is not None:
+        STAGE_LEARNING_RATES = {int(k): float(args.stage_learning_rate) for k in ROLLOUT_SCHEDULE}
+    if args.log_every is not None:
+        LOG_EVERY = max(1, int(args.log_every))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1286,17 +1562,60 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    ae_path = resolve_path(args.ae_checkpoint) if args.ae_checkpoint else latest_simple_ae_checkpoint()
-    ae, mean, std, ae_ckpt = load_simple_ae(ae_path, device)
+    ae_loss_weight = float(args.ae_loss_weight)
+    ae_path: Path | None = None
+    ae_ckpt: dict = {}
+    if ae_loss_weight != 0.0:
+        ae_path = resolve_path(args.ae_checkpoint) if args.ae_checkpoint else latest_simple_ae_checkpoint()
+        ae, mean, std, ae_ckpt = load_simple_ae(ae_path, device)
+    else:
+        ae = None
+        mean = torch.empty(0, dtype=torch.float32, device=device)
+        std = torch.empty(0, dtype=torch.float32, device=device)
     cfg = make_cfg(device, ae_ckpt)
+    cfg.ae_loss_weight = ae_loss_weight
+    tl.set_seed(int(cfg.seed))
+    rl_cfg = RLLossConfig(
+        pelvis_root_horizontal_weight=float(args.pelvis_root_horizontal_loss_weight),
+        pelvis_root_horizontal_limit_m=float(args.pelvis_root_horizontal_limit_m),
+        pelvis_root_rotation_weight=float(args.pelvis_root_rotation_loss_weight),
+        pelvis_root_rotation_limit_deg=float(args.pelvis_root_rotation_limit_deg),
+        end_effector_location_weight=float(args.end_effector_location_loss_weight),
+        end_effector_location_limit_m=tuple(float(v) for v in args.end_effector_location_limit_m),
+        end_effector_rotation_weight=float(args.end_effector_rotation_loss_weight),
+        end_effector_rotation_limit_deg=tuple(float(v) for v in args.end_effector_rotation_limit_deg),
+        end_effector_velocity_weight=float(args.end_effector_velocity_loss_weight),
+        end_effector_velocity_limit_mps=float(args.end_effector_velocity_limit_mps),
+        end_effector_angular_velocity_weight=float(args.end_effector_angular_velocity_loss_weight),
+        end_effector_angular_velocity_limit_deg_s=float(args.end_effector_angular_velocity_limit_deg_s),
+        pelvis_velocity_weight=float(args.pelvis_velocity_loss_weight),
+        pelvis_velocity_limit_mps=float(args.pelvis_velocity_limit_mps),
+        pelvis_angular_velocity_weight=float(args.pelvis_angular_velocity_loss_weight),
+        pelvis_angular_velocity_limit_deg_s=float(args.pelvis_angular_velocity_limit_deg_s),
+        core_angular_velocity_weight=float(args.core_angular_velocity_loss_weight),
+        core_angular_velocity_limit_deg_s=float(args.core_angular_velocity_limit_deg_s),
+        fps=float(cfg.fps),
+    )
     specs = resolve_clip_specs(args.npz, args.periodic_folder, args.nonperiodic_folder)
     clips = load_clips(specs, cfg)
     input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
-    expected_dim = int(ae_ckpt["schema"]["total_dim"])
-    if input_dim + output_dim != expected_dim:
-        raise ValueError(f"AE dim {expected_dim} does not match controller feature dim {input_dim + output_dim}")
+    if ae is not None:
+        expected_dim = int(ae_ckpt["schema"]["total_dim"])
+        if input_dim + output_dim != expected_dim:
+            raise ValueError(f"AE dim {expected_dim} does not match controller feature dim {input_dim + output_dim}")
 
     store = SimpleClipStore(clips, cfg, device)
+    envelope = None
+    linear_slide_weight = float(args.linear_slide_loss_weight)
+    angular_slide_weight = float(args.angular_slide_loss_weight)
+    if envelope_loss_enabled(linear_slide_weight, angular_slide_weight):
+        envelope = env.load_or_build_excess_envelope(
+            store,
+            env.ExcessEnvelopeConfig(margin=float(args.envelope_margin), knn=int(args.envelope_knn)),
+        )
+        sanity = env.groundtruth_sanity(store, envelope)
+        if max(float(value) for value in sanity.values()) > 1e-6:
+            raise RuntimeError(f"GT exceeds foot-slide envelope unexpectedly: {sanity}")
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
     optimizer = make_adamw(model.parameters(), LEARNING_RATE, device, capturable=bool(device.type == "cuda"))
 
@@ -1323,12 +1642,28 @@ def main() -> None:
     metadata = {
         "npz_paths": [str(path) for path, _cyclic in specs],
         "npz_folders": [{"path": str(path.parent), "cyclic": bool(cyclic)} for path, cyclic in specs],
-        "simple_ae_checkpoint": str(ae_path),
+        "simple_ae_checkpoint": str(ae_path) if ae_path is not None else None,
         "tensorboard_logdir": str(run_dir / "tb"),
         "policy": {
-            "loss": "simple_ae_output_reconstruction",
+            "loss": "rl_only" if (ae_loss_weight == 0.0 and rl_cfg.enabled) else "simple_ae_output_reconstruction",
+            "ae_loss_weight": float(ae_loss_weight),
             "ae_score_output_only": bool(AE_SCORE_OUTPUT_ONLY),
-            "mixed_rollout_at_max": True,
+            "ae_scores_raw_output": True,
+            "rl_loss_enabled": bool(rl_cfg.enabled),
+            "rl_loss": rl_cfg.to_dict(),
+            "envelope_loss_enabled": bool(envelope is not None),
+            "envelope_loss": {
+                "linear_slide_loss_weight": float(linear_slide_weight),
+                "angular_slide_loss_weight": float(angular_slide_weight),
+                "margin": float(args.envelope_margin),
+                "knn": int(args.envelope_knn),
+                "metadata": envelope["metadata"] if envelope is not None else None,
+            },
+            "rl_grad_clip_norm": float(RL_GRAD_CLIP_NORM) if rl_cfg.enabled else 0.0,
+            "zero_loss_stop_threshold": float(ZERO_LOSS_STOP_THRESHOLD),
+            "predict_residual": bool(cfg.predict_residual),
+            "zero_init_output": bool(cfg.zero_init_output),
+            "mixed_rollout_at_max": bool(MIXED_ROLLOUT_AT_MAX),
             "pose_representation": tl.IK_POSE_REPRESENTATION,
             "test_set": False,
             "checkpoint_selection": "latest_stage_last",
@@ -1336,6 +1671,8 @@ def main() -> None:
         "rollout_schedule": [int(k) for k in ROLLOUT_SCHEDULE],
         "rollout_stage_steps": [int(n) for n in ROLLOUT_STAGE_STEPS],
         "rollout_k": int(ROLLOUT_K),
+        "rollout_mode": "mixed_geometric_at_max" if MIXED_ROLLOUT_AT_MAX else "fixed_per_stage",
+        "log_every": int(LOG_EVERY),
         "row_count": int(final_cache["row_count"]),
         "batch_size": int(final_cache["batch_size"]),
         "input_dim": int(input_dim),
@@ -1350,15 +1687,23 @@ def main() -> None:
     writer.flush()
     refresh_tensorboard_async()
 
-    print(f"simple_ae_controller run={run_id} ae={ae_path} tensorboard_logdir={run_dir / 'tb'}", flush=True)
+    print(
+        f"simple_ae_controller run={run_id} "
+        f"ae={ae_path if ae_path is not None else 'disabled'} tensorboard_logdir={run_dir / 'tb'}",
+        flush=True,
+    )
     last_loss = float("inf")
+    best_loss = float("inf")
     init_path = save_controller_checkpoint(run_dir, run_id, "init", model, optimizer, 0, last_loss, 0, cfg, metadata)
     print(f"saved initial checkpoint {init_path}", flush=True)
 
     start = time.perf_counter()
     total_steps = sum(int(x) for x in ROLLOUT_STAGE_STEPS)
     step = 0
+    stop_training = False
+    last_stage_k = int(ROLLOUT_SCHEDULE[0]) if ROLLOUT_SCHEDULE else int(ROLLOUT_K)
     for stage_idx, stage_k in enumerate(ROLLOUT_SCHEDULE):
+        last_stage_k = int(stage_k)
         stage_steps = int(ROLLOUT_STAGE_STEPS[stage_idx])
         lr = stage_learning_rate(int(stage_k))
         set_optimizer_lr(optimizer, lr)
@@ -1374,6 +1719,11 @@ def main() -> None:
             int(stage_k),
             int(cache["batch_size"]),
             cache["start_pools"],
+            rl_cfg,
+            ae_loss_weight,
+            envelope,
+            linear_slide_weight,
+            angular_slide_weight,
         )
         print(
             f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} K={stage_k} "
@@ -1382,9 +1732,11 @@ def main() -> None:
         )
         for stage_step in range(1, stage_steps + 1):
             step += 1
-            loss = stepper.step()
-            last_loss = float(loss.detach().cpu())
-            if stage_step == 1 or stage_step % LOG_EVERY == 0 or stage_step == stage_steps:
+            loss_result = stepper.step()
+            last_loss = float(loss_result.total.detach().cpu())
+            loss_terms = {key: float(value.detach().cpu()) for key, value in loss_result.terms.items()}
+            zero_loss_stop = math.isfinite(last_loss) and last_loss <= float(ZERO_LOSS_STOP_THRESHOLD)
+            if stage_step == 1 or stage_step % LOG_EVERY == 0 or stage_step == stage_steps or zero_loss_stop:
                 model.eval()
                 mean_err = NAN_METRIC
                 max_err = NAN_METRIC
@@ -1393,6 +1745,11 @@ def main() -> None:
                 latest = save_controller_checkpoint(
                     run_dir, run_id, "latest", model, optimizer, step, last_loss, int(stage_k), cfg, metadata
                 )
+                if last_loss < best_loss:
+                    best_loss = last_loss
+                    save_controller_checkpoint(
+                        run_dir, run_id, "best", model, optimizer, step, best_loss, int(stage_k), cfg, metadata
+                    )
                 elapsed = time.perf_counter() - start
                 stats = cache["rollout_stats"]
                 gt_text = (
@@ -1400,12 +1757,30 @@ def main() -> None:
                     if RUN_FK_DIAGNOSTIC
                     else "gt_diag=off"
                 )
+                ae_text = "disabled" if ae_loss_weight == 0.0 else f"{loss_terms.get('ae_score', NAN_METRIC):.6g}"
+                rl_text = " ".join(f"{name}={loss_terms.get(name, NAN_METRIC):.6g}" for name in rl_cfg.enabled_terms())
+                slide_text = ""
+                if envelope is not None:
+                    slide_text = (
+                        f"linear_slide_weighted={loss_terms.get('linear_slide_weighted', NAN_METRIC):.6g} "
+                        f"angular_slide_weighted={loss_terms.get('angular_slide_weighted', NAN_METRIC):.6g} "
+                    )
                 print(
                     f"step={step:05d} K={stage_k} train_loss={last_loss:.6g} "
+                    f"ae={ae_text} "
+                    f"{rl_text} "
+                    f"{slide_text}"
                     f"{gt_text} effK_mean={stats['effective_k_mean']:.2f} lr={lr:.3g} elapsed_s={elapsed:.1f}",
                     flush=True,
                 )
-                writer.add_scalar("loss/controller_total", last_loss, step)
+                writer.add_scalar("loss/train_total", last_loss, step)
+                if ae_loss_weight != 0.0:
+                    writer.add_scalar("loss/ae_score", loss_terms.get("ae_score", NAN_METRIC), step)
+                for name in rl_cfg.enabled_terms():
+                    writer.add_scalar(f"loss/{name}", loss_terms.get(name, NAN_METRIC), step)
+                if envelope is not None:
+                    writer.add_scalar("loss/linear_slide_weighted", loss_terms.get("linear_slide_weighted", NAN_METRIC), step)
+                    writer.add_scalar("loss/angular_slide_weighted", loss_terms.get("angular_slide_weighted", NAN_METRIC), step)
                 if RUN_FK_DIAGNOSTIC:
                     writer.add_scalar("eval/rollout_mean_m", mean_err, step)
                     writer.add_scalar("eval/rollout_max_m", max_err, step)
@@ -1416,13 +1791,19 @@ def main() -> None:
                 writer.flush()
                 print(f"checkpoint_latest={latest}", flush=True)
                 model.train()
+            if zero_loss_stop:
+                stop_training = True
+                wake_on_zero_loss(run_id, step, last_loss)
+                break
         stage_path = save_controller_checkpoint(
             run_dir, run_id, f"stage_K{int(stage_k)}", model, optimizer, step, last_loss, int(stage_k), cfg, metadata
         )
         print(f"saved stage checkpoint {stage_path}", flush=True)
         del stepper
+        if stop_training:
+            break
 
-    last = save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, total_steps, last_loss, ROLLOUT_K, cfg, metadata)
+    last = save_controller_checkpoint(run_dir, run_id, "last", model, optimizer, step, last_loss, last_stage_k, cfg, metadata)
     writer.close()
     print(f"saved {last}", flush=True)
 

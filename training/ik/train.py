@@ -51,8 +51,8 @@ def make_cfg(device: torch.device) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     cfg.pose_representation = "ik_markers"
     cfg.cyclic_animation = True
-    cfg.predict_residual = True
-    cfg.zero_init_output = True
+    cfg.predict_residual = False
+    cfg.zero_init_output = False
     cfg.hidden_dim = HIDDEN_DIM
     cfg.num_hidden_layers = NUM_HIDDEN_LAYERS
     cfg.learning_rate = LEARNING_RATE
