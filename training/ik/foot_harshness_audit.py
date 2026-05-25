@@ -154,13 +154,13 @@ def rollout_sequence(model: torch.nn.Module, store: ctl.SimpleClipStore, cfg: tl
         raw = ctl.model_forward(model, inp, cur_vec, cfg)
         pred_vec = ctl.clean_output_vector(raw, store)
         pred_pose, _raw_pose = tl.output_to_pose(pred_vec, clip)
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
+        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, cur_idx)
         global_pos, global_rot = fk_full_by_clip(store, clip_ids, root_pos, root_rot, pred_pose)
         pred_pos[target] = global_pos[0]
         pred_rot[target] = global_rot[0]
 
         prev_vec, prev_pelvis, prev_payload = cur_vec, cur_pelvis, cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
     return pred_pos, pred_rot
 
@@ -198,7 +198,7 @@ def one_step_sequence(model: torch.nn.Module, store: ctl.SimpleClipStore, cfg: t
     raw = ctl.model_forward(model, inp, cur_vec, cfg)
     pred_vec = ctl.clean_output_vector(raw, store)
     pred_pose, _raw_pose = tl.output_to_pose(pred_vec, clip)
-    root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
+    root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, cur_idx)
     pred_pos[2:], pred_rot[2:] = fk_full_by_clip(store, clip_ids, root_pos, root_rot, pred_pose)
     return pred_pos, pred_rot
 
@@ -616,14 +616,8 @@ def foot_delta_feature(
     output_dim = int(schema["output_dim"])
     pose_dim = int(schema["pose_dim"])
     payload_start = output_dim - int(tl.IK_PAYLOAD_DIM)
-    root_feature_start = input_dim - (3 + int(cfg.future_window) * 4)
     if int(cfg.future_window) < 1:
-        raise ValueError("foot_delta_feature needs the existing one-step root future feature")
-    root_x = controller_input[:, root_feature_start + 3] * float(cfg.max_speed_scale_final)
-    root_z = controller_input[:, root_feature_start + 4] * float(cfg.max_speed_scale_final)
-    dyaw = torch.atan2(controller_input[:, root_feature_start + 6], controller_input[:, root_feature_start + 5])
-    delta_rot = tl.yaw_to_row_matrix(dyaw)
-    root_delta = torch.stack((root_x, torch.zeros_like(root_x), root_z), dim=-1)
+        raise ValueError("foot_delta_feature needs the controller root feature layout")
 
     deltas: list[torch.Tensor] = []
     for spec in tl.IK_PAYLOAD_SLICES:
@@ -633,8 +627,7 @@ def foot_delta_feature(
         assert isinstance(pos_slice, slice)
         cur = controller_input[:, payload_start + int(pos_slice.start) : payload_start + int(pos_slice.stop)]
         nxt = output[:, payload_start + int(pos_slice.start) : payload_start + int(pos_slice.stop)]
-        nxt_in_cur_root = torch.matmul(nxt.unsqueeze(1), delta_rot).squeeze(1) + root_delta
-        deltas.append(nxt_in_cur_root - cur)
+        deltas.append(nxt - cur)
     return torch.cat(deltas, dim=-1)
 
 
@@ -697,7 +690,8 @@ def train_foot_delta_autoencoder_variant(
     derived = foot_delta_feature(controller_input, output, schema, locomotion_cfg).detach().cpu()
     aug_features = torch.cat((raw_features, derived), dim=-1)
     aug_schema = dict(schema)
-    aug_schema["feature"] = "controller_input_plus_target_output_plus_foot_delta"
+    feature_root = "current_root" if tl.output_reference_uses_current_root() else "future_root"
+    aug_schema["feature"] = f"controller_input_plus_{feature_root}_transition_output_plus_foot_delta"
     aug_schema["base_total_dim"] = int(schema["total_dim"])
     aug_schema["total_dim"] = int(aug_features.shape[-1])
     aug_schema["foot_delta_start"] = int(schema["total_dim"])
@@ -979,6 +973,9 @@ def train_controller(
             "score_topk_fraction": float(score_topk_fraction),
             "stop_after_k": int(stop_after_k) if stop_after_k is not None else None,
             "pose_representation": tl.IK_POSE_REPRESENTATION,
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
+            "state_reference_root": tl.STATE_REFERENCE_ROOT,
         },
         "rollout_schedule": [int(k) for k in ctl.ROLLOUT_SCHEDULE],
         "rollout_stage_steps": [int(n) for n in ctl.ROLLOUT_STAGE_STEPS],
@@ -995,7 +992,10 @@ def train_controller(
     t0 = time.perf_counter()
     original_score_rows = ctl.ae_score_rows
     ae_schema = dict(ae_ckpt["schema"])
-    if ae_schema.get("feature") == "controller_input_plus_target_output_plus_foot_delta":
+    if str(ae_schema.get("feature", "")) in {
+        "controller_input_plus_current_root_transition_output_plus_foot_delta",
+        "controller_input_plus_future_root_transition_output_plus_foot_delta",
+    }:
         ctl.ae_score_rows = make_foot_delta_score_fn(
             ae_schema,
             cfg,

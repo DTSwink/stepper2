@@ -428,6 +428,9 @@ def transition_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, int
         "next_velocity_start": input_dim + output_dim + next_canon_dim,
         "transition_foot_motion_start": base_total_dim,
         "root_lookahead_start": total_without_root_lookahead,
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
+        "state_reference_root": tl.STATE_REFERENCE_ROOT,
     }
 
 
@@ -499,12 +502,20 @@ def transition_feature_from_next_pose(
     device: torch.device,
 ) -> torch.Tensor:
     model_input = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
-    next_output = tl.pose_target_output(next_pose)
-    pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
-    if "ik_payload" in next_pose:
-        joint_next_vel = (next_pose["ik_payload"] - cur_pose["ik_payload"]).reshape(cur_idx.shape[0], -1)
+    next_pose_state = next_pose
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = tl.root_state(clip, cur_idx + 1, cfg, device)
+    cur_pose_delta = cur_pose
+    if tl.output_reference_uses_current_root():
+        next_pose = tl.rebase_pose_root(clip, next_pose, next_root_pos, next_root_rot, cur_root_pos, cur_root_rot)
     else:
-        joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
+        cur_pose_delta = tl.rebase_pose_root(clip, cur_pose, cur_root_pos, cur_root_rot, next_root_pos, next_root_rot)
+    next_output = tl.pose_target_output(next_pose)
+    pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose_delta["pelvis_pos"]) / cfg.pose_delta_scale_final
+    if "ik_payload" in next_pose:
+        joint_next_vel = (next_pose["ik_payload"] - cur_pose_delta["ik_payload"]).reshape(cur_idx.shape[0], -1)
+    else:
+        joint_next_vel = (next_pose["canon_pos"] - cur_pose_delta["canon_pos"]).reshape(cur_idx.shape[0], -1)
     joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
     parts = [
         model_input,
@@ -514,7 +525,7 @@ def transition_feature_from_next_pose(
         joint_next_vel,
     ]
     if getattr(cfg, "include_transition_foot_motion", False):
-        parts.append(transition_foot_motion_features(clip, cur_idx, cur_pose, next_pose, cfg, device))
+        parts.append(transition_foot_motion_features(clip, cur_idx, cur_pose, next_pose_state, cfg, device))
     if max(0, int(getattr(cfg, "root_lookahead_steps", 0))) > 0:
         parts.append(root_lookahead_features(clip, cur_idx, cfg, device))
     return torch.cat(parts, dim=-1)

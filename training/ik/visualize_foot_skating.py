@@ -79,7 +79,7 @@ def rollout_autoreg(
 
     for target in range(2, frame_count):
         target_idx = torch.tensor([target], dtype=torch.long, device=device)
-        root_pos, root_rot, _root_yaw, _heading = store.root_state(clip_ids, target_idx)
+        root_pos, root_rot, _root_yaw, _heading = store.root_state(clip_ids, cur_idx)
         inp = simple_ctl.build_controller_input(
             store,
             clip_ids,
@@ -100,7 +100,7 @@ def rollout_autoreg(
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = simple_ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = simple_ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
     return pred_pos, pred_rot
 

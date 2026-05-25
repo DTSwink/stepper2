@@ -10,6 +10,7 @@ output_path = "training/runs/model_comparisons/model_comparison.html"
 import argparse
 import base64
 import json
+from contextlib import contextmanager
 from dataclasses import fields
 from pathlib import Path
 
@@ -28,7 +29,7 @@ except ImportError:
     import train_simple_ae_controller as simple_ctl
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -99,12 +100,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     }}
     #controls {{
       display: grid;
-      grid-template-columns: auto auto minmax(180px, 1fr) auto auto auto auto auto auto auto;
+      grid-template-rows: auto auto;
       gap: 10px;
-      align-items: center;
       padding: 10px 12px;
       background: var(--panel);
       border-top: 1px solid var(--line);
+    }}
+    #controlToolbar {{
+      display: flex;
+      justify-content: flex-end;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    #playbackControls {{
+      display: grid;
+      grid-template-columns: auto auto minmax(240px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
     }}
     button, input, select {{
       height: 32px;
@@ -121,8 +134,16 @@ HTML_TEMPLATE = r"""<!doctype html>
     label {{ display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }}
     .num {{ width: 72px; padding: 0 7px; }}
     @media (max-width: 760px) {{
-      #controls {{ grid-template-columns: auto 1fr auto; }}
-      #controls .wide-extra {{ display: none; }}
+      #controlToolbar {{
+        justify-content: flex-start;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 2px;
+        scrollbar-width: thin;
+      }}
+      #controlToolbar .wide-extra {{ flex: 0 0 auto; }}
+      #playbackControls {{ grid-template-columns: auto minmax(120px, 1fr) auto; }}
+      #playbackControls #runSelect {{ display: none !important; }}
     }}
   </style>
 </head>
@@ -143,17 +164,21 @@ HTML_TEMPLATE = r"""<!doctype html>
       <div id="tooltip"></div>
     </div>
     <div id="controls">
-      <select id="runSelect" title="Choose comparison run"></select>
-      <button id="play" title="Play or pause">Play</button>
-      <input id="frame" type="range" min="0" max="{last_frame}" value="0" step="1">
-      <label class="wide-extra">Speed <input id="speed" class="num" type="number" value="1" min="0.1" max="4" step="0.1"></label>
-      <label class="wide-extra">Scale <input id="scale" class="num" type="number" value="1" min="0.05" max="10" step="0.05"></label>
-      <button id="predictionMode" class="wide-extra" title="Toggle one-step prediction or full autoregressive rollout">Autoreg</button>
-      <button id="mode" class="wide-extra" title="Overlay or side-by-side comparison">Overlay</button>
-      <button id="volumes" class="wide-extra" title="Toggle bone orientation volumes">Hide Volumes</button>
-      <button id="trails" class="wide-extra" title="Toggle recent root trails">Trails</button>
-      <button id="labels" class="wide-extra" title="Toggle joint labels">Labels</button>
-      <button id="reset" class="wide-extra" title="Reset camera">Reset</button>
+      <div id="controlToolbar">
+        <label class="wide-extra">Scale <input id="scale" class="num" type="number" value="1" min="0.05" max="10" step="0.05"></label>
+        <button id="predictionMode" class="wide-extra" title="Toggle one-step prediction or full autoregressive rollout">Autoreg</button>
+        <button id="mode" class="wide-extra" title="Overlay or side-by-side comparison">Overlay</button>
+        <button id="volumes" class="wide-extra" title="Toggle bone orientation volumes">Hide Volumes</button>
+        <button id="trails" class="wide-extra" title="Toggle recent root trails">Trails</button>
+        <button id="labels" class="wide-extra" title="Toggle joint labels">Labels</button>
+        <button id="reset" class="wide-extra" title="Reset camera">Reset</button>
+      </div>
+      <div id="playbackControls">
+        <select id="runSelect" title="Choose comparison run"></select>
+        <button id="play" title="Play or pause">Play</button>
+        <input id="frame" type="range" min="0" max="{last_frame}" value="0" step="1">
+        <label>Speed <input id="speed" class="num" type="number" value="1" min="0.1" max="4" step="0.1"></label>
+      </div>
     </div>
   </div>
   <script id="motion-data" type="application/json">{payload}</script>
@@ -717,30 +742,58 @@ def resolve_optional_path(path_text: str | None) -> Path | None:
     return resolve_path(str(path_text))
 
 
-def find_latest_checkpoint() -> Path:
+def checkpoint_sort_key(path: Path) -> tuple[int, int, str]:
+    try:
+        checkpoint_mtime = int(path.stat().st_mtime_ns)
+    except OSError:
+        checkpoint_mtime = 0
+    run_dir = path.parent.parent if path.parent.name == "checkpoints" else path.parent
+    try:
+        run_mtime = int(run_dir.stat().st_mtime_ns)
+    except OSError:
+        run_mtime = checkpoint_mtime
+    return (max(checkpoint_mtime, run_mtime), checkpoint_mtime, str(path).lower())
+
+
+def likely_controller_checkpoint_path(path: Path) -> bool:
+    if not path.is_file() or path.suffix.lower() not in {".pt", ".pth"}:
+        return False
+    lower_name = path.name.lower()
+    if lower_name.endswith("_init.pt") or lower_name == "checkpoint_init.pt":
+        return False
+    if path.parent.name != "checkpoints":
+        return False
+    return True
+
+
+def is_current_controller_checkpoint_path(path: Path) -> bool:
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    return ckpt_runtime.is_current_ik_controller_checkpoint(ckpt)
+
+
+def find_latest_checkpoint(name_contains: str = "") -> Path:
     run_root = PROJECT_ROOT / "training" / "runs"
-    run_dirs = [path for path in run_root.iterdir() if path.is_dir()] if run_root.exists() else []
-    candidates: list[tuple[float, Path, Path]] = []
-    for run_dir in run_dirs:
-        ckpt_dir = run_dir / "checkpoints"
-        if not ckpt_dir.exists():
-            continue
-        checkpoints = [p for p in ckpt_dir.glob("*.pt") if p.is_file()]
-        if not checkpoints:
-            continue
-        newest_mtime = max(p.stat().st_mtime for p in checkpoints)
-        preferred = sorted(
-            [p for p in checkpoints if p.stem.endswith("_best") or "_best_" in p.stem],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not preferred:
-            preferred = sorted(checkpoints, key=lambda p: p.stat().st_mtime, reverse=True)
-        candidates.append((newest_mtime, run_dir, preferred[0]))
+    filter_text = str(name_contains or "").lower().strip()
+    candidates: list[Path] = []
+    if run_root.exists():
+        for checkpoint_dir in run_root.glob("*/checkpoints"):
+            try:
+                candidates.extend(
+                    path for path in checkpoint_dir.glob("*.pt") if likely_controller_checkpoint_path(path)
+                )
+            except OSError:
+                continue
     if not candidates:
         raise FileNotFoundError(f"No checkpoints found under {run_root}")
-    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
-    return candidates[0][2].resolve()
+    for checkpoint in sorted(candidates, key=checkpoint_sort_key, reverse=True):
+        if filter_text and filter_text not in str(checkpoint).lower():
+            continue
+        if is_current_controller_checkpoint_path(checkpoint):
+            return checkpoint.resolve()
+    raise FileNotFoundError(f"No current IK controller checkpoints found under {run_root}")
 
 
 def infer_npz_path(ckpt: dict, checkpoint: Path) -> Path:
@@ -760,6 +813,16 @@ def infer_npz_path(ckpt: dict, checkpoint: Path) -> Path:
         "No --npz-path was provided and the checkpoint does not record a usable source NPZ "
         f"({checkpoint})"
     )
+
+
+def infer_cyclic_from_path(path: Path) -> bool:
+    text = str(path).replace("\\", "/").lower()
+    stem = path.stem.lower()
+    if "loop" in stem or "animations_omni" in text:
+        return True
+    if "transition" in text or "turn" in stem or "reface" in stem or "diamond" in stem:
+        return False
+    return False
 
 
 def infer_npz_cyclic_flag(ckpt: dict, npz: Path) -> bool | None:
@@ -786,7 +849,7 @@ def infer_npz_cyclic_flag(ckpt: dict, npz: Path) -> bool | None:
                     return True
         except Exception:
             continue
-    return None
+    return infer_cyclic_from_path(npz_resolved)
 
 
 def apply_config_dict(cfg: tl.TrainConfig, values: dict) -> None:
@@ -810,6 +873,27 @@ def load_model(checkpoint: dict, clip: tl.MotionClip, cfg: tl.TrainConfig, devic
 
 def is_current_ik_controller_checkpoint(checkpoint: dict) -> bool:
     return ckpt_runtime.is_current_ik_controller_checkpoint(checkpoint)
+
+
+def checkpoint_output_contract(checkpoint: dict) -> tuple[str, str]:
+    policy = ckpt_runtime.checkpoint_policy(checkpoint)
+    root = tl.normalized_output_reference_root(policy.get("output_reference_root", tl.OUTPUT_REFERENCE_ROOT))
+    prediction = tl.normalized_output_prediction_mode(ckpt_runtime.checkpoint_output_prediction_mode(checkpoint))
+    return root, prediction
+
+
+@contextmanager
+def use_checkpoint_output_contract(checkpoint: dict):
+    previous_root = tl.OUTPUT_REFERENCE_ROOT
+    previous_prediction = tl.OUTPUT_PREDICTION_MODE
+    root, prediction = checkpoint_output_contract(checkpoint)
+    tl.OUTPUT_REFERENCE_ROOT = root
+    tl.OUTPUT_PREDICTION_MODE = prediction
+    try:
+        yield root, prediction
+    finally:
+        tl.OUTPUT_REFERENCE_ROOT = previous_root
+        tl.OUTPUT_PREDICTION_MODE = previous_prediction
 
 
 @torch.no_grad()
@@ -841,9 +925,9 @@ def rollout_ik_controller_model(
 
     for target in range(2, frame_count):
         target_idx = torch.tensor([target], dtype=torch.long, device=device)
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
 
         one_cur_idx = torch.tensor([target - 1], dtype=torch.long, device=device)
+        one_root_pos, one_root_rot, _one_yaw, _one_heading = store.root_state(clip_ids, one_cur_idx)
         one_prev_vec, one_prev_pelvis, one_prev_payload = simple_ctl.target_state(store, clip_ids, one_cur_idx - 1)
         one_cur_vec, one_cur_pelvis, one_cur_payload = simple_ctl.target_state(store, clip_ids, one_cur_idx)
         one_inp = simple_ctl.build_controller_input(
@@ -860,7 +944,10 @@ def rollout_ik_controller_model(
         one_raw = simple_ctl.model_forward(model, one_inp, one_cur_vec, cfg)
         one_vec = simple_ctl.clean_output_vector(one_raw, store)
         one_pose, _ = tl.output_to_pose(one_vec, clip)
-        one_global_pos, one_global_rot, _ = tl.fk_from_pose(clip, root_pos, root_rot, one_pose, device)
+        one_decode_root_pos, one_decode_root_rot = simple_ctl.transition_output_root_state(store, clip_ids, one_cur_idx)
+        one_global_pos, one_global_rot, _ = tl.fk_from_pose(
+            clip, one_decode_root_pos, one_decode_root_rot, one_pose, device
+        )
         pred_one_step_pos_t[target] = one_global_pos[0]
         pred_one_step_rot_t[target] = one_global_rot[0]
 
@@ -878,6 +965,7 @@ def rollout_ik_controller_model(
         raw = simple_ctl.model_forward(model, inp, cur_vec, cfg)
         pred_vec = simple_ctl.clean_output_vector(raw, store)
         pred_pose, _ = tl.output_to_pose(pred_vec, clip)
+        root_pos, root_rot = simple_ctl.transition_output_root_state(store, clip_ids, cur_idx)
         global_pos, global_rot, _ = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
         pred_ar_pos_t[target] = global_pos[0]
         pred_ar_rot_t[target] = global_rot[0]
@@ -885,7 +973,7 @@ def rollout_ik_controller_model(
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = simple_ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = simple_ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
 
     error_ar = (pred_ar_pos_t - gt_pos_t).norm(dim=-1).mean(dim=-1).detach().cpu().numpy().astype(np.float32)
@@ -974,6 +1062,65 @@ def write_html(payload: dict | list[dict], output: Path, title: str) -> None:
     output.write_text(html, encoding="utf-8")
 
 
+def render_checkpoint_to_html(
+    *,
+    checkpoint: Path,
+    output: Path,
+    npz: Path | None = None,
+    device: torch.device | None = None,
+    max_frames: int | None = None,
+) -> dict[str, object]:
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    ckpt_runtime.require_current_ik_controller_checkpoint(ckpt, checkpoint)
+    with use_checkpoint_output_contract(ckpt) as (output_root, prediction_mode):
+        resolved_npz = npz or infer_npz_path(ckpt, checkpoint)
+        cfg = tl.TrainConfig()
+        apply_config_dict(cfg, ckpt.get("config", {}))
+        cfg.device = str(device)
+        cfg.use_torch_compile = False
+
+        clip = tl.MotionClip(resolved_npz, cfg, cyclic_animation=infer_npz_cyclic_flag(ckpt, resolved_npz))
+        model = load_model(ckpt, clip, cfg, device)
+        gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = (
+            rollout_ik_controller_model(model, clip, cfg, device, max_frames)
+        )
+        payload = make_payload(
+            clip,
+            gt_pos,
+            gt_rot,
+            pred_one_step_pos,
+            pred_one_step_rot,
+            error_one_step,
+            pred_ar_pos,
+            pred_ar_rot,
+            error_ar,
+        )
+        title = f"{resolved_npz.stem} vs {checkpoint.parent.parent.name}"
+        payload["title"] = title
+        payload["output_reference_root"] = output_root
+        payload["output_prediction_mode"] = prediction_mode
+        write_html(payload, output, title)
+        return {
+            "checkpoint": checkpoint,
+            "npz": resolved_npz,
+            "runtime": ckpt_runtime.runtime_name(ckpt),
+            "output_reference_root": output_root,
+            "output_prediction_mode": prediction_mode,
+            "frame_count": int(payload["frame_count"]),
+            "bone_count": int(payload["bone_count"]),
+            "fps": float(payload["fps"]),
+            "one_step_start": float(error_one_step[0]),
+            "one_step_end": float(error_one_step[-1]),
+            "one_step_avg": float(error_one_step.mean()),
+            "one_step_max": float(error_one_step.max()),
+            "autoregressive_start": float(error_ar[0]),
+            "autoregressive_end": float(error_ar[-1]),
+            "autoregressive_avg": float(error_ar.mean()),
+            "autoregressive_max": float(error_ar.max()),
+        }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize autoregressive model rollout against NPZ ground truth.")
     parser.add_argument("--npz-path", default=npz_path)
@@ -987,47 +1134,29 @@ def main() -> None:
     output = resolve_path(args.output_path)
     device = torch.device(args.device)
 
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    ckpt_runtime.require_current_ik_controller_checkpoint(ckpt, checkpoint)
-    npz = resolve_optional_path(args.npz_path) or infer_npz_path(ckpt, checkpoint)
-    cfg = tl.TrainConfig()
-    apply_config_dict(cfg, ckpt.get("config", {}))
-    cfg.device = str(device)
-    cfg.use_torch_compile = False
-
-    clip = tl.MotionClip(npz, cfg, cyclic_animation=infer_npz_cyclic_flag(ckpt, npz))
-    model = load_model(ckpt, clip, cfg, device)
-    gt_pos, gt_rot, pred_one_step_pos, pred_one_step_rot, error_one_step, pred_ar_pos, pred_ar_rot, error_ar = (
-        rollout_ik_controller_model(model, clip, cfg, device, args.max_frames)
+    info = render_checkpoint_to_html(
+        checkpoint=checkpoint,
+        output=output,
+        npz=resolve_optional_path(args.npz_path),
+        device=device,
+        max_frames=args.max_frames,
     )
-    payload = make_payload(
-        clip,
-        gt_pos,
-        gt_rot,
-        pred_one_step_pos,
-        pred_one_step_rot,
-        error_one_step,
-        pred_ar_pos,
-        pred_ar_rot,
-        error_ar,
-    )
-    title = f"{npz.stem} vs {checkpoint.parent.parent.name}"
-    payload["title"] = title
-    write_html(payload, output, title)
 
     print(f"wrote {output}")
-    print(f"checkpoint {checkpoint}")
-    print(f"npz {npz}")
-    print(f"runtime {ckpt_runtime.runtime_name(ckpt)}")
-    print(f"frames {payload['frame_count']} bones {payload['bone_count']} fps {payload['fps']:.0f}")
-    print(f"one_step_mean_joint_error_start {float(error_one_step[0]):.6f}")
-    print(f"one_step_mean_joint_error_end {float(error_one_step[-1]):.6f}")
-    print(f"one_step_mean_joint_error_avg {float(error_one_step.mean()):.6f}")
-    print(f"one_step_mean_joint_error_max {float(error_one_step.max()):.6f}")
-    print(f"autoregressive_mean_joint_error_start {float(error_ar[0]):.6f}")
-    print(f"autoregressive_mean_joint_error_end {float(error_ar[-1]):.6f}")
-    print(f"autoregressive_mean_joint_error_avg {float(error_ar.mean()):.6f}")
-    print(f"autoregressive_mean_joint_error_max {float(error_ar.max()):.6f}")
+    print(f"checkpoint {info['checkpoint']}")
+    print(f"npz {info['npz']}")
+    print(f"runtime {info['runtime']}")
+    print(f"output_reference_root {info['output_reference_root']}")
+    print(f"output_prediction_mode {info['output_prediction_mode']}")
+    print(f"frames {info['frame_count']} bones {info['bone_count']} fps {info['fps']:.0f}")
+    print(f"one_step_mean_joint_error_start {info['one_step_start']:.6f}")
+    print(f"one_step_mean_joint_error_end {info['one_step_end']:.6f}")
+    print(f"one_step_mean_joint_error_avg {info['one_step_avg']:.6f}")
+    print(f"one_step_mean_joint_error_max {info['one_step_max']:.6f}")
+    print(f"autoregressive_mean_joint_error_start {info['autoregressive_start']:.6f}")
+    print(f"autoregressive_mean_joint_error_end {info['autoregressive_end']:.6f}")
+    print(f"autoregressive_mean_joint_error_avg {info['autoregressive_avg']:.6f}")
+    print(f"autoregressive_mean_joint_error_max {info['autoregressive_max']:.6f}")
 
 
 if __name__ == "__main__":

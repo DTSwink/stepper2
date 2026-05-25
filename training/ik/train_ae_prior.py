@@ -359,12 +359,16 @@ class ClipStore:
         self.ik_limb_specs = list(first.ik_limb_specs)
         self.ik_rest_axis = first.ik_rest_axis.to(device)
         self.ik_rest_pole = first.ik_rest_pole.to(device)
+        self.ik_ee_pole_ref = first.ik_ee_pole_ref.to(device)
+        self.ik_pole_alpha = first.ik_pole_alpha.to(device)
         self.ik_limb_lengths = first.ik_limb_lengths.to(device)
         self.ik_local_pole_axis = first.ik_local_pole_axis.to(device)
         self.ik_toe_offsets = first.ik_toe_offsets.to(device)
         self.ik_toe_axis = first.ik_toe_axis.to(device)
         self.ik_rest_axis_by_clip = torch.stack([clip.ik_rest_axis for clip in clips], dim=0).to(device)
         self.ik_rest_pole_by_clip = torch.stack([clip.ik_rest_pole for clip in clips], dim=0).to(device)
+        self.ik_ee_pole_ref_by_clip = torch.stack([clip.ik_ee_pole_ref for clip in clips], dim=0).to(device)
+        self.ik_pole_alpha_by_clip = torch.stack([clip.ik_pole_alpha for clip in clips], dim=0).to(device)
         self.ik_local_pole_axis_by_clip = torch.stack([clip.ik_local_pole_axis for clip in clips], dim=0).to(device)
         self.ik_toe_axis_by_clip = torch.stack([clip.ik_toe_axis for clip in clips], dim=0).to(device)
         self.foot_indices = tuple(int(x) for x in first.foot_indices_tensor.tolist())
@@ -694,7 +698,12 @@ class ClipStore:
     def get_input_root_features(self, clip_ids: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         return self.input_root_features.index_select(0, self.frame_index(clip_ids, idx))
 
-    def root_state(self, clip_ids: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def root_state(
+        self,
+        clip_ids: torch.Tensor,
+        idx: torch.Tensor,
+        max_cycles: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         clip_ids = clip_ids.to(self.device).long()
         idx = idx.to(self.device).long()
         frame = self.frame_index(clip_ids, idx)
@@ -711,7 +720,12 @@ class ClipStore:
         rel_rot = base_rot @ root0_inv
         cycle_pos = self.cycle_pos.index_select(0, clip_ids)
         cycle_rot = self.cycle_rot.index_select(0, clip_ids)
-        max_cycles = int(cycles.max().detach().cpu()) if cycles.numel() else 0
+        if max_cycles is None:
+            if idx.is_cuda and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("ClipStore.root_state requires a static max_cycles during CUDA graph capture.")
+            max_cycles = int(cycles.max().detach().cpu()) if cycles.numel() else 0
+        else:
+            max_cycles = max(0, int(max_cycles))
         for cycle in range(max_cycles):
             mask = (cycles > cycle).reshape(-1, 1)
             next_pos = torch.matmul(rel_pos.unsqueeze(1), cycle_rot).squeeze(1) + cycle_pos
@@ -792,17 +806,11 @@ class ClipStore:
                 end_root = base_root + axis * d_clamped
                 rest_axis = self.ik_rest_axis_by_clip.index_select(0, clip_ids_long)[:, limb_i].to(dtype=root_rot.dtype)
                 rest_pole = self.ik_rest_pole_by_clip.index_select(0, clip_ids_long)[:, limb_i].to(dtype=root_rot.dtype)
-                natural_pole = tl.project_to_plane(tl.swing_only_transport(rest_axis, axis, rest_pole), axis)
-                pole_root = tl.rotate_around_axis(natural_pole, axis, pole_float * tl.IK_POLE_ALPHA)
-                mid_root = tl.solve_two_bone_with_pole(
-                    base_root,
-                    end_root,
-                    l1,
-                    l2,
-                    rest_axis,
-                    rest_pole,
-                    pole_float,
-                )
+                ee_pole_ref = self.ik_ee_pole_ref_by_clip.index_select(0, clip_ids_long)[:, limb_i].to(dtype=root_rot.dtype)
+                pole_alpha = self.ik_pole_alpha_by_clip.index_select(0, clip_ids_long)[:, limb_i].to(dtype=root_rot.dtype)
+                natural_pole = tl.ee_frame_pole_reference(axis, end_rot_root, ee_pole_ref, rest_axis, rest_pole)
+                pole_root = tl.rotate_around_axis(natural_pole, axis, pole_float * pole_alpha)
+                mid_root = tl.solve_two_bone_with_pole_vector(base_root, end_root, l1, l2, pole_root)
                 solved_mid = tl.root_relative_to_world(mid_root.unsqueeze(1), root_pos, root_rot).squeeze(1)
                 solved_end = tl.root_relative_to_world(end_root.unsqueeze(1), root_pos, root_rot).squeeze(1)
                 end_rot_world = tl.root_relative_rot_to_world(end_rot_root, root_rot)
@@ -1049,12 +1057,34 @@ def store_transition_feature_from_next_pose(
     cfg: tl.TrainConfig,
 ) -> torch.Tensor:
     model_input = store_build_input(store, clip_ids, prev_idx, cur_idx, prev_pose, cur_pose, cfg)
-    next_output = tl.pose_target_output(next_pose)
-    pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose["pelvis_pos"]) / cfg.pose_delta_scale_final
-    if "ik_payload" in next_pose:
-        joint_next_vel = (next_pose["ik_payload"] - cur_pose["ik_payload"]).reshape(cur_idx.shape[0], -1)
+    next_pose_state = next_pose
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+    cur_pose_delta = cur_pose
+    if tl.output_reference_uses_current_root():
+        next_pose = tl.rebase_pose_root(
+            store.prototype,
+            next_pose,
+            next_root_pos,
+            next_root_rot,
+            cur_root_pos,
+            cur_root_rot,
+        )
     else:
-        joint_next_vel = (next_pose["canon_pos"] - cur_pose["canon_pos"]).reshape(cur_idx.shape[0], -1)
+        cur_pose_delta = tl.rebase_pose_root(
+            store.prototype,
+            cur_pose,
+            cur_root_pos,
+            cur_root_rot,
+            next_root_pos,
+            next_root_rot,
+        )
+    next_output = tl.pose_target_output(next_pose)
+    pelvis_next_vel = (next_pose["pelvis_pos"] - cur_pose_delta["pelvis_pos"]) / cfg.pose_delta_scale_final
+    if "ik_payload" in next_pose:
+        joint_next_vel = (next_pose["ik_payload"] - cur_pose_delta["ik_payload"]).reshape(cur_idx.shape[0], -1)
+    else:
+        joint_next_vel = (next_pose["canon_pos"] - cur_pose_delta["canon_pos"]).reshape(cur_idx.shape[0], -1)
     joint_next_vel = joint_next_vel / cfg.pose_delta_scale_final
     parts = [
         model_input,
@@ -1064,10 +1094,13 @@ def store_transition_feature_from_next_pose(
         joint_next_vel,
     ]
     if getattr(cfg, "include_transition_foot_motion", False):
-        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
-        next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
         cur_pos, cur_rot, _cur_canon = store.fk_from_pose(clip_ids, cur_root_pos, cur_root_rot, cur_pose)
-        next_pos, next_rot, _next_canon = store.fk_from_pose(clip_ids, next_root_pos, next_root_rot, next_pose)
+        next_pos, next_rot, _next_canon = store.fk_from_pose(
+            clip_ids,
+            next_root_pos,
+            next_root_rot,
+            next_pose_state,
+        )
         slide = cp.foot_slide_speeds(
             cur_pos,
             cur_rot,
@@ -1363,9 +1396,33 @@ def estimate_forward_yaw_excess_scale(
         raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
         pred_pose, _raw_pose = tl.output_to_pose(raw_out, store.prototype)
         target_idx = cur_idx + 1
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
-        pred_global_pos, pred_global_rot, pred_canon = store.fk_from_pose(clip_ids, root_pos, root_rot, pred_pose)
         cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
+        output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else target_root_pos
+        output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else target_root_rot
+        pred_global_pos, pred_global_rot, _pred_canon_current = store.fk_from_pose(
+            clip_ids,
+            output_root_pos,
+            output_root_rot,
+            pred_pose,
+        )
+        if tl.output_reference_uses_current_root():
+            state_pose = tl.rebase_pose_root(
+                store.prototype,
+                pred_pose,
+                cur_root_pos,
+                cur_root_rot,
+                target_root_pos,
+                target_root_rot,
+            )
+        else:
+            state_pose = pred_pose
+        _state_global_pos, _state_global_rot, pred_canon = store.fk_from_pose(
+            clip_ids,
+            target_root_pos,
+            target_root_rot,
+            state_pose,
+        )
         cur_global_pos, cur_global_rot, _cur_canon = store.fk_from_pose(clip_ids, cur_root_pos, cur_root_rot, cur_pose)
         speeds = cp.foot_vertical_yaw_speeds(
             cur_global_pos,
@@ -1385,7 +1442,7 @@ def estimate_forward_yaw_excess_scale(
         )
         bounds = store.yaw_bound_radps.index_select(0, store.frame_index(clip_ids, cur_idx))
         max_excess = torch.maximum(max_excess, F.relu(speeds - bounds).amax())
-        next_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
+        next_pose = tl.next_pose_from_prediction(state_pose, pred_canon)
         prev_pose = cur_pose
         cur_pose = next_pose
         prev_idx = cur_idx
@@ -1554,9 +1611,30 @@ def run_batch_ae_truncated(
             pred_pose, raw_pose = tl.output_to_pose(raw_out, clip)
             target_idx = torch.where(active, cur_idx + 1, cur_idx)
             tensors = clip.tensors(device)
-            root_pos, root_rot, _yaw, _heading = tl.root_state(clip, target_idx, cfg, device)
-            pred_global_pos, pred_global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
-            next_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+            target_root_pos, target_root_rot, _target_yaw, _target_heading = tl.root_state(
+                clip, target_idx, cfg, device
+            )
+            output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else target_root_pos
+            output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else target_root_rot
+            pred_global_pos, pred_global_rot, _pred_canon_current = tl.fk_from_pose(
+                clip, output_root_pos, output_root_rot, pred_pose, device
+            )
+            if tl.output_reference_uses_current_root():
+                state_pose = tl.rebase_pose_root(
+                    clip,
+                    pred_pose,
+                    cur_root_pos,
+                    cur_root_rot,
+                    target_root_pos,
+                    target_root_rot,
+                )
+            else:
+                state_pose = pred_pose
+            _state_global_pos, _state_global_rot, pred_canon = tl.fk_from_pose(
+                clip, target_root_pos, target_root_rot, state_pose, device
+            )
+            next_pose = tl.next_pose_from_prediction(state_pose, pred_canon)
             prior_scores = [
                 (
                     ae_score(
@@ -1648,10 +1726,22 @@ def run_batch_ae_truncated(
                     .sqrt()
                     .detach()
                 )
+                target_output_pose = (
+                    tl.rebase_pose_root(
+                        clip,
+                        target_pose,
+                        target_root_pos[active],
+                        target_root_rot[active],
+                        cur_root_pos[active],
+                        cur_root_rot[active],
+                    )
+                    if tl.output_reference_uses_current_root()
+                    else target_pose
+                )
                 output_mses.append(
                     F.mse_loss(
-                        tl.pose_target_output(select_pose_rows(next_pose, active)),
-                        tl.pose_target_output(target_pose),
+                        tl.pose_target_output(select_pose_rows(pred_pose, active)),
+                        tl.pose_target_output(target_output_pose),
                     )
                     .detach()
                 )
@@ -1850,9 +1940,30 @@ def run_batch_ae_resetting(
             inp = tl.build_input(clip, local_prev_idx, local_cur_idx, local_prev_pose, local_cur_pose, cfg, device)
             raw_out = tl.predict_next_raw(model, inp, local_cur_pose, cfg)
             pred_pose, raw_pose = tl.output_to_pose(raw_out, clip)
-            root_pos, root_rot, _yaw, _heading = tl.root_state(clip, local_target_idx, cfg, device)
-            pred_global_pos, pred_global_rot, pred_canon = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
-            next_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
+            cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, local_cur_idx, cfg, device)
+            target_root_pos, target_root_rot, _target_yaw, _target_heading = tl.root_state(
+                clip, local_target_idx, cfg, device
+            )
+            output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else target_root_pos
+            output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else target_root_rot
+            pred_global_pos, pred_global_rot, _pred_canon_current = tl.fk_from_pose(
+                clip, output_root_pos, output_root_rot, pred_pose, device
+            )
+            if tl.output_reference_uses_current_root():
+                state_pose = tl.rebase_pose_root(
+                    clip,
+                    pred_pose,
+                    cur_root_pos,
+                    cur_root_rot,
+                    target_root_pos,
+                    target_root_rot,
+                )
+            else:
+                state_pose = pred_pose
+            _state_global_pos, _state_global_rot, pred_canon = tl.fk_from_pose(
+                clip, target_root_pos, target_root_rot, state_pose, device
+            )
+            next_pose = tl.next_pose_from_prediction(state_pose, pred_canon)
             prior_scores = [
                 ae_score(
                     prior_info["model"],
@@ -1945,8 +2056,24 @@ def run_batch_ae_resetting(
                     * n_rows
                 )
                 ee_counts.append(n_rows)
+                target_output_pose = (
+                    tl.rebase_pose_root(
+                        clip,
+                        target_pose,
+                        target_root_pos,
+                        target_root_rot,
+                        cur_root_pos,
+                        cur_root_rot,
+                    )
+                    if tl.output_reference_uses_current_root()
+                    else target_pose
+                )
                 output_values.append(
-                    F.mse_loss(tl.pose_target_output(next_pose), tl.pose_target_output(target_pose)).detach() * n_rows
+                    F.mse_loss(
+                        tl.pose_target_output(pred_pose),
+                        tl.pose_target_output(target_output_pose),
+                    ).detach()
+                    * n_rows
                 )
                 output_counts.append(n_rows)
 
@@ -2090,18 +2217,48 @@ def run_batch_ae_store(
         raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
         pred_pose, raw_pose = tl.output_to_pose(raw_out, store.prototype)
         target_idx = cur_idx + 1
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
         needs_pred_global_rot = (
             cfg.slide_excess_loss_weight > 0.0
             or cfg.yaw_excess_loss_weight > 0.0
             or compute_diagnostics
         )
+        output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else target_root_pos
+        output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else target_root_rot
         if needs_pred_global_rot:
-            pred_global_pos, pred_global_rot, pred_canon = store.fk_from_pose(clip_ids, root_pos, root_rot, pred_pose)
+            pred_global_pos, pred_global_rot, _pred_canon_current = store.fk_from_pose(
+                clip_ids,
+                output_root_pos,
+                output_root_rot,
+                pred_pose,
+            )
         else:
-            pred_global_pos, pred_canon = store.fk_positions_from_pose(clip_ids, root_pos, root_rot, pred_pose)
+            pred_global_pos, _pred_canon_current = store.fk_positions_from_pose(
+                clip_ids,
+                output_root_pos,
+                output_root_rot,
+                pred_pose,
+            )
             pred_global_rot = None
-        next_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
+        if tl.output_reference_uses_current_root():
+            state_pose = tl.rebase_pose_root(
+                store.prototype,
+                pred_pose,
+                cur_root_pos,
+                cur_root_rot,
+                target_root_pos,
+                target_root_rot,
+            )
+        else:
+            state_pose = pred_pose
+        _state_global_pos, pred_canon = store.fk_positions_from_pose(
+            clip_ids,
+            target_root_pos,
+            target_root_rot,
+            state_pose,
+        )
+        next_pose = tl.next_pose_from_prediction(state_pose, pred_canon)
         prior_scores: list[tuple[torch.Tensor, float, str]] = []
         for prior_info in transition_priors:
             raw_score_rows = ae_score_rows(
@@ -2345,8 +2502,23 @@ def run_batch_ae_store(
                 .sqrt()
                 .detach()
             )
+            target_output_pose = (
+                tl.rebase_pose_root(
+                    store.prototype,
+                    target_pose,
+                    target_root_pos,
+                    target_root_rot,
+                    cur_root_pos,
+                    cur_root_rot,
+                )
+                if tl.output_reference_uses_current_root()
+                else target_pose
+            )
             output_values.append(
-                F.mse_loss(tl.pose_target_output(next_pose), tl.pose_target_output(target_pose)).detach()
+                F.mse_loss(
+                    tl.pose_target_output(pred_pose),
+                    tl.pose_target_output(target_output_pose),
+                ).detach()
             )
 
         prev_pose = cur_pose
@@ -2433,8 +2605,10 @@ def train(args: argparse.Namespace) -> None:
     cfg.disable_validation = True
     cfg.use_torch_compile = bool(args.compile) and not args.no_compile
     cfg.torch_compile_mode = args.compile_mode
-    cfg.predict_residual = args.predict_residual
-    cfg.zero_init_output = args.zero_init_output
+    if args.predict_residual is not None:
+        cfg.predict_residual = tl.output_prediction_uses_residual()
+    cfg.predict_residual = tl.output_prediction_uses_residual()
+    cfg.zero_init_output = args.zero_init_output or tl.output_prediction_uses_residual()
     cfg.run_name = args.run_name
     if args.date_prefix_run_name:
         cfg.run_name = tl.date_prefixed_run_name(cfg.run_name)
@@ -2585,6 +2759,14 @@ def train(args: argparse.Namespace) -> None:
         "non_pelvis_indices": clips[0].non_pelvis,
         "end_effector_indices": clips[0].end_effectors,
         "pose_representation": cfg.pose_representation,
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
+        "predict_residual": bool(cfg.predict_residual),
+        "state_reference_root": tl.STATE_REFERENCE_ROOT,
+        "ik_schema_version": tl.IK_SCHEMA_VERSION,
+        "ik_pole_reference": tl.IK_POLE_REFERENCE,
+        "ik_leg_pole_alpha_deg": math.degrees(tl.IK_LEG_POLE_ALPHA),
+        "ik_arm_pole_alpha_deg": math.degrees(tl.IK_ARM_POLE_ALPHA),
         "ik_marker_names": clips[0].ik_marker_names,
         "ik_marker_indices": clips[0].ik_marker_indices,
         "core_non_pelvis_indices": clips[0].core_non_pelvis,
@@ -3668,7 +3850,12 @@ def main() -> None:
         action="store_true",
         help="Synchronize CUDA around timed sections for stricter timing. Slower, but more precise.",
     )
-    parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--predict-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disabled. Residual prediction is rejected by the current IK controller contract.",
+    )
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--contact-physics-losses",

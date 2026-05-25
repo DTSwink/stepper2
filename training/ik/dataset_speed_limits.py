@@ -10,10 +10,12 @@ try:
     from .bootstrap import PROJECT_ROOT, ensure_paths
     from . import ik_core as tl
     from . import train_full_ae_envelope as full
+    from . import train_simple_ae_controller as ctl
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
     import ik_core as tl
     import train_full_ae_envelope as full
+    import train_simple_ae_controller as ctl
 
 ensure_paths()
 
@@ -116,51 +118,57 @@ def compute_dataset_limits(margin: float = 1.10) -> dict[str, object]:
         if cur.numel() == 0:
             continue
         fps = float(clip.fps)
+        store = ctl.SimpleClipStore([clip], cfg, torch.device("cpu"))
+        clip_ids = torch.zeros_like(cur)
+        cur_vec = store.get_target_output(clip_ids, cur)
+        out_vec = ctl.transition_target_output(store, clip_ids, cur)
+        cur_pose, _cur_raw = tl.output_to_pose(cur_vec, clip)
+        out_pose, _out_raw = tl.output_to_pose(out_vec, clip)
 
         pelvis_horizontal = torch.linalg.vector_norm(
-            torch.stack((clip.pelvis_local_pos[:, 0], clip.pelvis_local_pos[:, 2]), dim=-1),
+            torch.stack((out_pose["pelvis_pos"][:, 0], out_pose["pelvis_pos"][:, 2]), dim=-1),
             dim=-1,
         )
         _update_best(best, "pelvis_root_horizontal_m", _argmax_record(pelvis_horizontal, clip, "pelvis root-local horizontal distance"))
 
-        pelvis_static_rot = tl.rotation_6d_to_matrix(clip.pelvis_rot6)
+        pelvis_static_rot = tl.rotation_6d_to_matrix(out_pose["pelvis_rot6"])
         identity = torch.eye(3, dtype=pelvis_static_rot.dtype, device=pelvis_static_rot.device).expand_as(pelvis_static_rot)
         pelvis_root_angle = tl.geodesic_angles(pelvis_static_rot, identity) * 180.0 / torch.pi
         _update_best(best, "pelvis_root_rotation_deg", _argmax_record(pelvis_root_angle, clip, "pelvis root-local rotation angle"))
 
-        ee_static_pos = _payload_part(clip.ik_payload, "pos")
+        ee_static_pos = _payload_part(out_pose["ik_payload"], "pos")
         ee_static_loc = torch.linalg.vector_norm(ee_static_pos, dim=-1)
         _update_best(best, "end_effector_root_location_m", _argmax_record(ee_static_loc, clip, "IK hand/foot root-local location distance"))
         _update_slot_best(slot_max, slot_best, "end_effector_root_location_m", ee_static_loc, clip, names)
 
-        ee_static_rot = tl.rotation_6d_to_matrix(_payload_part(clip.ik_payload, "rot6").reshape(-1, 6))
+        ee_static_rot = tl.rotation_6d_to_matrix(_payload_part(out_pose["ik_payload"], "rot6").reshape(-1, 6))
         identity = torch.eye(3, dtype=ee_static_rot.dtype, device=ee_static_rot.device).expand_as(ee_static_rot)
-        ee_static_angle = tl.geodesic_angles(ee_static_rot, identity).reshape(clip.ik_payload.shape[0], len(names)) * 180.0 / torch.pi
+        ee_static_angle = tl.geodesic_angles(ee_static_rot, identity).reshape(cur.numel(), len(names)) * 180.0 / torch.pi
         _update_best(best, "end_effector_root_rotation_deg", _argmax_record(ee_static_angle, clip, "IK hand/foot root-local rotation angle"))
         _update_slot_best(slot_max, slot_best, "end_effector_root_rotation_deg", ee_static_angle, clip, names)
 
-        ee_pos_cur = _payload_part(clip.ik_payload.index_select(0, cur), "pos")
-        ee_pos_nxt = _payload_part(clip.ik_payload.index_select(0, nxt), "pos")
+        ee_pos_cur = _payload_part(cur_pose["ik_payload"], "pos")
+        ee_pos_nxt = _payload_part(out_pose["ik_payload"], "pos")
         ee_lin = torch.linalg.vector_norm(ee_pos_nxt - ee_pos_cur, dim=-1) * fps
         _update_best(best, "end_effector_velocity_mps", _argmax_record(ee_lin, clip, "IK hand/foot root-local position speed"))
 
-        ee_rot_cur = tl.rotation_6d_to_matrix(_payload_part(clip.ik_payload.index_select(0, cur), "rot6").reshape(-1, 6))
-        ee_rot_nxt = tl.rotation_6d_to_matrix(_payload_part(clip.ik_payload.index_select(0, nxt), "rot6").reshape(-1, 6))
+        ee_rot_cur = tl.rotation_6d_to_matrix(_payload_part(cur_pose["ik_payload"], "rot6").reshape(-1, 6))
+        ee_rot_nxt = tl.rotation_6d_to_matrix(_payload_part(out_pose["ik_payload"], "rot6").reshape(-1, 6))
         ee_ang = tl.geodesic_angles(ee_rot_nxt, ee_rot_cur).reshape(cur.numel(), -1) * fps * 180.0 / torch.pi
         _update_best(best, "end_effector_angular_velocity_deg_s", _argmax_record(ee_ang, clip, "IK hand/foot root-local rotation speed"))
 
         pelvis_lin = torch.linalg.vector_norm(
-            clip.pelvis_local_pos.index_select(0, nxt) - clip.pelvis_local_pos.index_select(0, cur), dim=-1
+            out_pose["pelvis_pos"] - cur_pose["pelvis_pos"], dim=-1
         ) * fps
         _update_best(best, "pelvis_velocity_mps", _argmax_record(pelvis_lin, clip, "pelvis local position speed"))
 
-        pelvis_rot_cur = tl.rotation_6d_to_matrix(clip.pelvis_rot6.index_select(0, cur))
-        pelvis_rot_nxt = tl.rotation_6d_to_matrix(clip.pelvis_rot6.index_select(0, nxt))
+        pelvis_rot_cur = tl.rotation_6d_to_matrix(cur_pose["pelvis_rot6"])
+        pelvis_rot_nxt = tl.rotation_6d_to_matrix(out_pose["pelvis_rot6"])
         pelvis_ang = tl.geodesic_angles(pelvis_rot_nxt, pelvis_rot_cur) * fps * 180.0 / torch.pi
         _update_best(best, "pelvis_angular_velocity_deg_s", _argmax_record(pelvis_ang, clip, "pelvis local rotation speed"))
 
-        core_cur = clip.core_non_pelvis_rot6.index_select(0, cur)
-        core_nxt = clip.core_non_pelvis_rot6.index_select(0, nxt)
+        core_cur = cur_pose["core_nonpelvis_rot6"]
+        core_nxt = out_pose["core_nonpelvis_rot6"]
         core_rot_cur = tl.rotation_6d_to_matrix(core_cur.reshape(-1, 6))
         core_rot_nxt = tl.rotation_6d_to_matrix(core_nxt.reshape(-1, 6))
         core_ang = tl.geodesic_angles(core_rot_nxt, core_rot_cur).reshape(cur.numel(), -1) * fps * 180.0 / torch.pi

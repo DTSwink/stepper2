@@ -144,13 +144,13 @@ def model_compact_sequence(
         )
         raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = ctl.clean_output_vector(raw, store)
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
+        root_pos, root_rot = ctl.transition_output_root_state(store, clip_ids, cur_idx)
         foot_pos, foot_rot = env.ik_foot_toe_state_from_vec(store, root_pos, root_rot, pred_vec)
         pred_pos[target] = foot_pos[0]
         pred_rot[target] = foot_rot[0]
 
         prev_vec, prev_pelvis, prev_payload = cur_vec, cur_pelvis, cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
     return pred_pos, pred_rot
 

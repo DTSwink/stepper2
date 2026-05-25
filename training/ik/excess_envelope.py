@@ -25,7 +25,7 @@ except ImportError:
     import contact_physics as cp
 
 
-CACHE_VERSION = 13
+CACHE_VERSION = 14
 SOLE_SAMPLE_GRID_VALUES = (
     (-1.0, -1.0),
     (-1.0, 0.0),
@@ -395,6 +395,8 @@ def _cache_key(
         "position_unit_scale": float(cfg.position_unit_scale),
         "margin": float(env_cfg.margin),
         "knn": int(env_cfg.knn),
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
         "situation_feature": "clip_id_plus_yaw_bend_runtime_foot_distance_xz_planted_side",
         "bound_lookup": "animation_dependent_nearest_same_planted_side_foot_ball_points_foot_yaw",
         "clips": [
@@ -563,6 +565,8 @@ def build_excess_envelope(
             "target_transitions": int(valid_mask.sum().item()),
             "margin": float(env_cfg.margin),
             "knn": int(env_cfg.knn),
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
             "max_real_linear_mps": float(real_linear.max().detach().cpu()),
             "max_real_angular_radps": float(real_angular.max().detach().cpu()),
             "situation_feature": "clip_id,yaw_delta/pi,bend_angle/pi,runtime_horizontal_foot_distance_xz_m,selected_lower_side",
@@ -694,7 +698,9 @@ def envelope_excess_ik_rows(
     cur_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cur_pos, cur_rot = ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
-    next_pos, next_rot = ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, next_vec)
+    output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else next_root_pos
+    output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else next_root_rot
+    next_pos, next_rot = ik_foot_toe_state_from_vec(store, output_root_pos, output_root_rot, next_vec)
     return envelope_excess_ik_state_rows(store, envelope, cur_pos, cur_rot, next_pos, next_rot, clip_ids, cur_idx)
 
 

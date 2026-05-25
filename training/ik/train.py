@@ -36,7 +36,7 @@ HIDDEN_DIM = 512
 NUM_HIDDEN_LAYERS = 2
 ROOT_LOOKAHEAD_STEPS = 1
 VALIDATION_ROWS = 2048
-USE_CUDA_GRAPH = True
+SUPERVISED_STEPPER_KIND = "cuda_graph_static_masked"
 USE_CUDA_AMP = False
 LR_STAGE_DECAYS = ((0.60, 1.0 / 3.0), (0.85, 0.1))
 RUNS_DIR = PROJECT_ROOT / "training" / "runs"
@@ -51,8 +51,8 @@ def make_cfg(device: torch.device) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     cfg.pose_representation = "ik_markers"
     cfg.cyclic_animation = True
-    cfg.predict_residual = False
-    cfg.zero_init_output = False
+    cfg.predict_residual = tl.output_prediction_uses_residual()
+    cfg.zero_init_output = tl.output_prediction_uses_residual()
     cfg.hidden_dim = HIDDEN_DIM
     cfg.num_hidden_layers = NUM_HIDDEN_LAYERS
     cfg.learning_rate = LEARNING_RATE
@@ -200,25 +200,35 @@ def rollout_stat_summary(batch_size: int, rollout_k: int) -> dict[str, float]:
     }
 
 
-def effective_rollout_stage_steps(train_steps: int) -> tuple[int, ...]:
-    steps = [int(v) for v in ROLLOUT_STAGE_STEPS]
+def effective_rollout_stage_steps(
+    train_steps: int,
+    schedule: tuple[int, ...] = ROLLOUT_SCHEDULE,
+) -> tuple[int, ...]:
+    if len(schedule) == 1:
+        return (max(1, int(train_steps)),)
+    steps = [int(v) for v in ROLLOUT_STAGE_STEPS[: len(schedule)]]
     scheduled = sum(steps)
     if int(train_steps) > scheduled:
         steps[-1] += int(train_steps) - scheduled
     return tuple(steps)
 
 
-def rollout_stage_for_step(step: int, train_steps: int = TRAIN_STEPS) -> tuple[int, int, int, int]:
+def rollout_stage_for_step(
+    step: int,
+    train_steps: int = TRAIN_STEPS,
+    schedule: tuple[int, ...] = ROLLOUT_SCHEDULE,
+    stage_steps_all: tuple[int, ...] | None = None,
+) -> tuple[int, int, int, int]:
     start = 1
-    stage_steps_all = effective_rollout_stage_steps(train_steps)
-    for stage_idx, (rollout_k, stage_steps) in enumerate(zip(ROLLOUT_SCHEDULE, stage_steps_all)):
+    stage_steps_all = stage_steps_all or effective_rollout_stage_steps(train_steps, schedule)
+    for stage_idx, (rollout_k, stage_steps) in enumerate(zip(schedule, stage_steps_all)):
         end = start + int(stage_steps) - 1
         if int(step) <= end:
             return stage_idx, int(rollout_k), start, end
         start = end + 1
     final_start = 1 + sum(stage_steps_all[:-1])
     final_end = sum(stage_steps_all)
-    return len(ROLLOUT_SCHEDULE) - 1, int(ROLLOUT_SCHEDULE[-1]), final_start, final_end
+    return len(schedule) - 1, int(schedule[-1]), final_start, final_end
 
 
 def mixed_rollout_enabled(rollout_k: int) -> bool:
@@ -416,6 +426,84 @@ def predicted_state_from_raw(
     return vec, pelvis_pos, payload
 
 
+def clean_output_vector(raw: torch.Tensor, store: rollout_data.ClipStore) -> torch.Tensor:
+    return predicted_state_from_raw(raw, store)[0]
+
+
+def rebase_output_vector_root(
+    store: rollout_data.ClipStore,
+    vec: torch.Tensor,
+    from_root_pos: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_pos: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> torch.Tensor:
+    rebased = tl.rebase_output_vector_root(
+        store.prototype,
+        vec,
+        from_root_pos,
+        from_root_rot,
+        to_root_pos,
+        to_root_rot,
+    )
+    return clean_output_vector(rebased, store)
+
+
+def transition_output_root_state(
+    store: rollout_data.ClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    max_cycles: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_idx = cur_idx if tl.output_reference_uses_current_root() else cur_idx + 1
+    root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, output_idx, max_cycles=max_cycles)
+    return root_pos, root_rot
+
+
+def transition_target_output(
+    store: rollout_data.ClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    max_cycles: int | None = None,
+) -> torch.Tensor:
+    target_idx = cur_idx + 1
+    target = store.get_target_output(clip_ids, target_idx)
+    if tl.output_reference_uses_future_root():
+        return target
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx, max_cycles=max_cycles)
+    target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(
+        clip_ids, target_idx, max_cycles=max_cycles
+    )
+    return rebase_output_vector_root(store, target, target_root_pos, target_root_rot, cur_root_pos, cur_root_rot)
+
+
+def advance_transition_state(
+    store: rollout_data.ClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    transition_vec: torch.Tensor,
+    max_cycles: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if tl.output_reference_uses_future_root():
+        return predicted_state_from_raw(transition_vec, store)
+    next_idx = cur_idx + 1
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx, max_cycles=max_cycles)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, next_idx, max_cycles=max_cycles)
+    state_vec = rebase_output_vector_root(store, transition_vec, cur_root_pos, cur_root_rot, next_root_pos, next_root_rot)
+    return predicted_state_from_raw(state_vec, store)
+
+
+def root_state_max_cycles_for_rollout(store: rollout_data.ClipStore, rollout_k: int) -> int:
+    max_cycles = 0
+    for clip in store.clips:
+        if not bool(clip.cyclic_animation):
+            continue
+        period = max(1, int(clip.cyclic_period))
+        max_idx = (period - 1) + max(1, int(rollout_k))
+        max_cycles = max(max_cycles, max_idx // period)
+    return max_cycles
+
+
 def model_forward(
     model: torch.nn.Module,
     inp: torch.Tensor,
@@ -427,8 +515,8 @@ def model_forward(
             raw = model(inp).float()
     else:
         raw = model(inp)
-    if cfg.predict_residual:
-        raw = cur_vec + raw
+    if cfg.predict_residual or tl.output_prediction_uses_residual():
+        return cur_vec + raw
     return raw
 
 
@@ -484,7 +572,7 @@ def supervised_rollout_loss(
         raw = model_forward(model, inp, cur_vec, cfg)
         next_vec, next_pelvis, next_markers = predicted_state_from_raw(raw, store)
         target_idx = cur_idx + 1
-        target = store.get_target_output(clip_ids, target_idx)
+        target = transition_target_output(store, clip_ids, cur_idx)
         # Loss must use the canonical cleaned state that rollout feeds back.
         # Raw 6D rotations can be numerically far while decoding to the same pose.
         row_loss = (next_vec - target).square().mean(dim=-1)
@@ -500,9 +588,12 @@ def supervised_rollout_loss(
         prev_vec = cur_vec.index_select(0, rows)
         prev_pelvis = cur_pelvis.index_select(0, rows)
         prev_markers = cur_markers.index_select(0, rows)
-        cur_vec = next_vec.index_select(0, rows)
-        cur_pelvis = next_pelvis.index_select(0, rows)
-        cur_markers = next_markers.index_select(0, rows)
+        cur_vec, cur_pelvis, cur_markers = advance_transition_state(
+            store,
+            next_clip_ids,
+            cur_idx.index_select(0, rows),
+            next_vec.index_select(0, rows),
+        )
         clip_ids = next_clip_ids
         prev_idx = cur_idx.index_select(0, rows)
         cur_idx = next_target_idx
@@ -527,6 +618,7 @@ def supervised_rollout_loss_static(
     cur_vec, cur_pelvis, cur_markers = target_state(store, clip_ids, cur_idx)
     row_weight = (1.0 / effective_k.float()) / float(batch_size)
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
+    root_max_cycles = root_state_max_cycles_for_rollout(store, rollout_k)
     for step in range(max(1, int(rollout_k))):
         inp = build_ik_input(
             store,
@@ -544,8 +636,12 @@ def supervised_rollout_loss_static(
         next_vec, next_pelvis, next_markers = predicted_state_from_raw(raw, store)
         active = effective_k > step
         target_idx = torch.where(active, cur_idx + 1, cur_idx)
-        target = store.get_target_output(clip_ids, target_idx)
-        # Keep static/CUDA-graph loss identical to the eager path.
+        target = torch.where(
+            active[:, None],
+            transition_target_output(store, clip_ids, cur_idx, max_cycles=root_max_cycles),
+            store.get_target_output(clip_ids, cur_idx),
+        )
+        # Static tensor shapes plus masks keep this CUDA graph replayable.
         row_loss = (next_vec - target).square().mean(dim=-1)
         total_loss = total_loss + (row_loss * row_weight * active.float()).sum()
         if step + 1 >= rollout_k:
@@ -556,9 +652,12 @@ def supervised_rollout_loss_static(
         prev_vec = torch.where(continuing_vec, cur_vec, prev_vec)
         prev_pelvis = torch.where(continuing_vec, cur_pelvis, prev_pelvis)
         prev_markers = torch.where(continuing_markers, cur_markers, prev_markers)
-        cur_vec = torch.where(continuing_vec, next_vec, cur_vec)
-        cur_pelvis = torch.where(continuing_vec, next_pelvis, cur_pelvis)
-        cur_markers = torch.where(continuing_markers, next_markers, cur_markers)
+        advanced_vec, advanced_pelvis, advanced_markers = advance_transition_state(
+            store, clip_ids, cur_idx, next_vec, max_cycles=root_max_cycles
+        )
+        cur_vec = torch.where(continuing_vec, advanced_vec, cur_vec)
+        cur_pelvis = torch.where(continuing_vec, advanced_pelvis, cur_pelvis)
+        cur_markers = torch.where(continuing_markers, advanced_markers, cur_markers)
         cur_idx = torch.where(continuing, cur_idx + 1, cur_idx)
     return total_loss
 
@@ -574,37 +673,8 @@ def sample_rollout_batch(
     return effective_k, clip_ids, starts
 
 
-class EagerSupervisedStep:
-    kind = "eager"
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        store: rollout_data.ClipStore,
-        cfg: tl.TrainConfig,
-        rollout_k: int,
-        batch_size: int,
-        start_pools: dict[int, StartPool],
-    ):
-        self.model = model
-        self.optimizer = optimizer
-        self.store = store
-        self.cfg = cfg
-        self.rollout_k = int(rollout_k)
-        self.batch_size = int(batch_size)
-        self.start_pools = start_pools
-
-    def step(self) -> torch.Tensor:
-        loss = supervised_rollout_loss(self.model, self.store, self.cfg, self.rollout_k, self.batch_size, self.start_pools)
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        self.optimizer.step()
-        return loss.detach()
-
-
 class CudaGraphSupervisedStep:
-    kind = "cuda_graph_static_masked"
+    kind = SUPERVISED_STEPPER_KIND
 
     def __init__(
         self,
@@ -685,11 +755,13 @@ def make_supervised_stepper(
     rollout_k: int,
     batch_size: int,
     start_pools: dict[int, StartPool],
-    use_cuda_graph: bool = USE_CUDA_GRAPH,
-) -> EagerSupervisedStep | CudaGraphSupervisedStep:
-    if bool(use_cuda_graph) and store.device.type == "cuda":
-        return CudaGraphSupervisedStep(model, optimizer, store, cfg, rollout_k, batch_size, start_pools)
-    return EagerSupervisedStep(model, optimizer, store, cfg, rollout_k, batch_size, start_pools)
+) -> CudaGraphSupervisedStep:
+    if store.device.type != "cuda":
+        raise RuntimeError("CUDA graph is mandatory for supervised IK training, but the store is not on CUDA.")
+    stepper = CudaGraphSupervisedStep(model, optimizer, store, cfg, rollout_k, batch_size, start_pools)
+    if stepper.kind != SUPERVISED_STEPPER_KIND:
+        raise RuntimeError(f"CUDA graph stepper activation failed: got stepper={stepper.kind!r}.")
+    return stepper
 
 
 def validation_starts(
@@ -733,12 +805,14 @@ def rollout_joint_error(
     for step in range(rollout_k):
         inp = rollout_data.store_build_input(store, clip_ids, prev_idx, cur_idx, prev_pose, cur_pose, cfg)
         raw = tl.predict_next_raw(model, inp, cur_pose, cfg)
-        pred_pose, _raw_pose = tl.output_to_pose(raw, store.prototype)
+        pred_vec = clean_output_vector(raw, store)
+        pred_pose, _raw_pose = tl.output_to_pose(pred_vec, store.prototype)
         target_idx = cur_idx + 1
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
-        pred_global, pred_canon = store.fk_positions_from_pose(clip_ids, root_pos, root_rot, pred_pose)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
+        pred_root_pos, pred_root_rot = transition_output_root_state(store, clip_ids, cur_idx)
+        pred_global, pred_canon = store.fk_positions_from_pose(clip_ids, pred_root_pos, pred_root_rot, pred_pose)
         target_pose = store.get_pose(clip_ids, target_idx)
-        target_global, _target_canon = store.fk_positions_from_pose(clip_ids, root_pos, root_rot, target_pose)
+        target_global, _target_canon = store.fk_positions_from_pose(clip_ids, target_root_pos, target_root_rot, target_pose)
         per_frame = (pred_global - target_global).norm(dim=-1).mean(dim=-1)
         total_error += float(per_frame.sum().cpu())
         total_frames += int(per_frame.numel())
@@ -746,7 +820,8 @@ def rollout_joint_error(
         if step + 1 == rollout_k:
             continue
         prev_pose = cur_pose
-        cur_pose = tl.next_pose_from_prediction(pred_pose, pred_canon)
+        state_vec, _state_pelvis, _state_markers = advance_transition_state(store, clip_ids, cur_idx, pred_vec)
+        cur_pose, _state_raw_pose = tl.output_to_pose(state_vec, store.prototype)
         prev_idx = cur_idx
         cur_idx = target_idx
     if total_frames == 0:
@@ -764,10 +839,12 @@ def save_named_checkpoint(
     best: float,
     cfg: tl.TrainConfig,
     metadata: dict,
+    rollout_k: int | None = None,
 ) -> Path:
     path = checkpoint_path(run_dir, run_id, tag)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(tl.checkpoint_payload(model, optimizer, step, best, ROLLOUT_K, cfg, metadata), path)
+    rollout_value = ROLLOUT_K if rollout_k is None else int(rollout_k)
+    torch.save(tl.checkpoint_payload(model, optimizer, step, best, rollout_value, cfg, metadata), path)
     return path
 
 
@@ -798,8 +875,7 @@ def write_readable_config(
         "learning_rate": float(LEARNING_RATE),
         "hidden_dim": int(HIDDEN_DIM),
         "num_hidden_layers": int(NUM_HIDDEN_LAYERS),
-        "use_cuda_graph": bool(USE_CUDA_GRAPH),
-        "effective_use_cuda_graph": bool(metadata.get("effective_use_cuda_graph", USE_CUDA_GRAPH)),
+        "stepper": SUPERVISED_STEPPER_KIND,
         "cuda_amp": bool(USE_CUDA_AMP),
         "checkpoint_policy": "init, latest every logged step, best at K32, last",
     }
@@ -818,8 +894,7 @@ def write_readable_config(
             "NUM_HIDDEN_LAYERS": NUM_HIDDEN_LAYERS,
             "ROOT_LOOKAHEAD_STEPS": ROOT_LOOKAHEAD_STEPS,
             "VALIDATION_ROWS": VALIDATION_ROWS,
-            "USE_CUDA_GRAPH": USE_CUDA_GRAPH,
-            "effective_use_cuda_graph": bool(metadata.get("effective_use_cuda_graph", USE_CUDA_GRAPH)),
+            "SUPERVISED_STEPPER_KIND": SUPERVISED_STEPPER_KIND,
             "USE_CUDA_AMP": USE_CUDA_AMP,
             "LR_STAGE_DECAYS": LR_STAGE_DECAYS,
         },
@@ -864,10 +939,18 @@ def main() -> None:
         action="store_true",
         help="Continue the schedule from the checkpoint epoch instead of using it only as initialization.",
     )
-    parser.add_argument("--disable-cuda-graph", action="store_true", help="Use eager supervised updates instead of CUDA graph replay.")
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="Forbidden: supervised IK training is CUDA-graph-only and will fail if this is passed.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.disable_cuda_graph:
+        raise RuntimeError("--disable-cuda-graph is forbidden; supervised IK training is CUDA-graph-only.")
+    if device.type != "cuda":
+        raise RuntimeError("CUDA graph is mandatory for supervised IK training, but CUDA is not available.")
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -881,14 +964,16 @@ def main() -> None:
     clip_specs = resolve_clip_specs(args.npz, args.periodic_folder, args.nonperiodic_folder)
     clips = load_clips(clip_specs, cfg)
     input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
-    use_cuda_graph = bool(USE_CUDA_GRAPH and not args.disable_cuda_graph)
+    train_steps = max(1, int(args.train_steps))
+    rollout_schedule = ROLLOUT_SCHEDULE
+    rollout_stage_steps = effective_rollout_stage_steps(train_steps, rollout_schedule)
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
     optimizer = make_adamw(
         model.parameters(),
         LEARNING_RATE,
         device,
         weight_decay=0.0,
-        capturable=bool(use_cuda_graph and device.type == "cuda"),
+        capturable=True,
     )
     base_step = 0
     init_best = float("inf")
@@ -906,7 +991,7 @@ def main() -> None:
     start_step = int(base_step) if bool(args.resume_step_from_checkpoint) else 0
     store = rollout_data.ClipStore(clips, cfg, device)
     stage_cache: dict[int, dict[str, object]] = {}
-    for stage_k in ROLLOUT_SCHEDULE:
+    for stage_k in rollout_schedule:
         rollout_values = rollout_values_for(stage_k) if mixed_rollout_enabled(stage_k) else (int(stage_k),)
         start_pools = build_start_pools(store, rollout_values, require_all_clips=False)
         max_pool_clip_ids, max_pool_starts = start_pools[int(stage_k)]
@@ -926,7 +1011,6 @@ def main() -> None:
     run_id = ik_run_id(args.run_label)
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    train_steps = max(1, int(args.train_steps))
     metadata = {
         "npz_paths": [str(path) for path, _cyclic in clip_specs],
         "npz_folders": [
@@ -935,11 +1019,20 @@ def main() -> None:
         ],
         "tensorboard_logdir": str(run_dir / TB_DIR_NAME),
         "policy": {
+            "loss": "supervised_rollout",
             "pose_representation": "ik_markers",
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
+            "state_reference_root": tl.STATE_REFERENCE_ROOT,
+            "ik_schema_version": tl.IK_SCHEMA_VERSION,
+            "ik_pole_reference": tl.IK_POLE_REFERENCE,
+            "ik_leg_pole_alpha_deg": 180.0 * float(tl.IK_LEG_POLE_ALPHA) / torch.pi,
+            "ik_arm_pole_alpha_deg": 180.0 * float(tl.IK_ARM_POLE_ALPHA) / torch.pi,
+            "predict_residual": bool(cfg.predict_residual),
             "gpu_resident_rollout": True,
             "random_clip_per_row": True,
             "mixed_rollout_at_max": True,
-            "training_step": "staged_cuda_graph_static_masked" if use_cuda_graph and device.type == "cuda" else "staged_eager",
+            "training_step": SUPERVISED_STEPPER_KIND,
             "cuda_amp": bool(USE_CUDA_AMP and device.type == "cuda"),
             "stage_lr_decays": [(float(t), float(m)) for t, m in LR_STAGE_DECAYS],
             "cyclic": True,
@@ -949,8 +1042,8 @@ def main() -> None:
         },
         "rollout_k": int(ROLLOUT_K),
         "max_rollout_k": int(MAX_ROLLOUT_K),
-        "rollout_schedule": [int(k) for k in ROLLOUT_SCHEDULE],
-        "rollout_stage_steps": [int(n) for n in effective_rollout_stage_steps(train_steps)],
+        "rollout_schedule": [int(k) for k in rollout_schedule],
+        "rollout_stage_steps": [int(n) for n in rollout_stage_steps],
         "rollout_values": [int(k) for k in final_cache["rollout_values"]],
         "fractal_rollout_probabilities": {
             str(int(k)): float(p)
@@ -972,7 +1065,7 @@ def main() -> None:
         "resume_step_from_checkpoint": bool(args.resume_step_from_checkpoint),
         "start_step": int(start_step),
         "train_steps": int(train_steps),
-        "effective_use_cuda_graph": bool(use_cuda_graph),
+        "stepper": SUPERVISED_STEPPER_KIND,
         "source_metadata": init_metadata,
     }
     config_payload = {"config": asdict(cfg), "metadata": metadata}
@@ -991,23 +1084,25 @@ def main() -> None:
     writer.add_text("config/json", f"```json\n{json.dumps(config_payload, indent=2)}\n```", 0)
     writer.add_text("run/id", run_id, 0)
     writer.add_scalar("run/started", 1.0, 0)
-    writer.add_scalar("curriculum/rollout_k", int(ROLLOUT_SCHEDULE[0]), 0)
-    writer.add_scalar("train/effective_rollout_k_mean", float(ROLLOUT_SCHEDULE[0]), 0)
-    writer.add_scalar("train/effective_rollout_k_max", float(ROLLOUT_SCHEDULE[0]), 0)
+    writer.add_scalar("curriculum/rollout_k", int(rollout_schedule[0]), 0)
+    writer.add_scalar("train/effective_rollout_k_mean", float(rollout_schedule[0]), 0)
+    writer.add_scalar("train/effective_rollout_k_max", float(rollout_schedule[0]), 0)
     writer.flush()
     assert_tensorboard_event_file(tb_dir)
     refresh_tensorboard_async()
 
     best = init_best
-    save_named_checkpoint(run_dir, run_id, "init", model, optimizer, start_step, best, cfg, metadata)
+    save_named_checkpoint(run_dir, run_id, "init", model, optimizer, start_step, best, cfg, metadata, rollout_k=0)
     start = time.perf_counter()
     current_stage_k = -1
     current_lr = None
-    stepper: EagerSupervisedStep | CudaGraphSupervisedStep | None = None
+    stepper: CudaGraphSupervisedStep | None = None
     if start_step >= train_steps:
         print(f"checkpoint already at step={start_step}, train_steps={train_steps}; writing last checkpoint", flush=True)
     for step in range(start_step + 1, train_steps + 1):
-        stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(step, train_steps)
+        stage_idx, stage_k, stage_start, stage_end = rollout_stage_for_step(
+            step, train_steps, rollout_schedule, rollout_stage_steps
+        )
         stage_step = step - stage_start + 1
         stage_steps = stage_end - stage_start + 1
         lr = stage_learning_rate(LEARNING_RATE, stage_step, stage_steps)
@@ -1027,11 +1122,12 @@ def main() -> None:
                 int(stage_k),
                 int(cache["batch_size"]),
                 cache["start_pools"],
-                use_cuda_graph=use_cuda_graph,
             )
+            if stepper.kind != SUPERVISED_STEPPER_KIND:
+                raise RuntimeError(f"CUDA graph is mandatory, but activated stepper={stepper.kind!r}.")
             current_stage_k = int(stage_k)
             print(
-                f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} "
+                f"stage={stage_idx + 1}/{len(rollout_schedule)} "
                 f"K={stage_k} steps={stage_start}-{stage_end} "
                 f"batch={int(cache['batch_size'])} lr={float(current_lr):.3g} stepper={stepper.kind}",
                 flush=True,
@@ -1049,6 +1145,7 @@ def main() -> None:
                 best,
                 cfg,
                 metadata,
+                rollout_k=int(stage_k),
             )
             print(f"saved stage checkpoint {stage_path}", flush=True)
 
@@ -1066,8 +1163,8 @@ def main() -> None:
             model.train()
             if int(stage_k) == int(ROLLOUT_K) and mean_err < best:
                 best = mean_err
-                save_named_checkpoint(run_dir, run_id, "best", model, optimizer, step, best, cfg, metadata)
-            save_named_checkpoint(run_dir, run_id, "latest", model, optimizer, step, best, cfg, metadata)
+                save_named_checkpoint(run_dir, run_id, "best", model, optimizer, step, best, cfg, metadata, rollout_k=int(stage_k))
+            save_named_checkpoint(run_dir, run_id, "latest", model, optimizer, step, best, cfg, metadata, rollout_k=int(stage_k))
             elapsed = time.perf_counter() - start
             rollout_stats = cache["rollout_stats"]
             best_to_log = best if best < float("inf") else mean_err
@@ -1093,7 +1190,8 @@ def main() -> None:
             writer.add_scalar("time/elapsed_s", elapsed, step)
             writer.flush()
 
-    last = save_named_checkpoint(run_dir, run_id, "last", model, optimizer, train_steps, best, cfg, metadata)
+    last_rollout_k = int(current_stage_k or ROLLOUT_K)
+    last = save_named_checkpoint(run_dir, run_id, "last", model, optimizer, train_steps, best, cfg, metadata, rollout_k=last_rollout_k)
     writer.close()
     assert_tensorboard_event_file(tb_dir)
     refresh_tensorboard_async()

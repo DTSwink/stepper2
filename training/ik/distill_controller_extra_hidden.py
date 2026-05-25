@@ -157,7 +157,10 @@ def distill_rollout_loss(
         )
         with torch.no_grad():
             teacher_raw = ctl.model_forward(teacher, inp, cur_vec, cfg)
-            teacher_vec, teacher_pelvis, teacher_payload = ctl.predicted_state_from_raw(teacher_raw, store)
+            teacher_vec = ctl.clean_output_vector(teacher_raw, store)
+            teacher_state_vec, teacher_pelvis, teacher_payload = ctl.advance_transition_state(
+                store, clip_ids, cur_idx, teacher_vec
+            )
 
         student_raw = ctl.model_forward(student, inp, cur_vec, cfg)
         student_vec = ctl.clean_output_vector(student_raw, store)
@@ -182,7 +185,7 @@ def distill_rollout_loss(
         prev_vec = torch.where(reset_mask, reset_prev_vec, torch.where(advance_mask, cur_vec, prev_vec))
         prev_pelvis = torch.where(reset_mask, reset_prev_pelvis, torch.where(advance_mask, cur_pelvis, prev_pelvis))
         prev_payload = torch.where(reset_mask, reset_prev_payload, torch.where(advance_mask, cur_payload, prev_payload))
-        cur_vec = torch.where(reset_mask, reset_cur_vec, torch.where(advance_mask, teacher_vec, cur_vec))
+        cur_vec = torch.where(reset_mask, reset_cur_vec, torch.where(advance_mask, teacher_state_vec, cur_vec))
         cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, torch.where(advance_mask, teacher_pelvis, cur_pelvis))
         cur_payload = torch.where(reset_mask, reset_cur_payload, torch.where(advance_mask, teacher_payload, cur_payload))
         cur_idx = torch.where(reset, reset_starts, torch.where(continuing, cur_idx + 1, cur_idx))
@@ -350,6 +353,9 @@ def main() -> None:
             "student_extra_hidden_layers": int(args.extra_hidden_layers),
             "student_same_width_as_teacher": True,
             "pose_representation": tl.IK_POSE_REPRESENTATION,
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
+            "state_reference_root": tl.STATE_REFERENCE_ROOT,
         },
     }
     write_readable_config(run_dir, args, teacher_cfg, student_cfg, metadata)

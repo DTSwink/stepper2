@@ -4,7 +4,7 @@ param(
     [string]$PeriodicFolder = "ue5\animations_omni_only_full\npz_final",
     [string]$NonperiodicFolder = "ue5\animations_transitions_only_full_trimmed\npz_final",
     [int]$TrainSteps = 100000,
-    [bool]$DisableCudaGraph = $true,
+    [bool]$DisableCudaGraph = $false,
     [switch]$StartIfMissing,
     [switch]$KillDuplicates
 )
@@ -122,7 +122,7 @@ try {
         "--train-steps", ([string]$TrainSteps)
     )
     if ($DisableCudaGraph) {
-        $args += "--disable-cuda-graph"
+        throw "DisableCudaGraph is forbidden; supervised IK training is CUDA-graph-only."
     }
 
     $proc = Start-Process `

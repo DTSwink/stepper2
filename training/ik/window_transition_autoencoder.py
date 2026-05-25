@@ -426,19 +426,20 @@ def transform_transition_feature_to_anchor(
         out[:, offset + 3] = torch.sin(dyaw)
 
     next_output_start = input_dim
-    next_root_pos, next_root_yaw = root_info(next_idx)
+    next_output_root_pos, next_output_root_yaw = root_info(cur_idx)
+    next_state_root_pos, next_state_root_yaw = root_info(next_idx)
     next_pelvis_local = raw[:, next_output_start : next_output_start + 3].reshape(b, 1, 3)
     next_pelvis = anchor_local_positions(
         next_pelvis_local,
-        next_root_pos,
-        next_root_yaw,
+        next_output_root_pos,
+        next_output_root_yaw,
         anchor_pos,
         anchor_yaw,
     ).reshape(b, 3)
     out[:, next_output_start : next_output_start + 3] = next_pelvis
 
     next_canon = raw[:, next_canon_start : next_canon_start + j_count * 3].reshape(b, j_count, 3)
-    next_canon_anchor = anchor_local_positions(next_canon, next_root_pos, next_root_yaw, anchor_pos, anchor_yaw)
+    next_canon_anchor = anchor_local_positions(next_canon, next_state_root_pos, next_state_root_yaw, anchor_pos, anchor_yaw)
     out[:, next_canon_start : next_canon_start + j_count * 3] = next_canon_anchor.reshape(b, j_count * 3)
     out[:, next_velocity_start : next_velocity_start + 3] = (next_pelvis - cur_pelvis) / cfg.pose_delta_scale_final
     out[:, next_velocity_start + 3 : next_velocity_start + velocity_dim] = (
@@ -785,14 +786,27 @@ def rollout_pose_sequence(
         inp = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, cfg, device)
         raw_out = tl.predict_next_raw(model, inp, cur_pose, cfg)
         pred_pose, _ = tl.output_to_pose(raw_out, clip)
-        root_pos, root_rot, _yaw, _heading = tl.root_state(clip, torch.tensor([target], dtype=torch.long, device=device), cfg, device)
-        _global_pos, _global_rot, canon_pos = tl.fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
-        next_pose = tl.next_pose_from_prediction(pred_pose, canon_pos)
+        target_idx = torch.tensor([target], dtype=torch.long, device=device)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, cfg, device)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = tl.root_state(clip, target_idx, cfg, device)
+        if tl.output_reference_uses_current_root():
+            state_pose = tl.rebase_pose_root(
+                clip,
+                pred_pose,
+                cur_root_pos,
+                cur_root_rot,
+                target_root_pos,
+                target_root_rot,
+            )
+        else:
+            state_pose = pred_pose
+        _global_pos, _global_rot, canon_pos = tl.fk_from_pose(clip, target_root_pos, target_root_rot, state_pose, device)
+        next_pose = tl.next_pose_from_prediction(state_pose, canon_pos)
         poses.append({key: value.detach().clone() for key, value in next_pose.items()})
         prev_pose = cur_pose
         cur_pose = next_pose
         prev_idx = cur_idx
-        cur_idx = torch.tensor([target], dtype=torch.long, device=device)
+        cur_idx = target_idx
     return poses
 
 

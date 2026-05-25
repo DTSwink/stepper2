@@ -40,6 +40,12 @@ except ImportError:
     import contact_physics as cp
 
 
+def residual_prediction_requested(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
+    return bool(value)
+
+
 @dataclass
 class TrainConfig:
     fps: int = 30
@@ -170,6 +176,11 @@ class TrainConfig:
     timed_checkpoint_interval_minutes: float = 30.0
     run_name: str = "locomotion_mlp"
     output_dir: str = "training/runs"
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "predict_residual":
+            value = output_prediction_uses_residual()
+        super().__setattr__(name, value)
 
     @property
     def max_speed_scale_final(self) -> float:
@@ -345,6 +356,15 @@ def canonicalize_rotations(rot: torch.Tensor, up_axis: int) -> torch.Tensor:
 
 
 IK_POSE_REPRESENTATION = "ik_markers"
+# Hard-coded experiment switch.  "current" is the current refactor:
+# controller outputs are frame T+1 expressed in frame T root.  "future" is the
+# legacy contract: controller outputs are frame T+1 expressed in frame T+1 root.
+OUTPUT_REFERENCE_ROOT = "current"
+# Hard-coded prediction parameterization.  "absolute" means the network emits
+# the transition output vector directly.  "residual" means the network emits a
+# delta added to the current state vector before decoding.
+OUTPUT_PREDICTION_MODE = "residual"
+STATE_REFERENCE_ROOT = "frame"
 IK_LIMB_SPECS = (
     {"side": "l", "kind": "arm", "start": "upperarm_l", "mid": "lowerarm_l", "end": "hand_l", "toe": None},
     {"side": "r", "kind": "arm", "start": "upperarm_r", "mid": "lowerarm_r", "end": "hand_r", "toe": None},
@@ -352,10 +372,75 @@ IK_LIMB_SPECS = (
     {"side": "r", "kind": "leg", "start": "thigh_r", "mid": "calf_r", "end": "foot_r", "toe": "ball_r"},
 )
 IK_PAYLOAD_DIM = 42
+IK_SCHEMA_VERSION = 2
+IK_POLE_REFERENCE = "ee_frame"
+IK_ARM_POLE_ALPHA = math.radians(45.0)
+IK_LEG_POLE_ALPHA = math.radians(10.0)
+# Kept for compatibility with old checkpoints/tools; current IK uses per-limb
+# IK_ARM_POLE_ALPHA / IK_LEG_POLE_ALPHA around an EE-frame pole reference.
 IK_POLE_ALPHA = math.pi / 2.0
 IK_TOE_ALPHA = math.pi / 2.0
 IK_CHARACTER_FORWARD = (0.0, -1.0, 0.0)
 IK_FOOT_LOCAL_SIDE_AXIS = (0.0, 1.0, 0.0)
+OUTPUT_REFERENCE_ROOT_CURRENT = "current"
+OUTPUT_REFERENCE_ROOT_FUTURE = "future"
+OUTPUT_REFERENCE_ROOT_VALUES = (OUTPUT_REFERENCE_ROOT_CURRENT, OUTPUT_REFERENCE_ROOT_FUTURE)
+OUTPUT_PREDICTION_MODE_ABSOLUTE = "absolute"
+OUTPUT_PREDICTION_MODE_RESIDUAL = "residual"
+OUTPUT_PREDICTION_MODE_VALUES = (OUTPUT_PREDICTION_MODE_ABSOLUTE, OUTPUT_PREDICTION_MODE_RESIDUAL)
+
+
+def normalized_output_reference_root(value: object | None = None) -> str:
+    mode = str(OUTPUT_REFERENCE_ROOT if value is None else value).lower().strip()
+    aliases = {
+        "current": OUTPUT_REFERENCE_ROOT_CURRENT,
+        "cur": OUTPUT_REFERENCE_ROOT_CURRENT,
+        "frame_t": OUTPUT_REFERENCE_ROOT_CURRENT,
+        "future": OUTPUT_REFERENCE_ROOT_FUTURE,
+        "next": OUTPUT_REFERENCE_ROOT_FUTURE,
+        "target": OUTPUT_REFERENCE_ROOT_FUTURE,
+        "frame_t+1": OUTPUT_REFERENCE_ROOT_FUTURE,
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unsupported OUTPUT_REFERENCE_ROOT={value if value is not None else OUTPUT_REFERENCE_ROOT!r}; "
+            f"expected one of {OUTPUT_REFERENCE_ROOT_VALUES!r}."
+        )
+    return aliases[mode]
+
+
+def output_reference_uses_current_root(value: object | None = None) -> bool:
+    return normalized_output_reference_root(value) == OUTPUT_REFERENCE_ROOT_CURRENT
+
+
+def output_reference_uses_future_root(value: object | None = None) -> bool:
+    return normalized_output_reference_root(value) == OUTPUT_REFERENCE_ROOT_FUTURE
+
+
+def normalized_output_prediction_mode(value: object | None = None) -> str:
+    mode = str(OUTPUT_PREDICTION_MODE if value is None else value).lower().strip()
+    aliases = {
+        "absolute": OUTPUT_PREDICTION_MODE_ABSOLUTE,
+        "abs": OUTPUT_PREDICTION_MODE_ABSOLUTE,
+        "direct": OUTPUT_PREDICTION_MODE_ABSOLUTE,
+        "residual": OUTPUT_PREDICTION_MODE_RESIDUAL,
+        "delta": OUTPUT_PREDICTION_MODE_RESIDUAL,
+        "res": OUTPUT_PREDICTION_MODE_RESIDUAL,
+    }
+    if mode not in aliases:
+        raise ValueError(
+            f"Unsupported OUTPUT_PREDICTION_MODE={value if value is not None else OUTPUT_PREDICTION_MODE!r}; "
+            f"expected one of {OUTPUT_PREDICTION_MODE_VALUES!r}."
+        )
+    return aliases[mode]
+
+
+def output_prediction_uses_absolute(value: object | None = None) -> bool:
+    return normalized_output_prediction_mode(value) == OUTPUT_PREDICTION_MODE_ABSOLUTE
+
+
+def output_prediction_uses_residual(value: object | None = None) -> bool:
+    return normalized_output_prediction_mode(value) == OUTPUT_PREDICTION_MODE_RESIDUAL
 
 
 def uses_ik_markers(value: object) -> bool:
@@ -383,6 +468,19 @@ def ik_chain_payload_slices() -> tuple[dict[str, object], ...]:
 
 
 IK_PAYLOAD_SLICES = ik_chain_payload_slices()
+
+
+def ik_pole_alpha_for_kind(kind: object) -> float:
+    return IK_LEG_POLE_ALPHA if str(kind).lower().strip() == "leg" else IK_ARM_POLE_ALPHA
+
+
+def ik_pole_alpha_for_specs(
+    specs: Iterable[dict[str, object]],
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    return torch.tensor([ik_pole_alpha_for_kind(spec.get("kind")) for spec in specs], dtype=dtype, device=device)
 
 
 def root_relative_positions(
@@ -527,6 +625,80 @@ def encode_pole_float(
     return torch.atan2(sin_v, cos_v) / float(alpha)
 
 
+def _broadcast_vec3(vec: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    vec = vec.to(dtype=target.dtype, device=target.device)
+    while vec.ndim < target.ndim:
+        vec = vec.unsqueeze(0)
+    return vec.expand_as(target) if vec.shape != target.shape else vec
+
+
+def _broadcast_scalar(value: torch.Tensor | float, target: torch.Tensor) -> torch.Tensor:
+    out = torch.as_tensor(value, dtype=target.dtype, device=target.device)
+    while out.ndim < target.ndim:
+        out = out.unsqueeze(0)
+    return out.expand_as(target)
+
+
+def ee_frame_pole_reference(
+    axis: torch.Tensor,
+    ee_rot_root: torch.Tensor,
+    ee_pole_ref: torch.Tensor,
+    rest_axis: torch.Tensor | None = None,
+    rest_pole: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Project an EE-local pole reference into the chain bend plane."""
+
+    axis = normalize(axis, eps)
+    ref_local = _broadcast_vec3(ee_pole_ref, axis)
+    ref_root = torch.matmul(ref_local.unsqueeze(-2), ee_rot_root).squeeze(-2)
+    raw = ref_root - axis * (ref_root * axis).sum(dim=-1, keepdim=True)
+    reference = normalize(raw, eps)
+    if rest_axis is None or rest_pole is None:
+        return reference
+    fallback = project_to_plane(swing_only_transport(rest_axis, axis, rest_pole), axis)
+    return torch.where(torch.linalg.norm(raw, dim=-1, keepdim=True) > eps, reference, fallback)
+
+
+def encode_ee_pole_float(
+    base_pos: torch.Tensor,
+    mid_pos: torch.Tensor,
+    end_pos: torch.Tensor,
+    ee_rot_root: torch.Tensor,
+    ee_pole_ref: torch.Tensor,
+    alpha: torch.Tensor | float,
+    rest_axis: torch.Tensor | None = None,
+    rest_pole: torch.Tensor | None = None,
+) -> torch.Tensor:
+    axis = normalize(end_pos - base_pos)
+    reference = ee_frame_pole_reference(axis, ee_rot_root, ee_pole_ref, rest_axis, rest_pole)
+    actual = project_to_plane(mid_pos - base_pos, axis)
+    sin_v = (torch.cross(reference, actual, dim=-1) * axis).sum(dim=-1)
+    cos_v = (reference * actual).sum(dim=-1)
+    alpha_t = _broadcast_scalar(alpha, sin_v).clamp_min(1e-8)
+    return torch.atan2(sin_v, cos_v) / alpha_t
+
+
+def solve_two_bone_with_pole_vector(
+    base_pos: torch.Tensor,
+    end_pos: torch.Tensor,
+    l1: torch.Tensor,
+    l2: torch.Tensor,
+    pole: torch.Tensor,
+) -> torch.Tensor:
+    raw = end_pos - base_pos
+    d_raw = torch.linalg.norm(raw, dim=-1, keepdim=True)
+    axis = normalize(raw)
+    min_d = (l1 - l2).abs().unsqueeze(-1) + 1e-5
+    max_d = (l1 + l2).unsqueeze(-1) - 1e-5
+    d = d_raw.clamp_min(1e-8).clamp(min=min_d, max=max_d)
+    pole = project_to_plane(pole, axis)
+
+    a = (l1.unsqueeze(-1).square() - l2.unsqueeze(-1).square() + d.square()) / (2.0 * d)
+    h = torch.sqrt((l1.unsqueeze(-1).square() - a.square()).clamp_min(0.0))
+    return base_pos + axis * a + pole * h
+
+
 def solve_two_bone_with_pole(
     base_pos: torch.Tensor,
     end_pos: torch.Tensor,
@@ -634,11 +806,11 @@ def clean_ik_payload(payload: torch.Tensor) -> torch.Tensor:
         assert isinstance(rot_slice, slice)
         parts.append(clean_6d(payload[:, rot_slice]))
         cursor += 6
-        parts.append(payload[:, cursor : cursor + 1])
+        parts.append(payload[:, cursor : cursor + 1].clamp(-1.0, 1.0))
         cursor += 1
         toe_slice = spec["toe_float"]
         if toe_slice is not None:
-            parts.append(payload[:, cursor : cursor + 1])
+            parts.append(payload[:, cursor : cursor + 1].clamp(-1.0, 1.0))
             cursor += 1
     return torch.cat(parts, dim=-1)
 
@@ -829,6 +1001,8 @@ class MotionClip:
         self.ik_toe_float = torch.empty((self.T, 0), dtype=torch.float32)
         self.ik_rest_axis = torch.empty((0, 3), dtype=torch.float32)
         self.ik_rest_pole = torch.empty((0, 3), dtype=torch.float32)
+        self.ik_ee_pole_ref = torch.empty((0, 3), dtype=torch.float32)
+        self.ik_pole_alpha = torch.empty((0,), dtype=torch.float32)
         self.ik_limb_lengths = torch.empty((0, 2), dtype=torch.float32)
         self.ik_local_pole_axis = torch.empty((0, 2, 3), dtype=torch.float32)
         self.ik_toe_offsets = torch.empty((0, 3), dtype=torch.float32)
@@ -854,6 +1028,8 @@ class MotionClip:
             toe_chunks: list[torch.Tensor] = []
             rest_axis_chunks: list[torch.Tensor] = []
             rest_pole_chunks: list[torch.Tensor] = []
+            ee_pole_ref_chunks: list[torch.Tensor] = []
+            pole_alpha_chunks: list[torch.Tensor] = []
             length_chunks: list[torch.Tensor] = []
             local_pole_axis_chunks: list[torch.Tensor] = []
             toe_offset_chunks: list[torch.Tensor] = []
@@ -870,13 +1046,23 @@ class MotionClip:
                 ee_rot6 = rotmat_to_6d(ee_rot_root)
                 rest_axis = normalize(self.rest_body_pos[end] - self.rest_body_pos[start])
                 rest_pole = -forward if kind == "arm" else forward
-                pole_float = encode_pole_float(
+                chain_axis = normalize(ee_pos - self.root_relative_pos[:, start])
+                chain_pole = project_to_plane(self.root_relative_pos[:, mid] - self.root_relative_pos[:, start], chain_axis)
+                ee_local_pole = torch.matmul(chain_pole.unsqueeze(1), ee_rot_root.transpose(-1, -2)).squeeze(1)
+                ee_pole_ref = normalize(ee_local_pole.mean(dim=0, keepdim=True))[0]
+                if float(torch.linalg.norm(ee_pole_ref)) < 1e-6:
+                    ee_pole_ref = ee_local_pole[0]
+                pole_alpha = torch.tensor(ik_pole_alpha_for_kind(kind), dtype=torch.float32)
+                pole_float = encode_ee_pole_float(
                     self.root_relative_pos[:, start],
                     self.root_relative_pos[:, mid],
                     self.root_relative_pos[:, end],
+                    ee_rot_root,
+                    ee_pole_ref,
+                    pole_alpha,
                     rest_axis,
                     rest_pole,
-                ).unsqueeze(-1)
+                ).clamp(-1.0, 1.0).unsqueeze(-1)
 
                 payload_chunks.extend((ee_pos, ee_rot6, pole_float))
                 ee_pos_chunks.append(ee_pos)
@@ -884,6 +1070,8 @@ class MotionClip:
                 pole_chunks.append(pole_float.squeeze(-1))
                 rest_axis_chunks.append(rest_axis)
                 rest_pole_chunks.append(rest_pole)
+                ee_pole_ref_chunks.append(ee_pole_ref)
+                pole_alpha_chunks.append(pole_alpha)
                 chain_axis_gt = normalize(self.global_pos[:, end] - self.global_pos[:, start])
                 chain_pole_gt = project_to_plane(self.global_pos[:, mid] - self.global_pos[:, start], chain_axis_gt)
                 start_axis = normalize(self.local_offsets[mid]).expand(self.T, 3)
@@ -946,39 +1134,52 @@ class MotionClip:
             self.ik_toe_float = torch.stack(toe_chunks, dim=1) if toe_chunks else torch.empty((self.T, 0))
             self.ik_rest_axis = torch.stack(rest_axis_chunks, dim=0)
             self.ik_rest_pole = torch.stack(rest_pole_chunks, dim=0)
+            self.ik_ee_pole_ref = torch.stack(ee_pole_ref_chunks, dim=0)
+            self.ik_pole_alpha = torch.stack(pole_alpha_chunks, dim=0)
             self.ik_limb_lengths = torch.stack(length_chunks, dim=0)
             self.ik_local_pole_axis = torch.stack(local_pole_axis_chunks, dim=0)
             self.ik_toe_offsets = torch.stack(toe_offset_chunks, dim=0)
             self.ik_toe_axis = torch.stack(toe_axis_chunks, dim=0)
             self.ik_marker_pos = self.root_relative_pos.index_select(1, self.ik_marker_indices_tensor)
             if "model_ik_payload" in arrays.files:
-                required = (
-                    "model_ik_rest_axis",
-                    "model_ik_rest_pole",
-                    "model_ik_limb_lengths",
-                    "model_ik_local_pole_axis",
-                    "model_ik_toe_offsets",
-                    "model_ik_toe_axis",
+                schema_version = int(arrays["model_ik_schema_version"]) if "model_ik_schema_version" in arrays.files else 1
+                pole_reference = (
+                    str(arrays["model_ik_pole_reference"].item())
+                    if "model_ik_pole_reference" in arrays.files
+                    else ""
                 )
-                missing = [key for key in required if key not in arrays.files]
-                if missing:
-                    raise ValueError(f"{path} is missing model IK metadata: {missing}")
-                model_payload = torch.tensor(arrays["model_ik_payload"], dtype=torch.float32)
-                if model_payload.shape != (self.T, IK_PAYLOAD_DIM):
-                    raise ValueError(
-                        f"{path} model_ik_payload shape {tuple(model_payload.shape)} "
-                        f"does not match {(self.T, IK_PAYLOAD_DIM)}"
+                if schema_version >= IK_SCHEMA_VERSION and pole_reference == IK_POLE_REFERENCE:
+                    required = (
+                        "model_ik_rest_axis",
+                        "model_ik_rest_pole",
+                        "model_ik_ee_pole_ref",
+                        "model_ik_pole_alpha",
+                        "model_ik_limb_lengths",
+                        "model_ik_local_pole_axis",
+                        "model_ik_toe_offsets",
+                        "model_ik_toe_axis",
                     )
-                self.ik_payload = model_payload
-                self.ik_ee_pos_root, self.ik_ee_rot6_root, self.ik_pole_float, self.ik_toe_float = split_ik_payload(
-                    self.ik_payload
-                )
-                self.ik_rest_axis = torch.tensor(arrays["model_ik_rest_axis"], dtype=torch.float32)
-                self.ik_rest_pole = torch.tensor(arrays["model_ik_rest_pole"], dtype=torch.float32)
-                self.ik_limb_lengths = torch.tensor(arrays["model_ik_limb_lengths"], dtype=torch.float32)
-                self.ik_local_pole_axis = torch.tensor(arrays["model_ik_local_pole_axis"], dtype=torch.float32)
-                self.ik_toe_offsets = torch.tensor(arrays["model_ik_toe_offsets"], dtype=torch.float32)
-                self.ik_toe_axis = torch.tensor(arrays["model_ik_toe_axis"], dtype=torch.float32)
+                    missing = [key for key in required if key not in arrays.files]
+                    if missing:
+                        raise ValueError(f"{path} is missing model IK metadata: {missing}")
+                    model_payload = torch.tensor(arrays["model_ik_payload"], dtype=torch.float32)
+                    if model_payload.shape != (self.T, IK_PAYLOAD_DIM):
+                        raise ValueError(
+                            f"{path} model_ik_payload shape {tuple(model_payload.shape)} "
+                            f"does not match {(self.T, IK_PAYLOAD_DIM)}"
+                        )
+                    self.ik_payload = clean_ik_payload(model_payload)
+                    self.ik_ee_pos_root, self.ik_ee_rot6_root, self.ik_pole_float, self.ik_toe_float = split_ik_payload(
+                        self.ik_payload
+                    )
+                    self.ik_rest_axis = torch.tensor(arrays["model_ik_rest_axis"], dtype=torch.float32)
+                    self.ik_rest_pole = torch.tensor(arrays["model_ik_rest_pole"], dtype=torch.float32)
+                    self.ik_ee_pole_ref = torch.tensor(arrays["model_ik_ee_pole_ref"], dtype=torch.float32)
+                    self.ik_pole_alpha = torch.tensor(arrays["model_ik_pole_alpha"], dtype=torch.float32)
+                    self.ik_limb_lengths = torch.tensor(arrays["model_ik_limb_lengths"], dtype=torch.float32)
+                    self.ik_local_pole_axis = torch.tensor(arrays["model_ik_local_pole_axis"], dtype=torch.float32)
+                    self.ik_toe_offsets = torch.tensor(arrays["model_ik_toe_offsets"], dtype=torch.float32)
+                    self.ik_toe_axis = torch.tensor(arrays["model_ik_toe_axis"], dtype=torch.float32)
 
         self.J = len(self.body_names)
         self.Jn = len(self.non_pelvis)
@@ -1027,6 +1228,8 @@ class MotionClip:
                 "ik_toe_float": self.ik_toe_float.to(device),
                 "ik_rest_axis": self.ik_rest_axis.to(device),
                 "ik_rest_pole": self.ik_rest_pole.to(device),
+                "ik_ee_pole_ref": self.ik_ee_pole_ref.to(device),
+                "ik_pole_alpha": self.ik_pole_alpha.to(device),
                 "ik_limb_lengths": self.ik_limb_lengths.to(device),
                 "ik_local_pole_axis": self.ik_local_pole_axis.to(device),
                 "ik_toe_offsets": self.ik_toe_offsets.to(device),
@@ -1186,6 +1389,79 @@ def pose_target_output(pose: dict[str, torch.Tensor]) -> torch.Tensor:
     )
 
 
+def _rebase_root_local_position(
+    local_pos: torch.Tensor,
+    from_root_pos: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_pos: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> torch.Tensor:
+    world = torch.matmul(local_pos.unsqueeze(1), from_root_rot).squeeze(1) + from_root_pos
+    return torch.matmul((world - to_root_pos).unsqueeze(1), to_root_rot.transpose(-1, -2)).squeeze(1)
+
+
+def _rebase_root_local_rot6(
+    rot6: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> torch.Tensor:
+    local_rot = rotation_6d_to_matrix(rot6)
+    world_rot = local_rot @ from_root_rot
+    return rotmat_to_6d(world_rot @ to_root_rot.transpose(-1, -2))
+
+
+def rebase_pose_root(
+    clip: MotionClip,
+    pose: dict[str, torch.Tensor],
+    from_root_pos: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_pos: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Express root-local pose fields under a different root transform."""
+
+    out = dict(pose)
+    out["pelvis_pos"] = _rebase_root_local_position(
+        pose["pelvis_pos"], from_root_pos, from_root_rot, to_root_pos, to_root_rot
+    )
+    out["pelvis_rot6"] = _rebase_root_local_rot6(pose["pelvis_rot6"], from_root_rot, to_root_rot)
+    if "ik_payload" in pose:
+        payload = pose["ik_payload"]
+        parts: list[torch.Tensor] = []
+        for spec in IK_PAYLOAD_SLICES:
+            pos_slice = spec["pos"]
+            rot_slice = spec["rot6"]
+            pole_slice = spec["pole"]
+            toe_slice = spec["toe_float"]
+            assert isinstance(pos_slice, slice)
+            assert isinstance(rot_slice, slice)
+            assert isinstance(pole_slice, slice)
+            parts.append(
+                _rebase_root_local_position(
+                    payload[:, pos_slice], from_root_pos, from_root_rot, to_root_pos, to_root_rot
+                )
+            )
+            parts.append(_rebase_root_local_rot6(payload[:, rot_slice], from_root_rot, to_root_rot))
+            parts.append(payload[:, pole_slice])
+            if toe_slice is not None:
+                assert isinstance(toe_slice, slice)
+                parts.append(payload[:, toe_slice])
+        out["ik_payload"] = clean_ik_payload(torch.cat(parts, dim=-1))
+    return out
+
+
+def rebase_output_vector_root(
+    clip: MotionClip,
+    vec: torch.Tensor,
+    from_root_pos: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_pos: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> torch.Tensor:
+    pose, _raw_pose = output_to_pose(vec, clip)
+    return pose_target_output(rebase_pose_root(clip, pose, from_root_pos, from_root_rot, to_root_pos, to_root_rot))
+
+
 def next_pose_from_prediction(pred_pose: dict[str, torch.Tensor], canon_pos: torch.Tensor) -> dict[str, torch.Tensor]:
     pose = {
         "pelvis_pos": pred_pose["pelvis_pos"],
@@ -1206,8 +1482,8 @@ def predict_next_raw(
     cfg: TrainConfig,
 ) -> torch.Tensor:
     raw = model(inp)
-    if cfg.predict_residual:
-        raw = pose_target_output(cur_pose) + raw
+    if cfg.predict_residual or output_prediction_uses_residual():
+        return pose_target_output(cur_pose) + raw
     return raw
 
 
@@ -1279,17 +1555,11 @@ def fk_from_pose(
             end_root = base_root + axis * d_clamped
             rest_axis = tensors["ik_rest_axis"][limb_i].to(dtype=root_rot.dtype)
             rest_pole = tensors["ik_rest_pole"][limb_i].to(dtype=root_rot.dtype)
-            natural_pole = project_to_plane(swing_only_transport(rest_axis, axis, rest_pole), axis)
-            pole_root = rotate_around_axis(natural_pole, axis, pole_float * IK_POLE_ALPHA)
-            mid_root = solve_two_bone_with_pole(
-                base_root,
-                end_root,
-                l1,
-                l2,
-                rest_axis,
-                rest_pole,
-                pole_float,
-            )
+            ee_pole_ref = tensors["ik_ee_pole_ref"][limb_i].to(dtype=root_rot.dtype)
+            pole_alpha = tensors["ik_pole_alpha"][limb_i].to(dtype=root_rot.dtype)
+            natural_pole = ee_frame_pole_reference(axis, end_rot_root, ee_pole_ref, rest_axis, rest_pole)
+            pole_root = rotate_around_axis(natural_pole, axis, pole_float * pole_alpha)
+            mid_root = solve_two_bone_with_pole_vector(base_root, end_root, l1, l2, pole_root)
             solved_mid = root_relative_to_world(mid_root.unsqueeze(1), root_pos, root_rot).squeeze(1)
             solved_end = root_relative_to_world(end_root.unsqueeze(1), root_pos, root_rot).squeeze(1)
             end_rot_world = root_relative_rot_to_world(end_rot_root, root_rot)
@@ -1612,23 +1882,48 @@ def compute_losses(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     b = target_idx.shape[0]
     tensors = clip.tensors(device)
-    root_pos, root_rot, _target_yaw, _target_heading = root_state(clip, target_idx, cfg, device)
-    pred_global_pos, pred_global_rot, pred_canon = fk_from_pose(clip, root_pos, root_rot, pred_pose, device)
-
     prev_root_pos, prev_root_rot, _prev_yaw, _prev_heading = root_state(clip, prev_idx, cfg, device)
     cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = root_state(clip, cur_idx, cfg, device)
+    target_root_pos, target_root_rot, _target_yaw, _target_heading = root_state(clip, target_idx, cfg, device)
+    if output_reference_uses_current_root():
+        output_root_pos, output_root_rot = cur_root_pos, cur_root_rot
+        target_pose_local = rebase_pose_root(
+            clip,
+            target_pose,
+            target_root_pos,
+            target_root_rot,
+            cur_root_pos,
+            cur_root_rot,
+        )
+        state_pose = rebase_pose_root(
+            clip,
+            pred_pose,
+            cur_root_pos,
+            cur_root_rot,
+            target_root_pos,
+            target_root_rot,
+        )
+    else:
+        output_root_pos, output_root_rot = target_root_pos, target_root_rot
+        target_pose_local = target_pose
+        state_pose = pred_pose
+    pred_global_pos, pred_global_rot, _pred_canon_current = fk_from_pose(
+        clip, output_root_pos, output_root_rot, pred_pose, device
+    )
+    _state_global_pos, _state_global_rot, state_canon = fk_from_pose(
+        clip, target_root_pos, target_root_rot, state_pose, device
+    )
+
     prev_global_pos, _prev_global_rot, _prev_canon = fk_from_pose(clip, prev_root_pos, prev_root_rot, prev_pose, device)
     cur_global_pos, cur_global_rot, _cur_canon = fk_from_pose(clip, cur_root_pos, cur_root_rot, cur_pose, device)
 
     target_global_pos, target_global_rot = global_from_clip(clip, target_idx, cfg, device)
 
     pelvis_loc = weighted_batch_mean(
-        F.huber_loss(pred_pose["pelvis_pos"], target_pose["pelvis_pos"], reduction="none"), sample_weight
+        F.huber_loss(pred_pose["pelvis_pos"], target_pose_local["pelvis_pos"], reduction="none"), sample_weight
     )
     pred_pelvis_rot = rotation_6d_to_matrix(pred_pose["pelvis_rot6"])
-    target_pelvis_rot = target_pose.get("pelvis_rot_mat")
-    if target_pelvis_rot is None:
-        target_pelvis_rot = rotation_6d_to_matrix(target_pose["pelvis_rot6"])
+    target_pelvis_rot = rotation_6d_to_matrix(target_pose_local["pelvis_rot6"])
     pelvis_rot = weighted_batch_mean(
         geodesic_angles(pred_pelvis_rot, target_pelvis_rot).unsqueeze(-1),
         sample_weight,
@@ -1652,12 +1947,12 @@ def compute_losses(
             pose_rot = zero_loss
             pose_aux = zero_loss
         marker_loc = weighted_batch_mean(
-            (pred_pose["ik_payload"] - target_pose["ik_payload"]).square(),
+            (pred_pose["ik_payload"] - target_pose_local["ik_payload"]).square(),
             sample_weight,
         )
         pose_aux = (
             pose_aux
-            + weighted_batch_mean((pred_pose["pelvis_rot6"] - target_pose["pelvis_rot6"]).square(), sample_weight)
+            + weighted_batch_mean((pred_pose["pelvis_rot6"] - target_pose_local["pelvis_rot6"]).square(), sample_weight)
             + marker_loc
         )
     else:
@@ -1675,7 +1970,7 @@ def compute_losses(
         pose_aux = weighted_batch_mean(
             (pred_pose["nonpelvis_rot6"] - target_pose["nonpelvis_rot6"]).square(), sample_weight
         ) + weighted_batch_mean(
-            (pred_pose["pelvis_rot6"] - target_pose["pelvis_rot6"]).square(), sample_weight
+            (pred_pose["pelvis_rot6"] - target_pose_local["pelvis_rot6"]).square(), sample_weight
         )
     ee_idx = tensors["end_effectors"]
     ee_delta = pred_global_pos.index_select(1, ee_idx) - target_global_pos.index_select(1, ee_idx)
@@ -1798,7 +2093,7 @@ def compute_losses(
         "foot_horizontal_speed_mean": foot_horizontal_speeds.detach().mean(),
         "freefall_relative_error": freefall_rel.detach().mean(),
     }
-    next_pose = next_pose_from_prediction(pred_pose, pred_canon)
+    next_pose = next_pose_from_prediction(state_pose, state_canon)
     return total, losses, next_pose, term_mask
 
 
@@ -2513,7 +2808,7 @@ def train(args: argparse.Namespace) -> None:
     if args.val_fraction is not None:
         cfg.val_fraction = args.val_fraction
     if args.predict_residual is not None:
-        cfg.predict_residual = args.predict_residual
+        cfg.predict_residual = output_prediction_uses_residual()
     if args.zero_init_output is not None:
         cfg.zero_init_output = args.zero_init_output
     if args.rollout_schedule is not None:
@@ -2744,6 +3039,13 @@ def train(args: argparse.Namespace) -> None:
         "foot_indices": clips[0].foot_indices,
         "toe_indices": clips[0].toe_indices,
         "pose_representation": cfg.pose_representation,
+        "output_reference_root": OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": normalized_output_prediction_mode(),
+        "predict_residual": bool(cfg.predict_residual),
+        "ik_schema_version": IK_SCHEMA_VERSION if uses_ik_markers(cfg.pose_representation) else None,
+        "ik_pole_reference": IK_POLE_REFERENCE if uses_ik_markers(cfg.pose_representation) else None,
+        "ik_leg_pole_alpha_deg": math.degrees(IK_LEG_POLE_ALPHA) if uses_ik_markers(cfg.pose_representation) else None,
+        "ik_arm_pole_alpha_deg": math.degrees(IK_ARM_POLE_ALPHA) if uses_ik_markers(cfg.pose_representation) else None,
         "ik_marker_names": clips[0].ik_marker_names,
         "ik_marker_indices": clips[0].ik_marker_indices,
         "core_non_pelvis_indices": clips[0].core_non_pelvis,
@@ -3113,7 +3415,12 @@ def main() -> None:
     parser.add_argument("--lr-plateau-cooldown-epochs", type=int, default=None)
     parser.add_argument("--lr-reset-on-rollout-advance", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--val-fraction", type=float, default=None)
-    parser.add_argument("--predict-residual", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--predict-residual",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Disabled. Residual prediction is rejected by the current IK controller contract.",
+    )
     parser.add_argument("--zero-init-output", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rollout-schedule", default=None, help="Comma-separated rollout K values, e.g. 1,2,4,8,16,32.")
     parser.add_argument("--curriculum-threshold", type=float, default=None)

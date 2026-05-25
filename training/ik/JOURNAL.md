@@ -108,7 +108,7 @@ clamped during decode/state carry.
 The vanilla simple-AE row is:
 
 ```text
-controller_input + target_output
+controller_input + current_root_transition_output
 ```
 
 When training a controller with frozen AE, score:
@@ -124,14 +124,30 @@ caused the Walk_F straight-arm regression.
 Simple AE is one-frame/current-transition only unless the user explicitly
 changes the plan.
 
+## Output Reference Contract
+
+Controller output is the next pose expressed in the current root referential.
+Frame state vectors are still stored in their own frame/root referential.
+
+- Decode controller predictions with the current root when measuring world
+  pose, foot sliding, envelope excess, or rendering the generated next pose.
+- Rebase prediction vectors from current root to next/future root before using
+  them as the next rollout state.
+- Core non-pelvis rotations stay parent-local and are not rebased. Pelvis
+  location/rotation and IK endpoint location/rotation are rebased. IK pole and
+  toe scalars are preserved.
+- Old future-root controller/AE checkpoints are contract-incompatible; new
+  checkpoints/schemas carry `output_reference_root = "current"`.
+
 ## Supervised Objective
 
-Supervised training compares cleaned/canonical predicted next vector to cached
-GT target vector:
+Supervised training compares the cleaned/canonical predicted transition vector
+to the GT next-frame vector rebased into the current root:
 
 ```text
 raw = model(input)
-pred_vec = predicted_state_from_raw(raw)
+pred_vec = clean_output_vector(raw)
+target_vec = transition_target_output(current_idx)
 loss = mse(pred_vec, target_vec)
 ```
 

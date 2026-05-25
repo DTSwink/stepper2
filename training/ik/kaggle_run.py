@@ -120,8 +120,8 @@ def supervised_cmd() -> tuple[list[str], list[str]]:
         cmd.append("--load-optimizer")
     if env_flag("STEPPER_RESUME_STEP_FROM_CHECKPOINT", True):
         cmd.append("--resume-step-from-checkpoint")
-    if env_flag("STEPPER_DISABLE_CUDA_GRAPH", True):
-        cmd.append("--disable-cuda-graph")
+    if env_flag("STEPPER_DISABLE_CUDA_GRAPH", False):
+        raise RuntimeError("STEPPER_DISABLE_CUDA_GRAPH is forbidden; supervised IK training is CUDA-graph-only.")
     return cmd, [label]
 
 
@@ -165,7 +165,7 @@ def ae_envelope_cmd() -> tuple[list[str], list[str]]:
     if pose_noise:
         cmd.extend(["--pose-noise", pose_noise])
     if env_flag("STEPPER_DISABLE_CUDA_GRAPH", False):
-        cmd.append("--disable-cuda-graph")
+        raise RuntimeError("STEPPER_DISABLE_CUDA_GRAPH is forbidden; CUDA graph is the default training contract.")
     return cmd, [ae_label, baseline_label, refined_label, final_label]
 
 

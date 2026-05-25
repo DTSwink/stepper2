@@ -67,6 +67,7 @@ def main() -> None:
 
     print(f"clip={clip.path}")
     print(f"frames={clip.T} bodies={clip.J} core={clip.Jcore} payload_dim={clip.ik_payload.shape[-1]}")
+    print(f"pole_reference={tl.IK_POLE_REFERENCE} pole_alpha_deg={[(float(x) * 180.0 / math.pi) for x in clip.ik_pole_alpha]}")
     print(f"pole_axes={clip.ik_local_pole_axis.tolist()}")
     print(f"toe_axes={clip.ik_toe_axis.tolist()}")
 

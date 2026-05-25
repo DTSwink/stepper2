@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -75,7 +76,7 @@ class SimpleAEConfig:
     val_fraction: float = VAL_FRACTION
     seed: int = SEED
     pose_representation: str = tl.IK_POSE_REPRESENTATION
-    feature: str = "controller_input_plus_target_output"
+    feature: str = "controller_input_plus_transition_output"
 
 
 class SimpleAutoencoder(nn.Module):
@@ -104,8 +105,8 @@ def make_locomotion_cfg(device: torch.device) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     cfg.pose_representation = tl.IK_POSE_REPRESENTATION
     cfg.cyclic_animation = True
-    cfg.predict_residual = False
-    cfg.zero_init_output = False
+    cfg.predict_residual = tl.output_prediction_uses_residual()
+    cfg.zero_init_output = tl.output_prediction_uses_residual()
     cfg.live_viewer = False
     cfg.visual_reporter = False
     cfg.update_comparison_on_exit = False
@@ -185,8 +186,21 @@ def feature_schema(clip: tl.MotionClip, cfg: tl.TrainConfig) -> dict[str, object
     velocity_dim = input_dim - pose_dim * 2 - 3 - int(cfg.future_window) * 4
     input_root_start = pose_dim * 2 + velocity_dim
     input_root_end = input_dim
+    feature_name = (
+        "controller_input_plus_current_root_transition_output"
+        if tl.output_reference_uses_current_root()
+        else "controller_input_plus_future_root_transition_output"
+    )
     return {
-        "feature": "controller_input_plus_target_output",
+        "feature": feature_name,
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
+        "predict_residual": bool(cfg.predict_residual),
+        "state_reference_root": tl.STATE_REFERENCE_ROOT,
+        "ik_schema_version": tl.IK_SCHEMA_VERSION,
+        "ik_pole_reference": tl.IK_POLE_REFERENCE,
+        "ik_leg_pole_alpha_deg": math.degrees(tl.IK_LEG_POLE_ALPHA),
+        "ik_arm_pole_alpha_deg": math.degrees(tl.IK_ARM_POLE_ALPHA),
         "total_dim": int(input_dim + output_dim),
         "input_dim": int(input_dim),
         "output_dim": int(output_dim),
@@ -221,6 +235,19 @@ def collect_controller_features(
         cur_pose = tl.get_pose_from_clip(clip, cur_idx, device)
         target_pose = tl.get_pose_from_clip(clip, target_idx, device)
         controller_input = tl.build_input(clip, prev_idx, cur_idx, prev_pose, cur_pose, locomotion_cfg, device)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = tl.root_state(clip, cur_idx, locomotion_cfg, device)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = tl.root_state(
+            clip, target_idx, locomotion_cfg, device
+        )
+        if tl.output_reference_uses_current_root():
+            target_pose = tl.rebase_pose_root(
+                clip,
+                target_pose,
+                target_root_pos,
+                target_root_rot,
+                cur_root_pos,
+                cur_root_rot,
+            )
         target_output = tl.pose_target_output(target_pose)
         chunks.append(torch.cat((controller_input, target_output), dim=-1).detach().cpu())
         clip_chunks.append(torch.full((cur_idx.numel(),), clip_id, dtype=torch.long))

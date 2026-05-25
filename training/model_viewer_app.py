@@ -1,27 +1,23 @@
 from __future__ import annotations
 
 import math
+import importlib
 import json
 import sys
 import threading
 import time
 import tkinter as tk
 import ctypes
+import functools
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
-import torch
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from OpenGL import GL, GLU
 from pyopengltk import OpenGLFrame
-
-try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    pass
 
 THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parents[0]
@@ -34,12 +30,68 @@ if str(FBX_PIPELINE_DIR) not in sys.path:
 if str(IK_DIR) not in sys.path:
     sys.path.insert(0, str(IK_DIR))
 
-import ik_core as ik_tl
+
+class LazyModule:
+    def __init__(self, module_name: str, on_load=None) -> None:
+        self.module_name = module_name
+        self.on_load = on_load
+        self._module = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        module = self._module
+        if module is not None:
+            return module
+        with self._lock:
+            module = self._module
+            if module is None:
+                module = importlib.import_module(self.module_name)
+                if self.on_load is not None:
+                    self.on_load(module)
+                self._module = module
+        return module
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+    def __repr__(self) -> str:
+        return f"<lazy module {self.module_name}>"
+
+
+def configure_torch_module(torch_module) -> None:
+    try:
+        torch_module.set_num_threads(1)
+        torch_module.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
+torch = LazyModule("torch", configure_torch_module)
+ik_tl = LazyModule("ik_core")
 tl = ik_tl
-from ik import checkpoint_runtime as ik_runtime
-from ik import contact_physics as cp
-from ik import excess_envelope as ik_env
-from ik import train_simple_ae_controller as ik_ctl
+ik_runtime = LazyModule("ik.checkpoint_runtime")
+cp = LazyModule("ik.contact_physics")
+ik_env = LazyModule("ik.excess_envelope")
+ik_ctl = LazyModule("ik.train_simple_ae_controller")
+
+
+def lazy_torch_inference_mode(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def warm_model_runtime() -> None:
+    try:
+        torch._load()
+        ik_tl._load()
+    except Exception:
+        pass
+
+
 from foot_contact import DEFAULT_CONFIG as FOOT_CONTACT_CONFIG
 from foot_contact import (
     FootContactConfig,
@@ -178,6 +230,42 @@ def resolve_path(path: str | Path) -> Path:
     return p.resolve()
 
 
+def infer_cyclic_from_path(path: Path) -> bool:
+    text = str(path).replace("\\", "/").lower()
+    stem = path.stem.lower()
+    if "loop" in stem or "animations_omni" in text:
+        return True
+    if "transition" in text or "turn" in stem or "reface" in stem or "diamond" in stem:
+        return False
+    return False
+
+
+def checkpoint_source_cyclic_flag(checkpoint: dict | None, path: Path) -> bool:
+    if not isinstance(checkpoint, dict):
+        return infer_cyclic_from_path(path)
+    metadata = checkpoint.get("metadata", {})
+    path_resolved = path.resolve()
+    for item in metadata.get("npz_folders", []):
+        if not isinstance(item, dict):
+            continue
+        folder_text = item.get("path")
+        if not folder_text:
+            continue
+        try:
+            folder = resolve_path(str(folder_text))
+        except Exception:
+            continue
+        if path_resolved.parent == folder:
+            return bool(item.get("cyclic", False))
+    for path_text in metadata.get("npz_paths", []):
+        try:
+            if resolve_path(str(path_text)) == path_resolved:
+                return infer_cyclic_from_path(path_resolved)
+        except Exception:
+            continue
+    return infer_cyclic_from_path(path_resolved)
+
+
 def normalize_hex_color(value: object, fallback: str = FLOOR) -> str:
     text = str(value).strip()
     if not text.startswith("#"):
@@ -281,20 +369,44 @@ def apply_config_dict_generic(cfg: object, values: dict) -> None:
         setattr(cfg, key, value)
 
 
-def path_has_ik_tag(path: Path) -> bool:
-    return any("_ik_" in part.lower() for part in path.parts)
+def checkpoint_uses_ik_data(ckpt: object) -> bool:
+    if not isinstance(ckpt, dict):
+        return False
+    return ik_runtime.is_current_ik_controller_checkpoint(ckpt)
+
+
+def checkpoint_output_contract(ckpt: object) -> tuple[str, str]:
+    if not isinstance(ckpt, dict):
+        return (
+            ik_tl.normalized_output_reference_root(),
+            ik_tl.normalized_output_prediction_mode(),
+        )
+    policy = ik_runtime.checkpoint_policy(ckpt)
+    root = ik_tl.normalized_output_reference_root(policy.get("output_reference_root", ik_tl.OUTPUT_REFERENCE_ROOT))
+    prediction = ik_tl.normalized_output_prediction_mode(ik_runtime.checkpoint_output_prediction_mode(ckpt))
+    return root, prediction
+
+
+@contextmanager
+def ik_output_contract(root: object, prediction: object):
+    module = ik_tl._load()
+    previous_root = module.OUTPUT_REFERENCE_ROOT
+    previous_prediction = module.OUTPUT_PREDICTION_MODE
+    module.OUTPUT_REFERENCE_ROOT = module.normalized_output_reference_root(root)
+    module.OUTPUT_PREDICTION_MODE = module.normalized_output_prediction_mode(prediction)
+    try:
+        yield
+    finally:
+        module.OUTPUT_REFERENCE_ROOT = previous_root
+        module.OUTPUT_PREDICTION_MODE = previous_prediction
 
 
 def checkpoint_uses_ik(path: Path) -> bool:
-    if path_has_ik_tag(path):
-        return True
     try:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
     except Exception:
         return False
-    if not isinstance(ckpt, dict):
-        return False
-    return ik_runtime.checkpoint_uses_ik(ckpt)
+    return checkpoint_uses_ik_data(ckpt)
 
 
 def load_controller_model(
@@ -311,17 +423,29 @@ def load_controller_model(
     return model
 
 
-def is_locomotion_checkpoint(path: Path) -> bool:
-    try:
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception:
-        return False
+def is_locomotion_checkpoint_data(ckpt: object) -> bool:
     if not isinstance(ckpt, dict):
         return False
     schema = ckpt.get("schema")
     if isinstance(schema, dict) and "total_dim" in schema:
         return False
     return isinstance(ckpt.get("config"), dict) and "model" in ckpt
+
+
+def is_locomotion_checkpoint(path: Path) -> bool:
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    return is_locomotion_checkpoint_data(ckpt)
+
+
+def checkpoint_matches_viewer(path: Path) -> bool:
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    return is_locomotion_checkpoint_data(ckpt) and checkpoint_uses_ik_data(ckpt)
 
 
 def checkpoint_candidates(pattern: str) -> list[Path]:
@@ -353,10 +477,51 @@ def checkpoint_time_key(path: Path) -> tuple[int, int, int, str]:
     return (run_activity, checkpoint_mtime, len(path.parts), str(path).lower())
 
 
+def likely_viewer_checkpoint_path(path: Path) -> bool:
+    lower_parts = [part.lower() for part in path.parts]
+    lower_name = path.name.lower()
+    run_name = checkpoint_run_dir(path).name.lower()
+    if "cache" in lower_parts or "old runs" in lower_parts:
+        return False
+    if "_ik_" not in f"_{run_name}_":
+        return False
+    if not lower_name.endswith((".pt", ".pth")):
+        return False
+    if any(token in lower_name for token in ("simple_ae", "autoencoder", "hard_negative", "buffer")):
+        return False
+    return True
+
+
+def newest_checkpoint_fast(policy: str = "last") -> Path | None:
+    if not DEFAULT_RUNS_DIR.exists():
+        return None
+    policy = normalize_checkpoint_policy(policy)
+    pattern_groups = (
+        ("*/checkpoints/*best*.pt", "*/checkpoints/*_best.pt")
+        if policy == "best"
+        else ("*/checkpoints/*_latest.pt", "*/checkpoints/*_last.pt", "*/checkpoints/*.pt")
+    )
+    candidates: list[Path] = []
+    for pattern in pattern_groups:
+        try:
+            candidates.extend(path for path in DEFAULT_RUNS_DIR.glob(pattern) if path.is_file())
+        except OSError:
+            continue
+        candidates = [path for path in dict.fromkeys(candidates) if likely_viewer_checkpoint_path(path)]
+        candidates.sort(key=checkpoint_time_key, reverse=True)
+        for path in candidates:
+            if "_init" not in path.name.lower():
+                return path
+    return None
+
+
 def newest_checkpoint(policy: str = "last") -> Path | None:
     if not DEFAULT_RUNS_DIR.exists():
         return None
     policy = normalize_checkpoint_policy(policy)
+    fast = newest_checkpoint_fast(policy)
+    if fast is not None:
+        return fast
     if policy == "best":
         pattern_groups = [["*best*.pt", "checkpoint_best*.pt"], ["*.pt"]]
     else:
@@ -370,7 +535,7 @@ def newest_checkpoint(policy: str = "last") -> Path | None:
             unique[str(path.resolve()).lower()] = path
         candidates = sorted(unique.values(), key=checkpoint_time_key, reverse=True)
         for path in candidates:
-            if is_locomotion_checkpoint(path) and checkpoint_uses_ik(path):
+            if checkpoint_matches_viewer(path):
                 return path
     return None
 
@@ -510,6 +675,8 @@ class Actor:
     generation_target: int = 0
     generation_thread: threading.Thread | None = field(default=None, repr=False)
     status: str = "ready"
+    output_reference_root: str = ""
+    output_prediction_mode: str = ""
 
     @property
     def frame_count(self) -> int:
@@ -534,7 +701,39 @@ class Actor:
         return ik_tl
 
     def is_current_ik_controller_checkpoint(self) -> bool:
-        return ik_runtime.is_current_ik_controller_checkpoint(self.checkpoint)
+        return checkpoint_uses_ik_data(self.checkpoint)
+
+    def set_output_contract(self, root: object, prediction: object) -> None:
+        self.output_reference_root = ik_tl.normalized_output_reference_root(root)
+        self.output_prediction_mode = ik_tl.normalized_output_prediction_mode(prediction)
+
+    def set_output_contract_from_checkpoint(self) -> None:
+        root, prediction = checkpoint_output_contract(self.checkpoint)
+        self.set_output_contract(root, prediction)
+
+    def output_contract_tuple(self) -> tuple[str, str]:
+        root = self.output_reference_root or ik_tl.OUTPUT_REFERENCE_ROOT
+        prediction = self.output_prediction_mode or ik_tl.OUTPUT_PREDICTION_MODE
+        return (
+            ik_tl.normalized_output_reference_root(root),
+            ik_tl.normalized_output_prediction_mode(prediction),
+        )
+
+    def output_contract_context(self):
+        root, prediction = self.output_contract_tuple()
+        return ik_output_contract(root, prediction)
+
+    def output_reference_uses_current_root(self) -> bool:
+        root, _prediction = self.output_contract_tuple()
+        return ik_tl.output_reference_uses_current_root(root)
+
+    def output_prediction_uses_residual(self) -> bool:
+        _root, prediction = self.output_contract_tuple()
+        return ik_tl.output_prediction_uses_residual(prediction)
+
+    def output_contract_label(self) -> str:
+        root, prediction = self.output_contract_tuple()
+        return f"{root}/{prediction}"
 
     def has_initial_pelvis_offset(self) -> bool:
         return bool(np.linalg.norm(self.initial_pelvis_offset) > 1e-7)
@@ -644,12 +843,30 @@ class Actor:
             and self.cur_simple_payload is not None
         )
 
-    def advance_simple_state(self, pred_vec: torch.Tensor) -> None:
+    def advance_simple_state(
+        self,
+        pred_vec: torch.Tensor,
+        from_root_pos: torch.Tensor,
+        from_root_rot: torch.Tensor,
+        to_root_pos: torch.Tensor,
+        to_root_rot: torch.Tensor,
+    ) -> None:
         if self.simple_store is None:
             return
         self.prev_simple_vec = self.cur_simple_vec
         self.prev_simple_pelvis = self.cur_simple_pelvis
         self.prev_simple_payload = self.cur_simple_payload
+        if self.output_reference_uses_current_root():
+            pred_vec = ik_ctl.rebase_output_vector_root(
+                self.simple_store,
+                pred_vec,
+                from_root_pos,
+                from_root_rot,
+                to_root_pos,
+                to_root_rot,
+            )
+        else:
+            pred_vec = ik_ctl.clean_output_vector(pred_vec, self.simple_store)
         self.cur_simple_vec, self.cur_simple_pelvis, self.cur_simple_payload = ik_ctl.predicted_state_from_vector(
             pred_vec, self.simple_store
         )
@@ -678,11 +895,12 @@ class Actor:
         self.npz_path = path
         self.source_npz_path = path if self.kind == "model" else None
         self.ik_mode = True
+        self.set_output_contract(ik_tl.OUTPUT_REFERENCE_ROOT, ik_tl.OUTPUT_PREDICTION_MODE)
         self.cfg = cfg or ik_tl.TrainConfig()
         if hasattr(self.cfg, "pose_representation"):
             self.cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
         self.cfg.use_torch_compile = False
-        self.clip = ik_tl.MotionClip(path, self.cfg)
+        self.clip = ik_tl.MotionClip(path, self.cfg, cyclic_animation=infer_cyclic_from_path(path))
         self.clip_tensors = None
         self.simple_store = None
         self.clear_simple_state()
@@ -712,13 +930,19 @@ class Actor:
         backend = self.backend()
         self.checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         ik_runtime.require_current_ik_controller_checkpoint(self.checkpoint, checkpoint_path)
-        self.cfg = backend.TrainConfig()
-        apply_config_dict_generic(self.cfg, self.checkpoint.get("config", {}))
-        if hasattr(self.cfg, "pose_representation"):
-            self.cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
-        self.cfg.device = str(device)
-        self.cfg.use_torch_compile = False
-        self.clip = backend.MotionClip(source_npz_path, self.cfg)
+        self.set_output_contract_from_checkpoint()
+        with self.output_contract_context():
+            self.cfg = backend.TrainConfig()
+            apply_config_dict_generic(self.cfg, self.checkpoint.get("config", {}))
+            if hasattr(self.cfg, "pose_representation"):
+                self.cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
+            self.cfg.device = str(device)
+            self.cfg.use_torch_compile = False
+            self.clip = backend.MotionClip(
+                source_npz_path,
+                self.cfg,
+                cyclic_animation=checkpoint_source_cyclic_flag(self.checkpoint, source_npz_path),
+            )
         self.source_contacts = None
         try:
             self.model = load_controller_model(self.checkpoint, self.clip, self.cfg, device, backend)
@@ -736,7 +960,7 @@ class Actor:
         self.clear_simple_state()
         self.ensure_simple_store()
         self.reset_generation()
-        self.status = f"on-demand IK model, source {source_npz_path.name}"
+        self.status = f"on-demand IK model ({self.output_contract_label()}), source {source_npz_path.name}"
 
     def reset_generation(self) -> None:
         with self.generation_lock:
@@ -768,7 +992,11 @@ class Actor:
                 pose_cur_idx = self.cur_idx
                 if self.random_init_source_npz_path is not None and self.random_init_frame is not None and self.cfg is not None:
                     try:
-                        candidate_clip = backend.MotionClip(self.random_init_source_npz_path, self.cfg)
+                        candidate_clip = backend.MotionClip(
+                            self.random_init_source_npz_path,
+                            self.cfg,
+                            cyclic_animation=checkpoint_source_cyclic_flag(self.checkpoint, self.random_init_source_npz_path),
+                        )
                         if candidate_clip.body_names != self.clip.body_names:
                             raise ValueError("random init skeleton does not match source skeleton")
                         max_seed_cur = max(1, candidate_clip.T - 1)
@@ -1002,7 +1230,7 @@ class Actor:
             if int(self.generation_target) <= target:
                 return
 
-    @torch.inference_mode()
+    @lazy_torch_inference_mode
     def generate_to(self, frame: int, extend_authored: bool = False) -> None:
         if self.kind == "model" and self.clip is not None and not self.controller_active:
             self.authored_extension_active = bool(extend_authored)
@@ -1104,16 +1332,24 @@ class Actor:
             pred_vec: torch.Tensor | None = None
             if self.controller_active:
                 target_idx = torch.tensor([target], dtype=torch.long)
+                source_cur_idx = self.cur_idx.to(self.device)
                 source_target_idx = torch.tensor([min(target, self.clip.T - 1)], dtype=torch.long, device=self.device)
-                root_pos = tensors["root_pos"].index_select(0, source_target_idx)
-                root_rot = tensors["root_rot"].index_select(0, source_target_idx)
+                decode_root_pos = tensors["root_pos"].index_select(0, source_cur_idx)
+                decode_root_rot = tensors["root_rot"].index_select(0, source_cur_idx)
+                state_root_pos = tensors["root_pos"].index_select(0, source_target_idx)
+                state_root_rot = tensors["root_rot"].index_select(0, source_target_idx)
                 inp = self.build_current_ik_controller_input()
             elif extend_authored:
                 prev_frame = int(self.prev_idx.reshape(-1)[0].item())
                 cur_frame = int(self.cur_idx.reshape(-1)[0].item())
                 target_idx = torch.tensor([cur_frame + 1], dtype=torch.long)
                 self.set_authored_extension_root_plan(prev_frame, cur_frame)
-                root_pos, root_rot, _root_yaw, _heading = self.authored_root_state(cur_frame + 1, self.device, True)
+                decode_root_pos, decode_root_rot, _cur_yaw, _cur_heading = self.authored_root_state(
+                    cur_frame, self.device, True
+                )
+                state_root_pos, state_root_rot, _root_yaw, _heading = self.authored_root_state(
+                    cur_frame + 1, self.device, True
+                )
                 inp = self.build_current_ik_controller_input()
             else:
                 next_idx = self.cur_idx.to(self.device) + 1
@@ -1125,7 +1361,12 @@ class Actor:
                 assert self.prev_simple_vec is not None and self.cur_simple_vec is not None
                 assert self.prev_simple_pelvis is not None and self.cur_simple_pelvis is not None
                 assert self.prev_simple_payload is not None and self.cur_simple_payload is not None
-                root_pos, root_rot, _root_yaw, _heading = self.simple_store.root_state(self.simple_clip_ids, next_idx)
+                decode_root_pos, decode_root_rot, _cur_yaw, _cur_heading = self.simple_store.root_state(
+                    self.simple_clip_ids, self.cur_idx.to(self.device)
+                )
+                state_root_pos, state_root_rot, _root_yaw, _heading = self.simple_store.root_state(
+                    self.simple_clip_ids, next_idx
+                )
                 inp = ik_ctl.build_controller_input(
                     self.simple_store,
                     self.simple_clip_ids,
@@ -1138,19 +1379,38 @@ class Actor:
                     self.cur_simple_payload,
                 )
             assert self.cur_simple_vec is not None and self.simple_store is not None
-            raw_out = ik_ctl.model_forward(self.model, inp, self.cur_simple_vec, self.cfg)
+            raw_out = self.model(inp)
+            if self.output_prediction_uses_residual():
+                raw_out = self.cur_simple_vec + raw_out
             pred_vec = ik_ctl.clean_output_vector(raw_out, self.simple_store)
             pred_pose, _ = backend.output_to_pose(pred_vec, self.clip)
+            output_root_pos = decode_root_pos if self.output_reference_uses_current_root() else state_root_pos
+            output_root_rot = decode_root_rot if self.output_reference_uses_current_root() else state_root_rot
             global_pos, global_rot, canon_pos = backend.fk_from_pose(
-                self.clip, root_pos, root_rot, pred_pose, self.device
+                self.clip, output_root_pos, output_root_rot, pred_pose, self.device
             )
             self.generated_pos.append(global_pos[0].detach().cpu().numpy().astype(np.float32))
             self.generated_rot.append(global_rot[0].detach().cpu().numpy().astype(np.float32))
             self.generated_contacts.append(self.pose_contacts_numpy(pred_pose))
             self.prev_pose = self.cur_pose
-            self.cur_pose = self.next_pose_from_prediction(pred_pose, canon_pos)
+            if self.output_reference_uses_current_root():
+                state_vec = ik_ctl.rebase_output_vector_root(
+                    self.simple_store,
+                    pred_vec,
+                    decode_root_pos,
+                    decode_root_rot,
+                    state_root_pos,
+                    state_root_rot,
+                )
+            else:
+                state_vec = ik_ctl.clean_output_vector(pred_vec, self.simple_store)
+            state_pose, _ = backend.output_to_pose(state_vec, self.clip)
+            _state_pos, _state_rot, state_canon = backend.fk_from_pose(
+                self.clip, state_root_pos, state_root_rot, state_pose, self.device
+            )
+            self.cur_pose = self.next_pose_from_prediction(state_pose, state_canon)
             if pred_vec is not None:
-                self.advance_simple_state(pred_vec)
+                self.advance_simple_state(pred_vec, decode_root_pos, decode_root_rot, state_root_pos, state_root_rot)
             self.prev_idx = self.cur_idx
             self.cur_idx = target_idx
 
@@ -1316,6 +1576,12 @@ class ModelViewerApp(tk.Tk):
         self.set_app_icon()
         self.minsize(920, 500)
         self.configure(bg=BG)
+        self.model_runtime_warmup_thread = threading.Thread(
+            target=warm_model_runtime,
+            name="StepperRuntimeWarmup",
+            daemon=True,
+        )
+        self.model_runtime_warmup_thread.start()
 
         self.actors: list[Actor] = []
         self.next_actor_id = 1
@@ -1401,6 +1667,10 @@ class ModelViewerApp(tk.Tk):
         self.root_motion_overlay_texture_text = ""
         self.root_motion_overlay_texture_size = (0, 0)
         self.root_motion_overlay_texture_uv = (1.0, 1.0)
+        self.selected_object_overlay_texture_id = 0
+        self.selected_object_overlay_texture_text = ""
+        self.selected_object_overlay_texture_size = (0, 0)
+        self.selected_object_overlay_texture_uv = (1.0, 1.0)
         self.contact_overlay_texture_id = 0
         self.contact_overlay_texture_text = ""
         self.contact_overlay_texture_size = (0, 0)
@@ -1410,6 +1680,7 @@ class ModelViewerApp(tk.Tk):
         self.ae_overlay_texture_size = (0, 0)
         self.ae_overlay_texture_uv = (1.0, 1.0)
         self.ae_prior_info: dict[str, object] | None = None
+        self.ae_prior_contract: tuple[str, str] | None = None
         self.ae_prior_load_attempted = False
         self.ae_prior_error = ""
         self.ae_value_cache: dict[str, object] = {}
@@ -1518,6 +1789,8 @@ class ModelViewerApp(tk.Tk):
         )
         self.random_initialization_var = tk.BooleanVar(value=bool(random_settings.get("enabled", False)))
         self.settings_status_var = tk.StringVar(value="")
+        self.auto_load_pending = False
+        self.auto_load_thread: threading.Thread | None = None
 
         self._configure_style()
         self._build_ui()
@@ -2396,7 +2669,11 @@ class ModelViewerApp(tk.Tk):
         for _attempt in range(min(12, len(candidates) * 2)):
             path = candidates[int(rng.integers(0, len(candidates)))]
             try:
-                candidate_clip = actor.backend().MotionClip(path, actor.cfg)
+                candidate_clip = actor.backend().MotionClip(
+                    path,
+                    actor.cfg,
+                    cyclic_animation=checkpoint_source_cyclic_flag(actor.checkpoint, path),
+                )
                 if actor.clip is not None and candidate_clip.body_names != actor.clip.body_names:
                     last_error = f"{path.name} skeleton does not match the selected model source."
                     continue
@@ -2440,7 +2717,11 @@ class ModelViewerApp(tk.Tk):
                 if actor.cfg is None:
                     last_error = f"{actor.name} has no model config."
                     continue
-                candidate_clip = actor.backend().MotionClip(path, actor.cfg)
+                candidate_clip = actor.backend().MotionClip(
+                    path,
+                    actor.cfg,
+                    cyclic_animation=checkpoint_source_cyclic_flag(actor.checkpoint, path),
+                )
                 if actor.clip is not None and candidate_clip.body_names != actor.clip.body_names:
                     last_error = f"{path.name} skeleton does not match the selected model source."
                     continue
@@ -2471,17 +2752,75 @@ class ModelViewerApp(tk.Tk):
         return False
 
     def auto_load_latest(self) -> None:
+        if self.actors or self.auto_load_pending:
+            return
+        policy = normalize_checkpoint_policy(self.startup_checkpoint_policy_var.get())
+        source = self.startup_source_npz()
+        if source is None:
+            return
+        device_name = self.device_var.get()
+        self.auto_load_pending = True
+        self.status_var.set("Finding latest checkpoint...")
+
+        def worker() -> None:
+            actor: Actor | None = None
+            checkpoint: Path | None = None
+            error: Exception | None = None
+            try:
+                checkpoint = newest_checkpoint(policy)
+                if checkpoint is None:
+                    raise FileNotFoundError("no compatible checkpoint found")
+                actor = Actor(
+                    actor_id=0,
+                    kind="model",
+                    name=actor_basename(checkpoint),
+                    color=PRED_ORANGE,
+                    ik_mode=True,
+                    checkpoint_path=checkpoint,
+                    status="needs source NPZ",
+                )
+                if device_name == "cuda" and not torch.cuda.is_available():
+                    load_device_name = "cpu"
+                else:
+                    load_device_name = device_name
+                actor.load_checkpoint(checkpoint, source, torch.device(load_device_name))
+            except Exception as exc:
+                error = exc
+            try:
+                self.after(0, lambda: self.finish_auto_load_latest(actor, checkpoint, source, error))
+            except tk.TclError:
+                pass
+
+        self.auto_load_thread = threading.Thread(target=worker, name="StepperAutoLoad", daemon=True)
+        self.auto_load_thread.start()
+
+    def finish_auto_load_latest(
+        self,
+        actor: Actor | None,
+        checkpoint: Path | None,
+        source: Path,
+        error: Exception | None,
+    ) -> None:
+        self.auto_load_pending = False
+        if error is not None:
+            self.status_var.set(f"Auto-load skipped: {error}")
+            return
+        if actor is None or checkpoint is None:
+            return
         if self.actors:
             return
-        checkpoint = newest_checkpoint(normalize_checkpoint_policy(self.startup_checkpoint_policy_var.get()))
-        source = self.startup_source_npz()
-        if checkpoint is None or source is None:
-            return
-        try:
-            actor = self.add_checkpoint_actor(checkpoint, source_npz_path=source)
-            self.status_var.set(f"Auto-loaded\n{checkpoint.name}\n{source.name}")
-        except Exception as exc:
-            self.status_var.set(f"Auto-load skipped: {exc}")
+        actor.actor_id = self.next_actor_id
+        self.next_actor_id += 1
+        self.ik_mode_var.set(True)
+        self.actors.append(actor)
+        if self.random_initialization_var.get() and actor.clip is not None:
+            self.sample_random_initialization(actor, redraw=False)
+        self.refresh_tree(select_id=actor.actor_id)
+        self.update_timeline()
+        self.update_bounds()
+        self.invalidate_shadow_cache()
+        self.draw()
+        self.status_var.set(f"Auto-loaded\n{checkpoint.name}\n{source.name}")
 
     def add_npz_actor(self, path: Path) -> Actor:
         actor = Actor(
@@ -4003,6 +4342,18 @@ class ModelViewerApp(tk.Tk):
         yaw_rate = math.degrees(angle_wrap_np(float(current_yaw) - float(previous_yaw))) * fps / max(1e-6, frame_delta)
         return f"root v {horizontal_speed:6.3f} m/s\nroot yaw {yaw_rate:+7.1f} deg/s"
 
+    def selected_object_overlay_text(self) -> str:
+        actor = self.selected_actor()
+        if actor is None:
+            return ""
+        if actor.kind == "model" and actor.checkpoint_path is not None:
+            return actor.checkpoint_path.name
+        if actor.kind == "npz" and actor.npz_path is not None:
+            return actor.npz_path.name
+        if actor.source_npz_path is not None:
+            return actor.source_npz_path.name
+        return actor.name
+
     def on_axis_gizmo_click(self, event: tk.Event) -> None:
         nearest = None
         nearest_d2 = float("inf")
@@ -4275,10 +4626,13 @@ class ModelViewerApp(tk.Tk):
                 payload_parts.append(root_relative[:, end])
                 end_rot_root = rot_t[:, end] @ root_inv
                 payload_parts.append(backend.rotmat_to_6d(end_rot_root))
-                pole_float = backend.encode_pole_float(
+                pole_float = backend.encode_ee_pole_float(
                     root_relative[:, start],
                     root_relative[:, mid],
                     root_relative[:, end],
+                    end_rot_root,
+                    tensors["ik_ee_pole_ref"][limb_i].to(dtype=root_rot.dtype),
+                    tensors["ik_pole_alpha"][limb_i].to(dtype=root_rot.dtype),
                     tensors["ik_rest_axis"][limb_i].to(dtype=root_rot.dtype),
                     tensors["ik_rest_pole"][limb_i].to(dtype=root_rot.dtype),
                 ).unsqueeze(-1)
@@ -5294,6 +5648,16 @@ class ModelViewerApp(tk.Tk):
         ) = self.make_overlay_texture(text, self.root_motion_overlay_texture_id, 14)
         self.root_motion_overlay_texture_text = text
 
+    def upload_selected_object_overlay_texture(self, text: str) -> None:
+        if text == self.selected_object_overlay_texture_text and self.selected_object_overlay_texture_id:
+            return
+        (
+            self.selected_object_overlay_texture_id,
+            self.selected_object_overlay_texture_size,
+            self.selected_object_overlay_texture_uv,
+        ) = self.make_overlay_texture(text, self.selected_object_overlay_texture_id, 13)
+        self.selected_object_overlay_texture_text = text
+
     def upload_contact_overlay_texture(self, text: str) -> None:
         if text == self.contact_overlay_texture_text and self.contact_overlay_texture_id:
             return
@@ -5314,12 +5678,20 @@ class ModelViewerApp(tk.Tk):
         ) = self.make_overlay_texture(text, self.ae_overlay_texture_id, 14)
         self.ae_overlay_texture_text = text
 
-    def latest_ae_prior(self) -> dict[str, object] | None:
-        if self.ae_prior_info is not None:
+    def latest_ae_prior(self, actor: Actor | None = None) -> dict[str, object] | None:
+        if actor is not None:
+            expected_root, expected_prediction = actor.output_contract_tuple()
+        else:
+            expected_root = ik_tl.normalized_output_reference_root()
+            expected_prediction = ik_tl.normalized_output_prediction_mode()
+        expected_contract = (expected_root, expected_prediction)
+        if self.ae_prior_info is not None and self.ae_prior_contract == expected_contract:
             return self.ae_prior_info
-        if self.ae_prior_load_attempted:
+        if self.ae_prior_load_attempted and self.ae_prior_contract == expected_contract:
             return None
         self.ae_prior_load_attempted = True
+        self.ae_prior_contract = expected_contract
+        self.ae_prior_info = None
         self.ae_prior_error = ""
         candidates: list[Path] = []
         for pattern in (
@@ -5327,30 +5699,19 @@ class ModelViewerApp(tk.Tk):
             "20*_ik*/checkpoints/*simple_ae*.pt",
             "*/checkpoints/*current_simple_ae*.pt",
             "*/checkpoints/*simple_ae*.pt",
+            "*simple_ae*/checkpoints/*.pt",
+            "*ae_research*/checkpoints/*.pt",
+            "*fullae*/checkpoints/*.pt",
         ):
             try:
                 candidates.extend(DEFAULT_RUNS_DIR.glob(pattern))
             except OSError:
                 continue
-        if not candidates:
-            stack = [DEFAULT_RUNS_DIR]
-            while stack:
-                folder = stack.pop()
-                try:
-                    children = list(folder.iterdir())
-                except OSError:
-                    continue
-                for child in children:
-                    if "cache" in {part.lower() for part in child.parts}:
-                        continue
-                    try:
-                        if child.is_dir():
-                            stack.append(child)
-                        elif child.suffix.lower() == ".pt":
-                            candidates.append(child)
-                    except OSError:
-                        continue
         candidates = list(dict.fromkeys(path.resolve() for path in candidates))
+        if not candidates:
+            self.ae_prior_error = "no AE checkpoint"
+            return None
+
         def candidate_mtime(path: Path) -> float:
             try:
                 return path.stat().st_mtime
@@ -5389,7 +5750,8 @@ class ModelViewerApp(tk.Tk):
                     continue
             try:
                 if kind in accepted_kinds:
-                    model, mean, std, loaded = ik_ctl.load_simple_ae(path, torch.device("cpu"))
+                    with ik_output_contract(expected_root, expected_prediction):
+                        model, mean, std, loaded = ik_ctl.load_simple_ae(path, torch.device("cpu"))
                     ckpt = loaded
                     schema = dict(ckpt["schema"])
                 else:
@@ -5410,7 +5772,22 @@ class ModelViewerApp(tk.Tk):
                 if str(schema.get("feature", "")) not in {
                     "controller_input_plus_target_output",
                     "1x_controller_input_plus_target_output",
+                    "controller_input_plus_current_root_transition_output",
+                    "controller_input_plus_future_root_transition_output",
+                    "controller_input_plus_transition_output",
                 }:
+                    continue
+                if schema.get("output_reference_root") != expected_root:
+                    continue
+                checkpoint_prediction = str(
+                    schema.get("output_prediction_mode", ik_tl.OUTPUT_PREDICTION_MODE_ABSOLUTE)
+                ).lower().strip()
+                if checkpoint_prediction != expected_prediction:
+                    continue
+                if (
+                    schema.get("ik_schema_version") != ik_tl.IK_SCHEMA_VERSION
+                    or schema.get("ik_pole_reference") != ik_tl.IK_POLE_REFERENCE
+                ):
                     continue
                 if "total_dim" not in schema or "input_dim" not in schema:
                     continue
@@ -5418,17 +5795,19 @@ class ModelViewerApp(tk.Tk):
                     model.eval()
                     for param in model.parameters():
                         param.requires_grad_(False)
-                loco_cfg = ik_tl.TrainConfig()
-                apply_config_dict_generic(loco_cfg, ckpt.get("locomotion_config", {}))
-                if hasattr(loco_cfg, "pose_representation"):
-                    loco_cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
-                loco_cfg.use_torch_compile = False
+                with ik_output_contract(expected_root, expected_prediction):
+                    loco_cfg = ik_tl.TrainConfig()
+                    apply_config_dict_generic(loco_cfg, ckpt.get("locomotion_config", {}))
+                    if hasattr(loco_cfg, "pose_representation"):
+                        loco_cfg.pose_representation = ik_tl.IK_POSE_REPRESENTATION
+                    loco_cfg.use_torch_compile = False
                 self.ae_prior_info = {
                     "path": path,
                     "model": model,
                     "mean": mean,
                     "std": std,
                     "schema": schema,
+                    "contract": expected_contract,
                     "locomotion_config": loco_cfg,
                     "kind": kind,
                     "variant": ckpt.get("variant", {}),
@@ -5612,6 +5991,19 @@ class ModelViewerApp(tk.Tk):
         root_feat = self.ae_root_delta_feature(actor, prev_idx, cur_idx, cfg, device)
         future_feat = self.ae_future_root_features(actor, cur_idx, cfg, device)
         model_input = torch.cat((current, previous, pelvis_vel, joint_vel, root_feat, future_feat), dim=-1)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = self.ae_root_state_for_actor(actor, cur_idx, cfg, device)
+        next_root_pos, next_root_rot, _next_yaw, _next_heading = self.ae_root_state_for_actor(
+            actor, cur_idx + 1, cfg, device
+        )
+        if actor.output_reference_uses_current_root():
+            next_pose = ik_tl.rebase_pose_root(
+                actor.clip,
+                next_pose,
+                next_root_pos,
+                next_root_rot,
+                cur_root_pos,
+                cur_root_rot,
+            )
         next_output = ik_tl.pose_target_output(next_pose)
         return torch.cat((model_input, next_output), dim=-1)
 
@@ -5671,10 +6063,13 @@ class ModelViewerApp(tk.Tk):
                 payload_chunks.append(ik_tl.rotmat_to_6d(ee_rot_root))
                 rest_axis = actor.clip.ik_rest_axis[limb_i].to(dtype=torch.float32, device=device)
                 rest_pole = actor.clip.ik_rest_pole[limb_i].to(dtype=torch.float32, device=device)
-                pole_float = ik_tl.encode_pole_float(
+                pole_float = ik_tl.encode_ee_pole_float(
                     root_local_pos[:, start],
                     root_local_pos[:, mid],
                     root_local_pos[:, end],
+                    ee_rot_root,
+                    actor.clip.ik_ee_pole_ref[limb_i].to(dtype=torch.float32, device=device),
+                    actor.clip.ik_pole_alpha[limb_i].to(dtype=torch.float32, device=device),
                     rest_axis,
                     rest_pole,
                 ).unsqueeze(-1)
@@ -5712,17 +6107,18 @@ class ModelViewerApp(tk.Tk):
     def ae_score_for_actor(self, actor: Actor) -> float | None:
         if actor.clip is None:
             return None
-        prior = self.latest_ae_prior()
+        prior = self.latest_ae_prior(actor)
         if prior is None:
             return None
         cur = self.ae_transition_frame(actor)
         if cur is None:
             return None
         prior_path = str(prior.get("path", ""))
+        prior_contract = tuple(prior.get("contract", actor.output_contract_tuple()))
         generated_revision = 0
         if actor.kind == "model" and cur + 1 < len(actor.generated_pos):
             generated_revision = id(actor.generated_pos[cur + 1])
-        cache_key = (prior_path, actor.actor_id, actor.kind, cur, generated_revision, len(actor.generated_pos))
+        cache_key = (prior_path, prior_contract, actor.actor_id, actor.kind, cur, generated_revision, len(actor.generated_pos))
         if self.ae_value_cache.get("key") == cache_key:
             cached = self.ae_value_cache.get("value")
             return float(cached) if cached is not None else None
@@ -6342,6 +6738,23 @@ class ModelViewerApp(tk.Tk):
             height,
         )
 
+    def gl_draw_selected_object_overlay(self, width: int, height: int) -> None:
+        text = self.selected_object_overlay_text()
+        if not text:
+            return
+        self.upload_selected_object_overlay_texture(text)
+        text_w, _text_h = self.selected_object_overlay_texture_size
+        x0 = max(12.0, float(width - text_w - 116))
+        self.gl_draw_text_overlay(
+            self.selected_object_overlay_texture_id,
+            self.selected_object_overlay_texture_size,
+            self.selected_object_overlay_texture_uv,
+            x0,
+            24.0,
+            width,
+            height,
+        )
+
     def contact_metrics_text(self, actor_poses: list[tuple[Actor, np.ndarray, np.ndarray]]) -> str:
         if not (self.show_foot_height_var.get() or self.show_foot_contact_var.get()):
             return ""
@@ -6663,6 +7076,7 @@ class ModelViewerApp(tk.Tk):
         self.gl_draw_contact_metrics_overlay(width, height, actor_poses)
         if AE_VALUE_OVERLAY_ENABLED:
             self.gl_draw_ae_value_overlay(width, height, actor_poses)
+        self.gl_draw_selected_object_overlay(width, height)
         self.gl_draw_camera_overlay(width, height)
         self.gl_draw_root_motion_overlay(width, height)
         GL.glFlush()

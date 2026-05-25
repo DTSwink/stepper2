@@ -239,7 +239,15 @@ def temporal_schema(base_schema: dict[str, object], frames: int) -> dict[str, ob
     out["window_frames"] = frames
     out["base_total_dim"] = int(base_schema["total_dim"])
     out["total_dim"] = int(base_schema["total_dim"]) * frames
-    out["feature"] = f"{frames}x_controller_input_plus_target_output"
+    feature_root = "current_root" if tl.output_reference_uses_current_root() else "future_root"
+    out["feature"] = f"{frames}x_controller_input_plus_{feature_root}_transition_output"
+    out["output_reference_root"] = tl.OUTPUT_REFERENCE_ROOT
+    out["output_prediction_mode"] = tl.normalized_output_prediction_mode()
+    out["state_reference_root"] = tl.STATE_REFERENCE_ROOT
+    out["ik_schema_version"] = tl.IK_SCHEMA_VERSION
+    out["ik_pole_reference"] = tl.IK_POLE_REFERENCE
+    out["ik_leg_pole_alpha_deg"] = math.degrees(tl.IK_LEG_POLE_ALPHA)
+    out["ik_arm_pole_alpha_deg"] = math.degrees(tl.IK_ARM_POLE_ALPHA)
     return out
 
 
@@ -347,7 +355,7 @@ def gt_transition_feature(store: ctl.SimpleClipStore, clip_ids: torch.Tensor, cu
     inp = ctl.build_controller_input(
         store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
     )
-    target_vec = store.get_target_output(clip_ids, cur_idx + 1)
+    target_vec = ctl.transition_target_output(store, clip_ids, cur_idx)
     return torch.cat((inp, target_vec), dim=-1)
 
 
@@ -423,7 +431,7 @@ def temporal_validation_ae_score(
             prev_vec = cur_vec
             prev_pelvis = cur_pelvis
             prev_payload = cur_payload
-            cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
+            cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
             cur_idx = cur_idx + 1
         return float(torch.cat(scores).mean().detach().cpu()) if scores else 0.0
 
@@ -475,11 +483,12 @@ def temporal_ae_rollout_loss(
             context = torch.cat((context[:, 1:, :], raw_feature[:, None, :]), dim=1).index_select(0, rows)
         pred_vec = pred_vec.index_select(0, rows)
         clip_ids = clip_ids.index_select(0, rows)
+        selected_cur_idx = cur_idx.index_select(0, rows)
         prev_vec = cur_vec.index_select(0, rows)
         prev_pelvis = cur_pelvis.index_select(0, rows)
         prev_payload = cur_payload.index_select(0, rows)
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
-        cur_idx = cur_idx.index_select(0, rows) + 1
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, clip_ids, selected_cur_idx, pred_vec)
+        cur_idx = selected_cur_idx + 1
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
     return total_loss
@@ -573,7 +582,7 @@ def controller_ae_rollout_loss(
         if float(pose_noise_amount) > 0.0:
             reset_cur_vec = ctl.add_pose_noise_to_vector(store, reset_cur_vec, float(pose_noise_amount))
             reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.predicted_state_from_vector(reset_cur_vec, store)
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        next_vec, next_pelvis, next_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
 
         reset_mask = reset[:, None]
         advance_mask = advance[:, None]
@@ -782,9 +791,10 @@ def rollout_global_velocity_metrics(
         pred_vec = ctl.clean_output_vector(raw, store)
         pred_pose, _ = tl.output_to_pose(pred_vec, store.prototype)
         target_idx = cur_idx + 1
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
-        pred_global = ctl.fk_positions_by_clip(store, clip_ids, root_pos, root_rot, pred_pose)
-        pred_rot = torch.empty((clip_ids.shape[0], store.J, 3, 3), dtype=root_pos.dtype, device=store.device)
+        cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
+        pred_global = ctl.fk_positions_by_clip(store, clip_ids, cur_root_pos, cur_root_rot, pred_pose)
+        pred_rot = torch.empty((clip_ids.shape[0], store.J, 3, 3), dtype=cur_root_pos.dtype, device=store.device)
         target_global = torch.empty_like(pred_global)
         target_rot = torch.empty_like(pred_rot)
         target_pose = store.get_pose(clip_ids, target_idx)
@@ -792,15 +802,15 @@ def rollout_global_velocity_metrics(
             rows = (clip_ids == int(clip_id)).nonzero(as_tuple=False).flatten()
             p_pos, p_rot, _p_canon = tl.fk_from_pose(
                 store.clips[int(clip_id)],
-                root_pos.index_select(0, rows),
-                root_rot.index_select(0, rows),
+                cur_root_pos.index_select(0, rows),
+                cur_root_rot.index_select(0, rows),
                 ctl.pose_rows(pred_pose, rows),
                 store.device,
             )
             t_pos, t_rot, _t_canon = tl.fk_from_pose(
                 store.clips[int(clip_id)],
-                root_pos.index_select(0, rows),
-                root_rot.index_select(0, rows),
+                target_root_pos.index_select(0, rows),
+                target_root_rot.index_select(0, rows),
                 ctl.pose_rows(target_pose, rows),
                 store.device,
             )
@@ -825,7 +835,7 @@ def rollout_global_velocity_metrics(
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
     pos = torch.cat(pos_errs)
     rot = torch.cat(rot_errs)

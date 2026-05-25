@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 try:
     from .bootstrap import PROJECT_ROOT, ensure_paths
     from .naming import checkpoint_path, ik_run_id
+    from . import checkpoint_runtime as ckpt_runtime
     from . import excess_envelope as env
     from . import ik_core as tl
     from .rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
@@ -21,6 +22,7 @@ try:
 except ImportError:
     from bootstrap import PROJECT_ROOT, ensure_paths
     from naming import checkpoint_path, ik_run_id
+    import checkpoint_runtime as ckpt_runtime
     import excess_envelope as env
     import ik_core as tl
     from rl_loss import RL_TERM_NAMES, RLLossConfig, compute_rl_loss
@@ -35,6 +37,10 @@ DEFAULT_AE_GLOB = "*_ik_simple_ae_*"
 SIMPLE_CONTROLLER_AE_KIND = "simple_controller_io_autoencoder"
 LEGACY_SIMPLE_AE_KIND = "simple_" + "ag" + "ent_io_autoencoder"
 ENVELOPE_TERM_NAMES = ("linear_slide_weighted", "angular_slide_weighted")
+IDENTITY_TERM_NAME = "identity_output"
+IDENTITY_MAXABS_TERM_NAME = "identity_output_maxabs"
+IDENTITY_WORLD_POS_TERM_NAME = "identity_world_pos"
+IDENTITY_PELVIS_POS_TERM_NAME = "identity_pelvis_pos"
 
 BATCH_SIZE = 4096
 SMALL_CUDA_K64_BATCH_SIZE = 3328
@@ -149,6 +155,8 @@ class SimpleClipStore:
         self.local_offsets = prototype_tensors["local_offsets"]
         self.ik_limb_lengths = prototype_tensors["ik_limb_lengths"]
         self.ik_rest_axis = prototype_tensors["ik_rest_axis"]
+        self.ik_ee_pole_ref = prototype_tensors["ik_ee_pole_ref"]
+        self.ik_pole_alpha = prototype_tensors["ik_pole_alpha"]
         self.ik_base_start_indices = tuple(int(spec["start"]) for spec in first.ik_limb_specs)
         needed_bones: set[int] = set()
         for start in self.ik_base_start_indices:
@@ -235,11 +243,10 @@ class SimpleClipStore:
                 cur_idx = rows.clone()
                 cur_idx[0] = period
             else:
-                max_cur = int(clip.T) - transition_feature_horizon(self.cfg) - 1
-                if max_cur < 1:
+                if int(clip.T) <= 1:
                     chunks.append(features)
                     continue
-                rows = torch.arange(1, max_cur + 1, dtype=torch.long, device=self.device)
+                rows = torch.arange(1, int(clip.T), dtype=torch.long, device=self.device)
                 cur_idx = rows
 
             clip_ids = torch.full((cur_idx.numel(),), clip_id, dtype=torch.long, device=self.device)
@@ -259,6 +266,8 @@ class SimpleClipStore:
             future_offsets = torch.arange(1, future_steps + 1, device=self.device, dtype=cur_idx.dtype)
             flat_clip_ids = clip_ids.reshape(-1, 1).expand(-1, future_steps).reshape(-1)
             flat_idx = (cur_idx.reshape(-1, 1) + future_offsets.reshape(1, future_steps)).reshape(-1)
+            if not clip.cyclic_animation:
+                flat_idx = flat_idx.clamp(max=int(clip.T) - 1)
             fut_pos, _fut_rot, fut_yaw, _fut_heading = self.root_state(flat_clip_ids, flat_idx)
             fut_pos = fut_pos.reshape(cur_idx.numel(), future_steps, 3)
             fut_yaw = fut_yaw.reshape(cur_idx.numel(), future_steps)
@@ -360,8 +369,8 @@ def make_cfg(device: torch.device, ae_ckpt: dict) -> tl.TrainConfig:
     cfg = tl.TrainConfig()
     apply_config_dict(cfg, ae_ckpt.get("locomotion_config", {}))
     cfg.pose_representation = tl.IK_POSE_REPRESENTATION
-    cfg.predict_residual = False
-    cfg.zero_init_output = False
+    cfg.predict_residual = tl.output_prediction_uses_residual()
+    cfg.zero_init_output = tl.output_prediction_uses_residual()
     cfg.hidden_dim = 512
     cfg.num_hidden_layers = 2
     cfg.learning_rate = LEARNING_RATE
@@ -372,6 +381,27 @@ def make_cfg(device: torch.device, ae_ckpt: dict) -> tl.TrainConfig:
     cfg.use_torch_compile = False
     cfg.device = str(device)
     return cfg
+
+
+def initialize_controller_output_from_ae_mean(
+    model: torch.nn.Module,
+    mean: torch.Tensor,
+    input_dim: int,
+    output_dim: int,
+) -> str:
+    output_layer = getattr(model, "net", [None])[-1]
+    if not isinstance(output_layer, torch.nn.Linear):
+        raise TypeError("Expected MLPController final layer to be torch.nn.Linear.")
+    target_mean = mean[int(input_dim) : int(input_dim) + int(output_dim)].to(
+        device=output_layer.bias.device,
+        dtype=output_layer.bias.dtype,
+    )
+    if int(target_mean.numel()) != int(output_dim):
+        raise ValueError(f"AE feature mean output dim {target_mean.numel()} does not match controller output dim {output_dim}.")
+    with torch.no_grad():
+        output_layer.weight.zero_()
+        output_layer.bias.copy_(target_mean)
+    return "ae_feature_output_mean_bias_zero_weight"
 
 
 def resolve_path(path_text: str | Path) -> Path:
@@ -446,6 +476,22 @@ def load_simple_ae(path: Path, device: torch.device) -> tuple[SimpleAutoencoder,
         raise ValueError(f"Not a simple controller IO AE checkpoint: {path}")
     ae_cfg = SimpleAEConfig(**ckpt["config"])
     schema = dict(ckpt["schema"])
+    if schema.get("output_reference_root") != tl.OUTPUT_REFERENCE_ROOT:
+        raise ValueError(
+            f"Simple AE checkpoint uses output_reference_root={schema.get('output_reference_root')!r}; "
+            f"expected {tl.OUTPUT_REFERENCE_ROOT!r}: {path}"
+        )
+    checkpoint_prediction = str(schema.get("output_prediction_mode", tl.OUTPUT_PREDICTION_MODE_ABSOLUTE)).lower().strip()
+    if checkpoint_prediction != tl.normalized_output_prediction_mode():
+        raise ValueError(
+            f"Simple AE checkpoint uses output_prediction_mode={checkpoint_prediction!r}; "
+            f"expected {tl.normalized_output_prediction_mode()!r}: {path}"
+        )
+    if schema.get("ik_schema_version") != tl.IK_SCHEMA_VERSION or schema.get("ik_pole_reference") != tl.IK_POLE_REFERENCE:
+        raise ValueError(
+            "Simple AE checkpoint uses a legacy IK pole schema; retrain the AE with "
+            f"ik_schema_version={tl.IK_SCHEMA_VERSION} and ik_pole_reference={tl.IK_POLE_REFERENCE!r}: {path}"
+        )
     model = SimpleAutoencoder(int(schema["total_dim"]), ae_cfg).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -633,6 +679,18 @@ def stage_learning_rate(rollout_k: int) -> float:
     return float(STAGE_LEARNING_RATES.get(int(rollout_k), LEARNING_RATE))
 
 
+def default_stage_learning_rates_for_schedule(schedule: tuple[int, ...]) -> dict[int, float]:
+    if max(int(k) for k in schedule) <= 32:
+        return {
+            1: 1e-4,
+            2: 1e-4,
+            8: 1e-4,
+            16: 5e-5,
+            32: 2e-5,
+        }
+    return dict(STAGE_LEARNING_RATES)
+
+
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = float(lr)
@@ -730,6 +788,82 @@ def add_pose_noise_to_vector(store: SimpleClipStore, vec: torch.Tensor, amount: 
 def target_state(store: SimpleClipStore, clip_ids: torch.Tensor, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     vec = store.get_target_output(clip_ids, idx)
     return vec, vec[:, :3], vec[:, payload_slice(store)]
+
+
+def rebase_output_vector_root(
+    store: SimpleClipStore,
+    vec: torch.Tensor,
+    from_root_pos: torch.Tensor,
+    from_root_rot: torch.Tensor,
+    to_root_pos: torch.Tensor,
+    to_root_rot: torch.Tensor,
+) -> torch.Tensor:
+    rebased = tl.rebase_output_vector_root(
+        store.prototype,
+        vec,
+        from_root_pos,
+        from_root_rot,
+        to_root_pos,
+        to_root_rot,
+    )
+    return clean_output_vector(rebased, store)
+
+
+def transition_output_root_state(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_idx = cur_idx if tl.output_reference_uses_current_root() else cur_idx + 1
+    root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, output_idx)
+    return root_pos, root_rot
+
+
+def current_state_as_transition_output(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    cur_vec: torch.Tensor,
+) -> torch.Tensor:
+    if tl.output_reference_uses_current_root():
+        return cur_vec
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+    return rebase_output_vector_root(store, cur_vec, cur_root_pos, cur_root_rot, next_root_pos, next_root_rot)
+
+
+def transition_target_output(store: SimpleClipStore, clip_ids: torch.Tensor, cur_idx: torch.Tensor) -> torch.Tensor:
+    target_idx = cur_idx + 1
+    target = store.get_target_output(clip_ids, target_idx)
+    if tl.output_reference_uses_future_root():
+        return target
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
+    return rebase_output_vector_root(store, target, target_root_pos, target_root_rot, cur_root_pos, cur_root_rot)
+
+
+def advance_transition_output(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    transition_vec: torch.Tensor,
+) -> torch.Tensor:
+    if tl.output_reference_uses_future_root():
+        return clean_output_vector(transition_vec, store)
+    next_idx = cur_idx + 1
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, next_idx)
+    return rebase_output_vector_root(store, transition_vec, cur_root_pos, cur_root_rot, next_root_pos, next_root_rot)
+
+
+def advance_transition_state(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    transition_vec: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    state_vec = advance_transition_output(store, clip_ids, cur_idx, transition_vec)
+    return predicted_state_from_vector(state_vec, store)
 
 
 def fast_clean_6d(d6: torch.Tensor) -> torch.Tensor:
@@ -908,8 +1042,8 @@ def predicted_state_from_vector(vec: torch.Tensor, store: SimpleClipStore) -> tu
 
 def model_forward(model: torch.nn.Module, inp: torch.Tensor, cur_vec: torch.Tensor, cfg: tl.TrainConfig) -> torch.Tensor:
     raw = model(inp)
-    if cfg.predict_residual:
-        raw = cur_vec + raw
+    if cfg.predict_residual or tl.output_prediction_uses_residual():
+        return cur_vec + raw
     return raw
 
 
@@ -946,6 +1080,24 @@ def ae_score_rows(
     return (recon - x).square().mean(dim=-1)
 
 
+def identity_world_position_rows(
+    store: SimpleClipStore,
+    clip_ids: torch.Tensor,
+    cur_idx: torch.Tensor,
+    pred_vec: torch.Tensor,
+    cur_vec: torch.Tensor,
+) -> torch.Tensor:
+    cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
+    pred_root_pos, pred_root_rot = transition_output_root_state(store, clip_ids, cur_idx)
+    pred_pose, _pred_raw_pose = tl.output_to_pose(pred_vec, store.prototype)
+    cur_pose, _cur_raw_pose = tl.output_to_pose(cur_vec, store.prototype)
+    pred_pos, _pred_rot, _pred_canon = tl.fk_from_pose(
+        store.prototype, pred_root_pos, pred_root_rot, pred_pose, store.device
+    )
+    cur_pos, _cur_rot, _cur_canon = tl.fk_from_pose(store.prototype, cur_root_pos, cur_root_rot, cur_pose, store.device)
+    return (pred_pos - cur_pos).square().sum(dim=-1).mean(dim=-1)
+
+
 def pure_ae_rollout_loss(
     model: torch.nn.Module,
     ae: SimpleAutoencoder,
@@ -960,6 +1112,10 @@ def pure_ae_rollout_loss(
     envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
     linear_slide_weight: float = 0.0,
     angular_slide_weight: float = 0.0,
+    identity_loss_weight: float = 0.0,
+    identity_maxabs_weight: float = 0.0,
+    identity_world_pos_weight: float = 0.0,
+    identity_pelvis_pos_weight: float = 0.0,
 ) -> ControllerLossResult:
     max_k = max(1, int(rollout_k))
     original_batch_size = max(1, int(batch_size))
@@ -971,6 +1127,10 @@ def pure_ae_rollout_loss(
     row_weight = (1.0 / effective_k.float()) / float(original_batch_size)
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
     ae_total = torch.zeros_like(total_loss)
+    identity_total = torch.zeros_like(total_loss)
+    identity_maxabs_total = torch.zeros_like(total_loss)
+    identity_world_pos_total = torch.zeros_like(total_loss)
+    identity_pelvis_pos_total = torch.zeros_like(total_loss)
     rl_terms = {name: torch.zeros_like(total_loss) for name in RL_TERM_NAMES}
     envelope_terms = {name: torch.zeros_like(total_loss) for name in ENVELOPE_TERM_NAMES}
     has_envelope = envelope is not None and (float(linear_slide_weight) != 0.0 or float(angular_slide_weight) != 0.0)
@@ -981,19 +1141,48 @@ def pure_ae_rollout_loss(
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
+        cur_output_vec = current_state_as_transition_output(store, clip_ids, cur_idx, cur_vec)
         active = torch.ones_like(row_weight, dtype=torch.bool)
         if float(ae_loss_weight) != 0.0:
-            ae_loss = (ae_score_rows(ae, mean, std, inp, raw) * row_weight).sum() * float(ae_loss_weight)
+            ae_loss = (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight).sum() * float(ae_loss_weight)
         else:
             ae_loss = torch.zeros_like(total_loss)
-        rl_loss = compute_rl_loss(pred_vec, cur_vec, row_weight, active, rl_cfg)
+        if float(identity_loss_weight) != 0.0:
+            identity_loss = (
+                (pred_vec - cur_output_vec).square().mean(dim=-1) * row_weight
+            ).sum() * float(identity_loss_weight)
+        else:
+            identity_loss = torch.zeros_like(total_loss)
+        if float(identity_maxabs_weight) != 0.0:
+            identity_maxabs_loss = (
+                (pred_vec - cur_output_vec).abs().amax(dim=-1) * row_weight
+            ).sum() * float(identity_maxabs_weight)
+        else:
+            identity_maxabs_loss = torch.zeros_like(total_loss)
+        if float(identity_world_pos_weight) != 0.0:
+            identity_world_pos_loss = (
+                identity_world_position_rows(store, clip_ids, cur_idx, pred_vec, cur_vec) * row_weight
+            ).sum() * float(identity_world_pos_weight)
+        else:
+            identity_world_pos_loss = torch.zeros_like(total_loss)
+        if float(identity_pelvis_pos_weight) != 0.0:
+            identity_pelvis_pos_loss = (
+                (pred_vec[:, :3] - cur_output_vec[:, :3]).square().sum(dim=-1) * row_weight
+            ).sum() * float(identity_pelvis_pos_weight)
+        else:
+            identity_pelvis_pos_loss = torch.zeros_like(total_loss)
+        rl_loss = compute_rl_loss(pred_vec, cur_output_vec, row_weight, active, rl_cfg)
         ae_total = ae_total + ae_loss
+        identity_total = identity_total + identity_loss
+        identity_maxabs_total = identity_maxabs_total + identity_maxabs_loss
+        identity_world_pos_total = identity_world_pos_total + identity_world_pos_loss
+        identity_pelvis_pos_total = identity_pelvis_pos_total + identity_pelvis_pos_loss
         for key, value in rl_loss.terms.items():
             rl_terms[key] = rl_terms.get(key, torch.zeros_like(total_loss)) + value
         envelope_loss = torch.zeros_like(total_loss)
         if has_envelope:
             cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
-            next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+            next_root_pos, next_root_rot = transition_output_root_state(store, clip_ids, cur_idx)
             cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
             next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
             linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
@@ -1011,7 +1200,16 @@ def pure_ae_rollout_loss(
             envelope_terms["linear_slide_weighted"] = envelope_terms["linear_slide_weighted"] + linear_loss
             envelope_terms["angular_slide_weighted"] = envelope_terms["angular_slide_weighted"] + angular_loss
             envelope_loss = linear_loss + angular_loss
-        total_loss = total_loss + ae_loss + rl_loss.total + envelope_loss
+        total_loss = (
+            total_loss
+            + ae_loss
+            + identity_loss
+            + identity_maxabs_loss
+            + identity_world_pos_loss
+            + identity_pelvis_pos_loss
+            + rl_loss.total
+            + envelope_loss
+        )
         if step + 1 >= max_k:
             break
 
@@ -1021,7 +1219,13 @@ def pure_ae_rollout_loss(
             break
         clip_ids = clip_ids.index_select(0, rows)
         reset = training_reset_rows(store, clip_ids, cur_idx.index_select(0, rows), torch.ones_like(rows, dtype=torch.bool))
-        next_vec, next_pelvis, next_payload = predicted_state_from_vector(pred_vec.index_select(0, rows), store)
+        selected_cur_idx = cur_idx.index_select(0, rows)
+        next_vec, next_pelvis, next_payload = advance_transition_state(
+            store,
+            clip_ids,
+            selected_cur_idx,
+            pred_vec.index_select(0, rows),
+        )
         next_idx = cur_idx.index_select(0, rows) + 1
         reset_starts = sample_same_clip_training_starts(store, clip_ids)
         reset_prev_vec, reset_prev_pelvis, reset_prev_payload = target_state(store, clip_ids, reset_starts - 1)
@@ -1036,7 +1240,18 @@ def pure_ae_rollout_loss(
         cur_idx = torch.where(reset, reset_starts, next_idx)
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
-    return ControllerLossResult(total=total_loss, terms={"ae_score": ae_total, **rl_terms, **envelope_terms})
+    return ControllerLossResult(
+        total=total_loss,
+        terms={
+            "ae_score": ae_total,
+            IDENTITY_TERM_NAME: identity_total,
+            IDENTITY_MAXABS_TERM_NAME: identity_maxabs_total,
+            IDENTITY_WORLD_POS_TERM_NAME: identity_world_pos_total,
+            IDENTITY_PELVIS_POS_TERM_NAME: identity_pelvis_pos_total,
+            **rl_terms,
+            **envelope_terms,
+        },
+    )
 
 
 def pure_ae_rollout_loss_static(
@@ -1056,6 +1271,10 @@ def pure_ae_rollout_loss_static(
     envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
     linear_slide_weight: float = 0.0,
     angular_slide_weight: float = 0.0,
+    identity_loss_weight: float = 0.0,
+    identity_maxabs_weight: float = 0.0,
+    identity_world_pos_weight: float = 0.0,
+    identity_pelvis_pos_weight: float = 0.0,
 ) -> ControllerLossResult:
     rl_cfg = rl_cfg or RLLossConfig()
     max_k = max(1, int(rollout_k))
@@ -1065,6 +1284,10 @@ def pure_ae_rollout_loss_static(
     row_weight = (1.0 / effective_k.float()) / float(max(1, int(batch_size)))
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
     ae_total = torch.zeros_like(total_loss)
+    identity_total = torch.zeros_like(total_loss)
+    identity_maxabs_total = torch.zeros_like(total_loss)
+    identity_world_pos_total = torch.zeros_like(total_loss)
+    identity_pelvis_pos_total = torch.zeros_like(total_loss)
     rl_terms = {name: torch.zeros_like(total_loss) for name in RL_TERM_NAMES}
     envelope_terms = {name: torch.zeros_like(total_loss) for name in ENVELOPE_TERM_NAMES}
     has_envelope = envelope is not None and (float(linear_slide_weight) != 0.0 or float(angular_slide_weight) != 0.0)
@@ -1075,20 +1298,51 @@ def pure_ae_rollout_loss_static(
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
         pred_vec = clean_output_vector(raw, store)
+        cur_output_vec = current_state_as_transition_output(store, clip_ids, cur_idx, cur_vec)
         active = effective_k > step
         if float(ae_loss_weight) != 0.0:
-            ae_loss = (ae_score_rows(ae, mean, std, inp, raw) * row_weight * active.float()).sum() * float(ae_loss_weight)
+            ae_loss = (ae_score_rows(ae, mean, std, inp, pred_vec) * row_weight * active.float()).sum() * float(ae_loss_weight)
         else:
             ae_loss = torch.zeros_like(total_loss)
-        rl_loss = compute_rl_loss(pred_vec, cur_vec, row_weight, active, rl_cfg)
+        if float(identity_loss_weight) != 0.0:
+            identity_loss = (
+                (pred_vec - cur_output_vec).square().mean(dim=-1) * row_weight * active.float()
+            ).sum() * float(identity_loss_weight)
+        else:
+            identity_loss = torch.zeros_like(total_loss)
+        if float(identity_maxabs_weight) != 0.0:
+            identity_maxabs_loss = (
+                (pred_vec - cur_output_vec).abs().amax(dim=-1) * row_weight * active.float()
+            ).sum() * float(identity_maxabs_weight)
+        else:
+            identity_maxabs_loss = torch.zeros_like(total_loss)
+        if float(identity_world_pos_weight) != 0.0:
+            active_f = active.float()
+            identity_world_pos_loss = (
+                identity_world_position_rows(store, clip_ids, cur_idx, pred_vec, cur_vec) * row_weight * active_f
+            ).sum() * float(identity_world_pos_weight)
+        else:
+            identity_world_pos_loss = torch.zeros_like(total_loss)
+        if float(identity_pelvis_pos_weight) != 0.0:
+            active_f = active.float()
+            identity_pelvis_pos_loss = (
+                (pred_vec[:, :3] - cur_output_vec[:, :3]).square().sum(dim=-1) * row_weight * active_f
+            ).sum() * float(identity_pelvis_pos_weight)
+        else:
+            identity_pelvis_pos_loss = torch.zeros_like(total_loss)
+        rl_loss = compute_rl_loss(pred_vec, cur_output_vec, row_weight, active, rl_cfg)
         ae_total = ae_total + ae_loss
+        identity_total = identity_total + identity_loss
+        identity_maxabs_total = identity_maxabs_total + identity_maxabs_loss
+        identity_world_pos_total = identity_world_pos_total + identity_world_pos_loss
+        identity_pelvis_pos_total = identity_pelvis_pos_total + identity_pelvis_pos_loss
         for key, value in rl_loss.terms.items():
             rl_terms[key] = rl_terms.get(key, torch.zeros_like(total_loss)) + value
         envelope_loss = torch.zeros_like(total_loss)
         if has_envelope:
             active_f = active.float()
             cur_root_pos, cur_root_rot, _cur_yaw, _cur_heading = store.root_state(clip_ids, cur_idx)
-            next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
+            next_root_pos, next_root_rot = transition_output_root_state(store, clip_ids, cur_idx)
             cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
             next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
             linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
@@ -1106,12 +1360,21 @@ def pure_ae_rollout_loss_static(
             envelope_terms["linear_slide_weighted"] = envelope_terms["linear_slide_weighted"] + linear_loss
             envelope_terms["angular_slide_weighted"] = envelope_terms["angular_slide_weighted"] + angular_loss
             envelope_loss = linear_loss + angular_loss
-        total_loss = total_loss + ae_loss + rl_loss.total + envelope_loss
+        total_loss = (
+            total_loss
+            + ae_loss
+            + identity_loss
+            + identity_maxabs_loss
+            + identity_world_pos_loss
+            + identity_pelvis_pos_loss
+            + rl_loss.total
+            + envelope_loss
+        )
         if step + 1 >= max_k:
             break
 
         continuing = effective_k > (step + 1)
-        next_vec, next_pelvis, next_payload = predicted_state_from_vector(pred_vec, store)
+        next_vec, next_pelvis, next_payload = advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         reset = training_reset_rows(store, clip_ids, cur_idx, continuing)
         advance = continuing & (~reset)
         reset_starts = (
@@ -1130,7 +1393,18 @@ def pure_ae_rollout_loss_static(
         cur_pelvis = torch.where(reset_mask, reset_cur_pelvis, torch.where(advance_mask, next_pelvis, cur_pelvis))
         cur_payload = torch.where(reset_mask, reset_cur_payload, torch.where(advance_mask, next_payload, cur_payload))
         cur_idx = torch.where(reset, reset_starts, torch.where(continuing, cur_idx + 1, cur_idx))
-    return ControllerLossResult(total=total_loss, terms={"ae_score": ae_total, **rl_terms, **envelope_terms})
+    return ControllerLossResult(
+        total=total_loss,
+        terms={
+            "ae_score": ae_total,
+            IDENTITY_TERM_NAME: identity_total,
+            IDENTITY_MAXABS_TERM_NAME: identity_maxabs_total,
+            IDENTITY_WORLD_POS_TERM_NAME: identity_world_pos_total,
+            IDENTITY_PELVIS_POS_TERM_NAME: identity_pelvis_pos_total,
+            **rl_terms,
+            **envelope_terms,
+        },
+    )
 
 
 class CudaGraphPureAEStep:
@@ -1152,6 +1426,10 @@ class CudaGraphPureAEStep:
         envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None,
         linear_slide_weight: float,
         angular_slide_weight: float,
+        identity_loss_weight: float,
+        identity_maxabs_weight: float,
+        identity_world_pos_weight: float,
+        identity_pelvis_pos_weight: float,
     ):
         if store.device.type != "cuda":
             raise RuntimeError("CudaGraphPureAEStep requires CUDA")
@@ -1169,6 +1447,10 @@ class CudaGraphPureAEStep:
         self.envelope = envelope
         self.linear_slide_weight = float(linear_slide_weight)
         self.angular_slide_weight = float(angular_slide_weight)
+        self.identity_loss_weight = float(identity_loss_weight)
+        self.identity_maxabs_weight = float(identity_maxabs_weight)
+        self.identity_world_pos_weight = float(identity_world_pos_weight)
+        self.identity_pelvis_pos_weight = float(identity_pelvis_pos_weight)
         self.effective_k = torch.empty((self.batch_size,), dtype=torch.long, device=store.device)
         self.clip_ids = torch.empty_like(self.effective_k)
         self.starts = torch.empty_like(self.effective_k)
@@ -1176,7 +1458,15 @@ class CudaGraphPureAEStep:
             (max(1, int(self.rollout_k)), self.batch_size), dtype=torch.long, device=store.device
         )
         self.loss = torch.zeros((), dtype=torch.float32, device=store.device)
-        self.term_names = ("ae_score", *RL_TERM_NAMES, *ENVELOPE_TERM_NAMES)
+        self.term_names = (
+            "ae_score",
+            IDENTITY_TERM_NAME,
+            IDENTITY_MAXABS_TERM_NAME,
+            IDENTITY_WORLD_POS_TERM_NAME,
+            IDENTITY_PELVIS_POS_TERM_NAME,
+            *RL_TERM_NAMES,
+            *ENVELOPE_TERM_NAMES,
+        )
         self.term_tensors = {name: torch.zeros_like(self.loss) for name in self.term_names}
         self.graph = torch.cuda.CUDAGraph()
         self._capture()
@@ -1209,6 +1499,10 @@ class CudaGraphPureAEStep:
             self.envelope,
             self.linear_slide_weight,
             self.angular_slide_weight,
+            self.identity_loss_weight,
+            self.identity_maxabs_weight,
+            self.identity_world_pos_weight,
+            self.identity_pelvis_pos_weight,
         )
 
     def _capture(self) -> None:
@@ -1265,6 +1559,10 @@ class EagerPureAEStep:
         envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None,
         linear_slide_weight: float,
         angular_slide_weight: float,
+        identity_loss_weight: float,
+        identity_maxabs_weight: float,
+        identity_world_pos_weight: float,
+        identity_pelvis_pos_weight: float,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -1280,6 +1578,10 @@ class EagerPureAEStep:
         self.envelope = envelope
         self.linear_slide_weight = float(linear_slide_weight)
         self.angular_slide_weight = float(angular_slide_weight)
+        self.identity_loss_weight = float(identity_loss_weight)
+        self.identity_maxabs_weight = float(identity_maxabs_weight)
+        self.identity_world_pos_weight = float(identity_world_pos_weight)
+        self.identity_pelvis_pos_weight = float(identity_pelvis_pos_weight)
 
     def step(self) -> ControllerLossResult:
         loss_result = pure_ae_rollout_loss(
@@ -1296,6 +1598,10 @@ class EagerPureAEStep:
             self.envelope,
             self.linear_slide_weight,
             self.angular_slide_weight,
+            self.identity_loss_weight,
+            self.identity_maxabs_weight,
+            self.identity_world_pos_weight,
+            self.identity_pelvis_pos_weight,
         )
         self.optimizer.zero_grad(set_to_none=True)
         loss_result.total.backward()
@@ -1319,8 +1625,14 @@ def make_pure_ae_stepper(
     envelope: dict[str, torch.Tensor | dict[str, float | int | str]] | None = None,
     linear_slide_weight: float = 0.0,
     angular_slide_weight: float = 0.0,
+    identity_loss_weight: float = 0.0,
+    identity_maxabs_weight: float = 0.0,
+    identity_world_pos_weight: float = 0.0,
+    identity_pelvis_pos_weight: float = 0.0,
 ) -> CudaGraphPureAEStep | EagerPureAEStep:
-    if store.device.type == "cuda":
+    # The FK-based identity terms currently allocate small constants inside FK;
+    # CUDA graph capture forbids that, so keep this diagnostic loss on eager.
+    if store.device.type == "cuda" and float(identity_world_pos_weight) == 0.0:
         return CudaGraphPureAEStep(
             model,
             optimizer,
@@ -1336,6 +1648,10 @@ def make_pure_ae_stepper(
             envelope,
             linear_slide_weight,
             angular_slide_weight,
+            identity_loss_weight,
+            identity_maxabs_weight,
+            identity_world_pos_weight,
+            identity_pelvis_pos_weight,
         )
     return EagerPureAEStep(
         model,
@@ -1352,6 +1668,10 @@ def make_pure_ae_stepper(
         envelope,
         linear_slide_weight,
         angular_slide_weight,
+        identity_loss_weight,
+        identity_maxabs_weight,
+        identity_world_pos_weight,
+        identity_pelvis_pos_weight,
     )
 
 
@@ -1383,7 +1703,8 @@ def validation_ae_score(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
-        score = ae_score_rows(ae, mean, std, inp, raw)
+        pred_vec = clean_output_vector(raw, store)
+        score = ae_score_rows(ae, mean, std, inp, pred_vec)
         total += float(score.sum().detach().cpu())
         count += int(score.numel())
         if step + 1 >= int(rollout_k):
@@ -1391,7 +1712,7 @@ def validation_ae_score(
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = predicted_state_from_raw(raw, store)
+        cur_vec, cur_pelvis, cur_payload = advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = cur_idx + 1
     return total / float(max(1, count))
 
@@ -1441,11 +1762,15 @@ def rollout_joint_error(
             store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload
         )
         raw = model_forward(model, inp, cur_vec, store.cfg)
-        pred_pose, _raw_pose = tl.output_to_pose(raw, store.prototype)
+        pred_vec = clean_output_vector(raw, store)
+        pred_pose, _raw_pose = tl.output_to_pose(pred_vec, store.prototype)
         target_idx = cur_idx + 1
-        root_pos, root_rot, _yaw, _heading = store.root_state(clip_ids, target_idx)
-        pred_global = fk_positions_by_clip(store, clip_ids, root_pos, root_rot, pred_pose)
-        target_global = fk_positions_by_clip(store, clip_ids, root_pos, root_rot, store.get_pose(clip_ids, target_idx))
+        target_root_pos, target_root_rot, _target_yaw, _target_heading = store.root_state(clip_ids, target_idx)
+        pred_root_pos, pred_root_rot = transition_output_root_state(store, clip_ids, cur_idx)
+        pred_global = fk_positions_by_clip(store, clip_ids, pred_root_pos, pred_root_rot, pred_pose)
+        target_global = fk_positions_by_clip(
+            store, clip_ids, target_root_pos, target_root_rot, store.get_pose(clip_ids, target_idx)
+        )
         per_frame = (pred_global - target_global).norm(dim=-1).mean(dim=-1)
         total_error += float(per_frame.sum().detach().cpu())
         total_frames += int(per_frame.numel())
@@ -1455,7 +1780,7 @@ def rollout_joint_error(
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = predicted_state_from_raw(raw, store)
+        cur_vec, cur_pelvis, cur_payload = advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         cur_idx = target_idx
     return total_error / float(max(1, total_frames)), max_error
 
@@ -1478,6 +1803,26 @@ def save_controller_checkpoint(
     return path
 
 
+def load_controller_init_checkpoint(model: torch.nn.Module, path: Path) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt_runtime.require_current_ik_controller_checkpoint(ckpt, path)
+    policy = ckpt_runtime.checkpoint_policy(ckpt)
+    checkpoint_root = str(policy.get("output_reference_root", "")).strip().lower()
+    if checkpoint_root != tl.OUTPUT_REFERENCE_ROOT:
+        raise ValueError(
+            f"Controller init checkpoint uses output_reference_root={checkpoint_root!r}; "
+            f"expected {tl.OUTPUT_REFERENCE_ROOT!r}: {path}"
+        )
+    checkpoint_prediction = str(policy.get("output_prediction_mode", tl.OUTPUT_PREDICTION_MODE_ABSOLUTE)).strip().lower()
+    if checkpoint_prediction != tl.normalized_output_prediction_mode():
+        raise ValueError(
+            f"Controller init checkpoint uses output_prediction_mode={checkpoint_prediction!r}; "
+            f"expected {tl.normalized_output_prediction_mode()!r}: {path}"
+        )
+    model.load_state_dict(ckpt["model"], strict=True)
+    return ckpt
+
+
 def main() -> None:
     global LOG_EVERY, MIXED_ROLLOUT_AT_MAX, ROLLOUT_K, ROLLOUT_SCHEDULE, ROLLOUT_STAGE_STEPS, STAGE_LEARNING_RATES
 
@@ -1486,6 +1831,7 @@ def main() -> None:
     parser.add_argument("--periodic-folder", default=None)
     parser.add_argument("--nonperiodic-folder", default=None)
     parser.add_argument("--ae-checkpoint", default=None)
+    parser.add_argument("--init-checkpoint", default=None)
     parser.add_argument("--run-label", default="walkF_simple_ae_controller")
     parser.add_argument("--ae-loss-weight", type=float, default=1.0)
     parser.add_argument("--rollout-schedule", type=int, nargs="+", default=None)
@@ -1495,6 +1841,10 @@ def main() -> None:
     parser.add_argument("--no-mixed-rollout-at-max", dest="mixed_rollout_at_max", action="store_false")
     parser.add_argument("--stage-learning-rate", type=float, default=None)
     parser.add_argument("--log-every", type=int, default=None)
+    parser.add_argument("--identity-output-loss-weight", type=float, default=0.0)
+    parser.add_argument("--identity-output-maxabs-loss-weight", type=float, default=0.0)
+    parser.add_argument("--identity-world-pos-loss-weight", type=float, default=0.0)
+    parser.add_argument("--identity-pelvis-pos-loss-weight", type=float, default=0.0)
     parser.add_argument("--linear-slide-loss-weight", type=float, default=0.0)
     parser.add_argument("--angular-slide-loss-weight", type=float, default=0.0)
     parser.add_argument("--envelope-margin", type=float, default=env.ExcessEnvelopeConfig().margin)
@@ -1553,6 +1903,8 @@ def main() -> None:
         MIXED_ROLLOUT_AT_MAX = bool(args.mixed_rollout_at_max)
     if args.stage_learning_rate is not None:
         STAGE_LEARNING_RATES = {int(k): float(args.stage_learning_rate) for k in ROLLOUT_SCHEDULE}
+    elif args.rollout_schedule is not None:
+        STAGE_LEARNING_RATES = default_stage_learning_rates_for_schedule(ROLLOUT_SCHEDULE)
     if args.log_every is not None:
         LOG_EVERY = max(1, int(args.log_every))
 
@@ -1563,6 +1915,10 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     ae_loss_weight = float(args.ae_loss_weight)
+    identity_loss_weight = float(args.identity_output_loss_weight)
+    identity_maxabs_weight = float(args.identity_output_maxabs_loss_weight)
+    identity_world_pos_weight = float(args.identity_world_pos_loss_weight)
+    identity_pelvis_pos_weight = float(args.identity_pelvis_pos_loss_weight)
     ae_path: Path | None = None
     ae_ckpt: dict = {}
     if ae_loss_weight != 0.0:
@@ -1596,6 +1952,12 @@ def main() -> None:
         core_angular_velocity_limit_deg_s=float(args.core_angular_velocity_limit_deg_s),
         fps=float(cfg.fps),
     )
+    identity_enabled = (
+        identity_loss_weight != 0.0
+        or identity_maxabs_weight != 0.0
+        or identity_world_pos_weight != 0.0
+        or identity_pelvis_pos_weight != 0.0
+    )
     specs = resolve_clip_specs(args.npz, args.periodic_folder, args.nonperiodic_folder)
     clips = load_clips(specs, cfg)
     input_dim, output_dim = tl.make_batch_dims(clips[0], cfg)
@@ -1616,7 +1978,17 @@ def main() -> None:
         sanity = env.groundtruth_sanity(store, envelope)
         if max(float(value) for value in sanity.values()) > 1e-6:
             raise RuntimeError(f"GT exceeds foot-slide envelope unexpectedly: {sanity}")
+    init_checkpoint_path = resolve_path(args.init_checkpoint) if args.init_checkpoint else None
     model = tl.MLPController(input_dim, output_dim, cfg).to(device)
+    output_initialization = "default"
+    init_ckpt: dict | None = None
+    if init_checkpoint_path is not None:
+        init_ckpt = load_controller_init_checkpoint(model, init_checkpoint_path)
+        output_initialization = f"loaded_controller_checkpoint:{init_checkpoint_path}"
+    elif ae is not None and ae_loss_weight != 0.0 and not tl.output_prediction_uses_residual():
+        output_initialization = initialize_controller_output_from_ae_mean(model, mean, input_dim, output_dim)
+    elif tl.output_prediction_uses_residual():
+        output_initialization = "residual_zero_weight_zero_bias"
     optimizer = make_adamw(model.parameters(), LEARNING_RATE, device, capturable=bool(device.type == "cuda"))
 
     stage_cache: dict[int, dict[str, object]] = {}
@@ -1643,10 +2015,27 @@ def main() -> None:
         "npz_paths": [str(path) for path, _cyclic in specs],
         "npz_folders": [{"path": str(path.parent), "cyclic": bool(cyclic)} for path, cyclic in specs],
         "simple_ae_checkpoint": str(ae_path) if ae_path is not None else None,
+        "init_checkpoint": str(init_checkpoint_path) if init_checkpoint_path is not None else None,
         "tensorboard_logdir": str(run_dir / "tb"),
         "policy": {
-            "loss": "rl_only" if (ae_loss_weight == 0.0 and rl_cfg.enabled) else "simple_ae_output_reconstruction",
+            "loss": (
+                "identity_statue"
+                if ae_loss_weight == 0.0 and identity_enabled and not rl_cfg.enabled
+                else (
+                    "rl_only"
+                    if (ae_loss_weight == 0.0 and rl_cfg.enabled)
+                    else (
+                        "simple_ae_output_reconstruction_with_optional_envelope"
+                        if envelope is not None
+                        else "simple_ae_output_reconstruction"
+                    )
+                )
+            ),
             "ae_loss_weight": float(ae_loss_weight),
+            "identity_output_loss_weight": float(identity_loss_weight),
+            "identity_output_maxabs_loss_weight": float(identity_maxabs_weight),
+            "identity_world_pos_loss_weight": float(identity_world_pos_weight),
+            "identity_pelvis_pos_loss_weight": float(identity_pelvis_pos_weight),
             "ae_score_output_only": bool(AE_SCORE_OUTPUT_ONLY),
             "ae_scores_raw_output": True,
             "rl_loss_enabled": bool(rl_cfg.enabled),
@@ -1663,10 +2052,20 @@ def main() -> None:
             "zero_loss_stop_threshold": float(ZERO_LOSS_STOP_THRESHOLD),
             "predict_residual": bool(cfg.predict_residual),
             "zero_init_output": bool(cfg.zero_init_output),
+            "output_initialization": output_initialization,
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
+            "state_reference_root": tl.STATE_REFERENCE_ROOT,
+            "ik_schema_version": tl.IK_SCHEMA_VERSION,
+            "ik_pole_reference": tl.IK_POLE_REFERENCE,
+            "ik_leg_pole_alpha_deg": math.degrees(tl.IK_LEG_POLE_ALPHA),
+            "ik_arm_pole_alpha_deg": math.degrees(tl.IK_ARM_POLE_ALPHA),
             "mixed_rollout_at_max": bool(MIXED_ROLLOUT_AT_MAX),
             "pose_representation": tl.IK_POSE_REPRESENTATION,
             "test_set": False,
             "checkpoint_selection": "latest_stage_last",
+            "init_checkpoint_epoch": int(init_ckpt.get("epoch", 0)) if init_ckpt is not None else 0,
+            "init_checkpoint_rollout_k": int(init_ckpt.get("rollout_k", 0)) if init_ckpt is not None else 0,
         },
         "rollout_schedule": [int(k) for k in ROLLOUT_SCHEDULE],
         "rollout_stage_steps": [int(n) for n in ROLLOUT_STAGE_STEPS],
@@ -1706,7 +2105,10 @@ def main() -> None:
         last_stage_k = int(stage_k)
         stage_steps = int(ROLLOUT_STAGE_STEPS[stage_idx])
         lr = stage_learning_rate(int(stage_k))
-        set_optimizer_lr(optimizer, lr)
+        if stage_idx > 0 and bool(cfg.lr_reset_on_rollout_advance):
+            optimizer = make_adamw(model.parameters(), lr, device, capturable=bool(device.type == "cuda"))
+        else:
+            set_optimizer_lr(optimizer, lr)
         cache = stage_cache[int(stage_k)]
         model.train()
         stepper = make_pure_ae_stepper(
@@ -1724,6 +2126,10 @@ def main() -> None:
             envelope,
             linear_slide_weight,
             angular_slide_weight,
+            identity_loss_weight,
+            identity_maxabs_weight,
+            identity_world_pos_weight,
+            identity_pelvis_pos_weight,
         )
         print(
             f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} K={stage_k} "
@@ -1758,6 +2164,24 @@ def main() -> None:
                     else "gt_diag=off"
                 )
                 ae_text = "disabled" if ae_loss_weight == 0.0 else f"{loss_terms.get('ae_score', NAN_METRIC):.6g}"
+                identity_text = ""
+                if identity_enabled:
+                    identity_parts = []
+                    if identity_loss_weight != 0.0:
+                        identity_parts.append(f"identity_output={loss_terms.get(IDENTITY_TERM_NAME, NAN_METRIC):.6g}")
+                    if identity_maxabs_weight != 0.0:
+                        identity_parts.append(
+                            f"identity_output_maxabs={loss_terms.get(IDENTITY_MAXABS_TERM_NAME, NAN_METRIC):.6g}"
+                        )
+                    if identity_world_pos_weight != 0.0:
+                        identity_parts.append(
+                            f"identity_world_pos={loss_terms.get(IDENTITY_WORLD_POS_TERM_NAME, NAN_METRIC):.6g}"
+                        )
+                    if identity_pelvis_pos_weight != 0.0:
+                        identity_parts.append(
+                            f"identity_pelvis_pos={loss_terms.get(IDENTITY_PELVIS_POS_TERM_NAME, NAN_METRIC):.6g}"
+                        )
+                    identity_text = " " + " ".join(identity_parts)
                 rl_text = " ".join(f"{name}={loss_terms.get(name, NAN_METRIC):.6g}" for name in rl_cfg.enabled_terms())
                 slide_text = ""
                 if envelope is not None:
@@ -1767,7 +2191,7 @@ def main() -> None:
                     )
                 print(
                     f"step={step:05d} K={stage_k} train_loss={last_loss:.6g} "
-                    f"ae={ae_text} "
+                    f"ae={ae_text}{identity_text} "
                     f"{rl_text} "
                     f"{slide_text}"
                     f"{gt_text} effK_mean={stats['effective_k_mean']:.2f} lr={lr:.3g} elapsed_s={elapsed:.1f}",
@@ -1776,6 +2200,20 @@ def main() -> None:
                 writer.add_scalar("loss/train_total", last_loss, step)
                 if ae_loss_weight != 0.0:
                     writer.add_scalar("loss/ae_score", loss_terms.get("ae_score", NAN_METRIC), step)
+                if identity_loss_weight != 0.0:
+                    writer.add_scalar("loss/identity_output", loss_terms.get(IDENTITY_TERM_NAME, NAN_METRIC), step)
+                if identity_maxabs_weight != 0.0:
+                    writer.add_scalar(
+                        "loss/identity_output_maxabs", loss_terms.get(IDENTITY_MAXABS_TERM_NAME, NAN_METRIC), step
+                    )
+                if identity_world_pos_weight != 0.0:
+                    writer.add_scalar(
+                        "loss/identity_world_pos", loss_terms.get(IDENTITY_WORLD_POS_TERM_NAME, NAN_METRIC), step
+                    )
+                if identity_pelvis_pos_weight != 0.0:
+                    writer.add_scalar(
+                        "loss/identity_pelvis_pos", loss_terms.get(IDENTITY_PELVIS_POS_TERM_NAME, NAN_METRIC), step
+                    )
                 for name in rl_cfg.enabled_terms():
                     writer.add_scalar(f"loss/{name}", loss_terms.get(name, NAN_METRIC), step)
                 if envelope is not None:

@@ -328,12 +328,12 @@ def rollout_loss(
             else:
                 cur_root_pos = carried_cur_root_pos
                 cur_root_rot = carried_cur_root_rot
-            next_root_pos, next_root_rot, _next_yaw, _next_heading = store.root_state(clip_ids, cur_idx + 1)
             if carried_cur_foot_pos is None or carried_cur_foot_rot is None:
                 cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
             else:
                 cur_foot_pos = carried_cur_foot_pos
                 cur_foot_rot = carried_cur_foot_rot
+            next_root_pos, next_root_rot = ctl.transition_output_root_state(store, clip_ids, cur_idx)
             next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
             linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
                 store,
@@ -365,7 +365,12 @@ def rollout_loss(
             selected_cur_idx,
             torch.ones_like(selected_cur_idx, dtype=torch.bool),
         )
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec.index_select(0, rows), store)
+        next_vec, next_pelvis, next_payload = ctl.advance_transition_state(
+            store,
+            selected_clip_ids,
+            selected_cur_idx,
+            pred_vec.index_select(0, rows),
+        )
         reset_starts = ctl.sample_same_clip_training_starts(store, selected_clip_ids)
         reset_prev_vec, reset_prev_pelvis, reset_prev_payload = ctl.target_state(store, selected_clip_ids, reset_starts - 1)
         reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.target_state(store, selected_clip_ids, reset_starts)
@@ -419,7 +424,7 @@ def supervised_k1_loss(
     )
     raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
     pred_vec = ctl.clean_output_vector(raw, store)
-    target = store.get_target_output(clip_ids, cur_idx + 1)
+    target = ctl.transition_target_output(store, clip_ids, cur_idx)
     supervised = (pred_vec - target).square().mean(dim=-1).mean() * float(SUPERVISED_K1_LOSS_WEIGHT)
     return scaled_loss(supervised), {"supervised": supervised}
 
@@ -535,7 +540,9 @@ def rollout_loss_static(
         ae_rows = ctl.ae_score_rows(ae, mean, std, inp, pred_vec)
         ae_rows = ae_rows * float(AE_LOSS_WEIGHT)
         next_root_pos, next_root_rot = root_state_fixed_cycles(store, clip_ids, cur_idx + 1, root_cycle_count)
-        next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred_vec)
+        output_root_pos = cur_root_pos if tl.output_reference_uses_current_root() else next_root_pos
+        output_root_rot = cur_root_rot if tl.output_reference_uses_current_root() else next_root_rot
+        next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, output_root_pos, output_root_rot, pred_vec)
         linear_rows, angular_rows = env.envelope_excess_ik_state_rows(
             store,
             envelope,
@@ -561,7 +568,11 @@ def rollout_loss_static(
             break
 
         continuing = effective_k > (step + 1)
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        if tl.output_reference_uses_current_root():
+            next_vec = ctl.rebase_output_vector_root(store, pred_vec, cur_root_pos, cur_root_rot, next_root_pos, next_root_rot)
+        else:
+            next_vec = ctl.clean_output_vector(pred_vec, store)
+        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(next_vec, store)
         reset = ctl.training_reset_rows(store, clip_ids, cur_idx, continuing)
         advance = continuing & (~reset)
         reset_starts = (
@@ -1000,6 +1011,9 @@ def train_controller_adaptive(
                 "pole_toe_sigma_at_1": float(ctl.POSE_NOISE_SCALAR_SIGMA_AT_1),
             },
             "pose_representation": tl.IK_POSE_REPRESENTATION,
+            "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+            "output_prediction_mode": tl.normalized_output_prediction_mode(),
+            "state_reference_root": tl.STATE_REFERENCE_ROOT,
             "adaptive_stall_curriculum": True,
             "final_stage_runs_until_manual_stop": bool(FINAL_STAGE_RUNS_UNTIL_MANUAL_STOP),
             "disable_cuda_graph": bool(disable_cuda_graph),

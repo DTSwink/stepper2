@@ -205,16 +205,20 @@ def bake_npz(input_npz: Path, output_npz: Path, report_json: Path | None = None)
     payload["model_lcl_translation_m"] = model_local_pos.astype(np.float32)
     payload["model_default_lcl_translation_m"] = model_local_pos[0].astype(np.float32)
     payload["model_ik_payload"] = pose["ik_payload"].detach().cpu().numpy().astype(np.float32)
+    payload["model_ik_schema_version"] = np.array(tl.IK_SCHEMA_VERSION, dtype=np.int32)
+    payload["model_ik_pole_reference"] = np.array(tl.IK_POLE_REFERENCE)
     payload["model_ik_rest_axis"] = clip.ik_rest_axis.detach().cpu().numpy().astype(np.float32)
     payload["model_ik_rest_pole"] = clip.ik_rest_pole.detach().cpu().numpy().astype(np.float32)
+    payload["model_ik_ee_pole_ref"] = clip.ik_ee_pole_ref.detach().cpu().numpy().astype(np.float32)
+    payload["model_ik_pole_alpha"] = clip.ik_pole_alpha.detach().cpu().numpy().astype(np.float32)
     payload["model_ik_limb_lengths"] = clip.ik_limb_lengths.detach().cpu().numpy().astype(np.float32)
     payload["model_ik_local_pole_axis"] = clip.ik_local_pole_axis.detach().cpu().numpy().astype(np.float32)
     payload["model_ik_toe_offsets"] = clip.ik_toe_offsets.detach().cpu().numpy().astype(np.float32)
     payload["model_ik_toe_axis"] = clip.ik_toe_axis.detach().cpu().numpy().astype(np.float32)
     payload["ik_reconstructable"] = np.array(True, dtype=np.bool_)
-    payload["ik_reconstruction_version"] = np.array(1, dtype=np.int32)
+    payload["ik_reconstruction_version"] = np.array(2, dtype=np.int32)
     payload["ik_reconstruction_contract"] = np.array(
-        "Payload42 fixed point: model-space arrays and model_ik_payload decode to final NPZ transforms"
+        "Payload42 fixed point: EE-frame pole reference, per-limb theta clamp, and model_ik_payload decode to final NPZ transforms"
     )
     for key in STALE_OR_OBSOLETE_KEYS:
         payload.pop(key, None)

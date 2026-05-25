@@ -233,6 +233,9 @@ def temporal_schema(store: ctl.SimpleClipStore, cfg: TemporalAEConfig) -> dict[s
         "input_dim": int(cfg.frames) * int(root_dim) + int(input_body_frames) * int(body_dim),
         "target_dim": int(target_body_frames) * int(body_dim),
         "pose_representation": tl.IK_POSE_REPRESENTATION,
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
+        "state_reference_root": tl.STATE_REFERENCE_ROOT,
         "body_names": list(store.prototype.body_names),
     }
 
@@ -262,7 +265,7 @@ def build_temporal_rows(
         flat_clip = clip_ids[:, None].expand_as(row_idx).reshape(-1)
         flat_idx = row_idx.reshape(-1)
         roots = store.get_input_root_features(flat_clip, flat_idx).reshape(starts.numel(), -1)
-        bodies8 = store.get_target_output(flat_clip, flat_idx + 1).reshape(starts.numel(), frames, -1)
+        bodies8 = ctl.transition_target_output(store, flat_clip, flat_idx).reshape(starts.numel(), frames, -1)
         if cfg.variant == "root8_body8":
             input_body = bodies8.reshape(starts.numel(), -1)
             target_body = input_body
@@ -472,7 +475,7 @@ def initial_body_context(store: ctl.SimpleClipStore, clip_ids: torch.Tensor, cur
     idx = cur_idx[:, None] - (int(frames) - 1) + offsets[None, :]
     flat_clip = clip_ids[:, None].expand_as(idx).reshape(-1)
     flat_idx = idx.reshape(-1)
-    return store.get_target_output(flat_clip, flat_idx + 1).reshape(cur_idx.numel(), int(frames) - 1, -1)
+    return ctl.transition_target_output(store, flat_clip, flat_idx).reshape(cur_idx.numel(), int(frames) - 1, -1)
 
 
 def temporal_score_rows(
@@ -527,7 +530,7 @@ def build_amp_real_rows(
         flat_idx = row_idx.reshape(-1)
         roots = store.get_input_root_features(flat_clip, flat_idx).reshape(starts.numel(), -1)
         current_body = store.get_target_output(clip_ids, starts)
-        future_body = store.get_target_output(flat_clip, flat_idx + 1).reshape(starts.numel(), -1)
+        future_body = ctl.transition_target_output(store, flat_clip, flat_idx).reshape(starts.numel(), -1)
         feature = amp_feature(roots, current_body, future_body)
         root_chunks.append(roots.detach())
         current_chunks.append(current_body.detach())
@@ -547,6 +550,9 @@ def build_amp_real_rows(
         "input_dim": int(frames * root_dim + (frames + 1) * body_dim),
         "feature_layout": "roots[8] + current_body[1] + future_body[8]",
         "pose_representation": tl.IK_POSE_REPRESENTATION,
+        "output_reference_root": tl.OUTPUT_REFERENCE_ROOT,
+        "output_prediction_mode": tl.normalized_output_prediction_mode(),
+        "state_reference_root": tl.STATE_REFERENCE_ROOT,
         "body_names": list(store.prototype.body_names),
     }
     return (
@@ -648,7 +654,7 @@ def collect_amp_fake_features(
         reset_starts = reset_starts_by_step[step]
         reset_prev_vec, reset_prev_pelvis, reset_prev_payload = ctl.target_state(store, clip_ids, reset_starts - 1)
         reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.target_state(store, clip_ids, reset_starts)
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        next_vec, next_pelvis, next_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         reset_mask = reset[:, None]
         advance_mask = advance[:, None]
         prev_vec = torch.where(reset_mask, reset_prev_vec, torch.where(advance_mask, cur_vec, prev_vec))
@@ -730,7 +736,7 @@ def supervised_k1_transition_loss(
     inp = ctl.build_controller_input(store, clip_ids, cur_idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload)
     raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
     pred_vec = ctl.clean_output_vector(raw, store)
-    target = store.get_target_output(clip_ids, cur_idx + 1)
+    target = ctl.transition_target_output(store, clip_ids, cur_idx)
     return F.mse_loss(pred_vec, target)
 
 
@@ -836,7 +842,7 @@ def temporal_rollout_loss(
         reset_starts = reset_starts_by_step[step]
         reset_prev_vec, reset_prev_pelvis, reset_prev_payload = ctl.target_state(store, clip_ids, reset_starts - 1)
         reset_cur_vec, reset_cur_pelvis, reset_cur_payload = ctl.target_state(store, clip_ids, reset_starts)
-        next_vec, next_pelvis, next_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        next_vec, next_pelvis, next_payload = ctl.advance_transition_state(store, clip_ids, cur_idx, pred_vec)
         reset_mask = reset[:, None]
         advance_mask = advance[:, None]
         prev_vec = torch.where(reset_mask, reset_prev_vec, torch.where(advance_mask, cur_vec, prev_vec))
@@ -935,9 +941,9 @@ def diamond_envelope_metric(
         raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
         pred = ctl.clean_output_vector(raw, store)
         cur_root_pos, cur_root_rot, _a, _b = store.root_state(cids, i)
-        next_root_pos, next_root_rot, _c, _d = store.root_state(cids, i + 1)
+        output_root_pos, output_root_rot = ctl.transition_output_root_state(store, cids, i)
         cur_foot_pos, cur_foot_rot = env.ik_foot_toe_state_from_vec(store, cur_root_pos, cur_root_rot, cur_vec)
-        next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, next_root_pos, next_root_rot, pred)
+        next_foot_pos, next_foot_rot = env.ik_foot_toe_state_from_vec(store, output_root_pos, output_root_rot, pred)
         linear, angular, bound_l, bound_a = env.envelope_values_ik_state_rows(
             store, envelope, cur_foot_pos, cur_foot_rot, next_foot_pos, next_foot_rot, cids, i
         )
@@ -946,8 +952,8 @@ def diamond_envelope_metric(
         lin_raw.append(linear)
         lin_bound.append(bound_l)
         prev_vec, prev_pelvis, prev_payload = cur_vec, cur_pelvis, cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred, store)
-        pred_vecs.append(pred.squeeze(0))
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, cids, i, pred)
+        pred_vecs.append(cur_vec.squeeze(0))
     lin = torch.cat(lin_excess)
     ang = torch.cat(ang_excess)
     raw = torch.cat(lin_raw)
@@ -992,9 +998,9 @@ def rollout_clip_vectors(
         inp = ctl.build_controller_input(store, cids, idx, prev_vec, cur_vec, prev_pelvis, cur_pelvis, prev_payload, cur_payload)
         raw = ctl.model_forward(model, inp, cur_vec, store.cfg)
         pred = ctl.clean_output_vector(raw, store)
-        pred_vecs.append(pred.squeeze(0))
         prev_vec, prev_pelvis, prev_payload = cur_vec, cur_pelvis, cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred, store)
+        cur_vec, cur_pelvis, cur_payload = ctl.advance_transition_state(store, cids, idx, pred)
+        pred_vecs.append(cur_vec.squeeze(0))
     frame_idx = torch.arange(1, max_cur + 2, dtype=torch.long, device=store.device)
     return clip_id, torch.stack(pred_vecs, dim=0), frame_idx
 

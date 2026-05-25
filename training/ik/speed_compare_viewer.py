@@ -100,7 +100,8 @@ def rollout_vectors(
             one_cur_payload,
         )
         one_raw = ctl.model_forward(model, one_inp, one_cur_vec, cfg)
-        one_vec[target] = ctl.clean_output_vector(one_raw, store)[0]
+        one_transition = ctl.clean_output_vector(one_raw, store)
+        one_vec[target] = ctl.advance_transition_output(store, one_clip, one_cur_idx, one_transition)[0]
 
         inp = ctl.build_controller_input(
             store,
@@ -115,11 +116,12 @@ def rollout_vectors(
         )
         raw = ctl.model_forward(model, inp, cur_vec, cfg)
         pred_vec = ctl.clean_output_vector(raw, store)
-        ar_vec[target] = pred_vec[0]
+        state_vec = ctl.advance_transition_output(store, one_clip, cur_idx, pred_vec)
+        ar_vec[target] = state_vec[0]
         prev_vec = cur_vec
         prev_pelvis = cur_pelvis
         prev_payload = cur_payload
-        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(pred_vec, store)
+        cur_vec, cur_pelvis, cur_payload = ctl.predicted_state_from_vector(state_vec, store)
         cur_idx = target_idx
     return clip, store, gt_vec, one_vec, ar_vec
 

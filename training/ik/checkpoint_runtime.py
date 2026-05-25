@@ -9,6 +9,9 @@ CURRENT_IK_CONTROLLER_LOSSES = frozenset(
         "simple_ae_output_reconstruction",
         "simple_ae_output_reconstruction_with_optional_envelope",
         "rl_only",
+        "identity_statue",
+        "identity_output",
+        "supervised_rollout",
     }
 )
 
@@ -17,12 +20,36 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "none"}
+    return bool(value)
+
+
 def checkpoint_metadata(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return _as_dict(checkpoint.get("metadata"))
 
 
 def checkpoint_policy(checkpoint: dict[str, Any]) -> dict[str, Any]:
     return _as_dict(checkpoint_metadata(checkpoint).get("policy"))
+
+
+def checkpoint_output_prediction_mode(checkpoint: dict[str, Any]) -> str:
+    policy = checkpoint_policy(checkpoint)
+    config = _as_dict(checkpoint.get("config"))
+    raw = policy.get("output_prediction_mode", config.get("output_prediction_mode"))
+    if raw is None:
+        raw = "residual" if (_truthy_flag(policy.get("predict_residual")) or _truthy_flag(config.get("predict_residual"))) else "absolute"
+    mode = str(raw).lower().strip()
+    aliases = {
+        "absolute": "absolute",
+        "abs": "absolute",
+        "direct": "absolute",
+        "residual": "residual",
+        "res": "residual",
+        "delta": "residual",
+    }
+    return aliases.get(mode, mode)
 
 
 def checkpoint_is_autoencoder(checkpoint: dict[str, Any]) -> bool:
@@ -45,6 +72,12 @@ def is_current_ik_controller_checkpoint(checkpoint: Any) -> bool:
         return False
     metadata = checkpoint_metadata(checkpoint)
     policy = checkpoint_policy(checkpoint)
+    if checkpoint_output_prediction_mode(checkpoint) not in {"absolute", "residual"}:
+        return False
+    if str(policy.get("output_reference_root", "")).lower().strip() not in {"current", "future"}:
+        return False
+    if policy.get("ik_schema_version") != 2 or policy.get("ik_pole_reference") != "ee_frame":
+        return False
     if metadata.get("simple_ae_checkpoint"):
         return True
     if policy.get("loss") in CURRENT_IK_CONTROLLER_LOSSES:
@@ -53,6 +86,10 @@ def is_current_ik_controller_checkpoint(checkpoint: Any) -> bool:
         "ae_loss_weight",
         "ae_score_output_only",
         "ae_scores_raw_output",
+        "identity_output_loss_weight",
+        "identity_output_maxabs_loss_weight",
+        "identity_world_pos_loss_weight",
+        "identity_pelvis_pos_loss_weight",
         "rl_loss_enabled",
         "rl_loss",
         "rl_grad_clip_norm",
