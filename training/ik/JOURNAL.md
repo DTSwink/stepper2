@@ -250,6 +250,169 @@ mismatch the 25-bone training skeleton. Sources used:
 - turn45 L/R:
   `stepper/ue5/animation_transitions_only_full/npz_final_trimmed/M_Neutral_Stand_Turn_045_{L,R}.npz`
 
+## Pure-RL gait — long-horizon stability (v15+, ad-vitam walking)
+
+Problem after v14: the controller has a clean gait + no-hover at K=64
+(2 s rollout) but the HTML viewer shows clear drift past ~50 frames in
+the autoregressive evaluation. Training only ever sees `K` consecutive
+frames whose initial state is sampled from the *dataset*; it never sees
+its own drifted poses, so it never learns to recover from them.
+
+Techniques considered for ad-vitam stability:
+
+1.  **Increase K (brute force)**. K=128 / K=256 exposes more drift to the
+    optimiser but quadratically increases memory (gradients across K
+    steps). Will likely OOM on 8-16 GB GPUs at K=128 with current batch.
+    Marginal returns once K > ~1 gait cycle.
+2.  **DAgger-style persistent rollout state (chosen for v15)**. After
+    each training step's rollout, cache the *final* predicted state
+    (pose + pelvis + payload + clip_id + cur_idx + 1) per row. On the
+    next training step, with probability `--persistent-state-prob`
+    replace the freshly-sampled dataset start with the cached drifted
+    state for that row. The model then sees its own out-of-distribution
+    states and gradients flow through them. Equivalent to training on
+    arbitrarily long virtual rollouts, chopped into K-sized chunks. Cost
+    is identical to a normal training step (memory unchanged).
+3.  **Input noise injection**. Add Gaussian noise to the model input
+    each step to make it robust. Easy but coarse: it does not target
+    the actual error mode (compounding pose drift), just adds isotropic
+    noise. Kept as a fallback.
+4.  **Chained rollouts within a single step**. Run M back-to-back K-step
+    rollouts, only backprop-ing through the last one. Similar net effect
+    to DAgger persistent state but more expensive (M extra forward
+    passes per step) and more code change. Skipped.
+5.  **Periodic stability eval + early stop**. Run an N=1000 frame
+    autoregressive rollout every K steps, measure pose-velocity
+    standard deviation / pelvis Y drift, and only checkpoint when
+    stable. Useful for monitoring, not for training pressure. Will add
+    once DAgger is in.
+
+v15 plan (in order of expected impact):
+
+- (a) Implement DAgger persistent state in `pure_ae_rollout_loss` and
+  `PureAEStep`, only for cyclic clips (`walkF`) at first; non-cyclic
+  clips (turns) keep dataset-sampled starts so they don't run off the
+  end of the clip.
+- (b) Warm up at `--persistent-state-prob=0` for some steps so the
+  cache starts non-pathological, then ramp the probability to ~0.5.
+- (c) If stability still poor at long horizons, optionally add small
+  input noise (~0.5% of std) to harden the controller.
+
+Open questions for v15:
+
+- Does persistent state break gait emergence? (model sees only "mid
+  walk" states, never "start from rest"). Mitigation: keep some
+  fraction of starts from the dataset.
+- Does cur_idx + 1 always stay in the cyclic clip? Cyclic clips wrap
+  modulo T at the store level, so this should be safe; will assert
+  during training.
+
+## v15 — DAgger persistent state results (2026-05-25)
+
+Settings: continue from v14 checkpoint, K=64, batch=203, LR=1e-4,
+`--persistent-state-prob=0.5 --persistent-state-warmup=5`. All other
+RL terms identical to v14.
+
+Training-time loss trajectory:
+
+- step 1   (warmup, dataset only):  total=0.07, ee_loc=0.046, foot_pin=0.006
+- step 25  (persistent kicks in):   total=3.45, ee_loc=2.29,  foot_pin=0.21
+- step 50:                          total=1.31, ee_loc=0.036, foot_pin=0.047
+- step 75:                          total=0.27, ee_loc=0.021, foot_pin=0.052
+
+The persistent-state injection immediately exposes large `ee_loc` /
+`foot_pin` costs on drifted states, then the optimiser shaves them
+down in <100 steps. No NaN, no gradient explosion.
+
+Diagnostic at step 75 on a 600-frame (20 s) autoregressive walkF
+rollout:
+
+- gait period l = r = 0.91 s (was 1.98 s in v14)
+- contact duty l = 0.525, r = 0.510 (DAgger pressure FIXED the v14
+  dwell-cycle asymmetry as a side effect; both feet now share work)
+- hover_ratio_both_off = 0.002
+- slide_in_contact mean l = 0.023 m/s, r = 0.029 m/s
+- pelvis horizontal dev = 0.058 m at 600 frames (was 0.13 m at 120
+  frames in v14, so drift not just contained but tighter than v14)
+- pelvis world y mean = 1.099 m (TOO TALL, target 0.88)
+
+Turn diagnostics unchanged (perfect: 1.00/1.00 contact, 0.000 hover).
+
+Conclusions:
+
+- DAgger persistent state is the single biggest stability win in the
+  whole run. It fixed long-horizon drift AND the symmetry quirk in
+  one shot.
+- The faster gait period (0.91 s vs 1.98 s) is a side effect: with
+  drifted states in the training distribution, the optimiser prefers
+  shorter strides that recover quickly.
+- New issue: pelvis is now too tall (~22 cm above target). The
+  `rl_pelvis_height` weight (20) is not enough to dominate. Plan for
+  v16: bump weight to 50 or tighten tolerance to 0.02 m.
+
+v16 plan:
+
+- Continue v15 training (keep persistent-state injection on).
+- Raise `--pelvis-height-loss-weight` to 50 and tighten
+  `--pelvis-height-tolerance-m` to 0.03 to bring the pelvis back to
+  the natural 0.88 m height.
+- If pelvis becomes oscillatory between steps, add a small
+  `pelvis-height-tolerance-m` band hysteresis. Not implementing
+  unless needed.
+
+## v16 — tightened pelvis-height + persistent state
+
+Settings: continue from v15 ckpt; same as v15 but
+`--pelvis-height-loss-weight=100` (5x) and tolerance=0.03 (1.7x
+tighter).
+
+Diagnostic at step 150 (600-frame walkF rollout):
+
+- pelvis world y = 0.813 m (was 1.099 m in v15, target 0.88 m;
+  slight undershoot)
+- contact duty l = 0.523, r = 0.505 (still symmetric)
+- gait period l = 0.91 s, r = 0.95 s (slight asymmetry)
+- hover_ratio_both_off = 0.002
+- slide_in_contact l = 0.016, r = 0.075 m/s (right side regressed
+  slightly, likely transient while pelvis sinks)
+- pelvis horizontal dev = 0.046 m (BETTER than v15's 0.058)
+
+Turn clips still perfect (1.0/1.0 contact, 0 hover).
+
+Training is yo-yoing on pelvis_height loss (step 50 = 0.009, step
+100 = 0.73, step 150 = 0.52). The aggressive 100x weight makes the
+optimiser overshoot; it bounces around the target. Expect slow
+convergence over a few hundred more steps. Loss still trending down
+overall (step 25=0.47 → step 150=0.60 average).
+
+If oscillation persists past step 300:
+
+- Drop weight back to 50 and let the tighter tolerance still do
+  most of the work.
+- Or halve the LR to 5e-5 to damp oscillation.
+
+## Tracking ideas for v17+ (not yet implemented)
+
+These are queued for later if v16 still has issues:
+
+- **Curriculum on persistent-state-prob**: start at 0.1 and ramp to
+  0.5 over the first 200 steps to soften the introduction of
+  drifted states.
+- **Long-horizon eval as training signal**: every 50 steps, run a
+  1000-frame autoregressive eval. If pelvis drifts > 0.20 m, snap
+  the LR down by 0.5x as a safety brake.
+- **Foot-balance loss**: penalise large per-step disparity between
+  per-foot contact duty over a window. Would directly target any
+  residual asymmetry.
+- **Mirror augmentation**: swap left/right for half the batch each
+  step; should force exact L/R parity if needed (but the model is
+  already nearly symmetric so likely unnecessary).
+- **Pelvis-velocity-z loss**: explicitly penalise vertical pelvis
+  oscillation beyond the natural step bob (~5 cm).
+- **Action smoothness loss**: penalise large per-step deltas in the
+  predicted output vector. Could help reduce twitchiness if the
+  viewer shows any.
+
 ## Removed / Rejected
 
 - `training/ik/window_buffer_ae_experiment.py` was removed from the active code.

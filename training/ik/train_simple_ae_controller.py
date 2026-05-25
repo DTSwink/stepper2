@@ -1121,14 +1121,52 @@ def pure_ae_rollout_loss(
     identity_maxabs_weight: float = 0.0,
     identity_world_pos_weight: float = 0.0,
     identity_pelvis_pos_weight: float = 0.0,
-) -> ControllerLossResult:
+    persistent_state: dict[str, torch.Tensor] | None = None,
+    return_final_state: bool = False,
+) -> ControllerLossResult | tuple[ControllerLossResult, dict[str, torch.Tensor]]:
+    """Run one autoregressive rollout, compute losses, optionally inject a
+    cached "drifted" start state for a subset of rows (DAgger-style), and
+    optionally return the final per-row state so the caller can cache it for
+    the next training step.
+
+    When `persistent_state` is provided, the function forces effective_k=max_k
+    for every row (no row drops) so that the final state is well defined for
+    each row in the original batch. Rows where `persistent_state["mask"]` is
+    True have their freshly-sampled dataset start replaced by the cached
+    state; rows where it is False keep the fresh sample.
+    """
     max_k = max(1, int(rollout_k))
     original_batch_size = max(1, int(batch_size))
-    effective_k = sample_effective_rollout_k(original_batch_size, max_k, store.device)
+    use_persistent = persistent_state is not None and bool(persistent_state["mask"].any())
+    need_final_state = bool(return_final_state)
+    if use_persistent or need_final_state:
+        # Without row drops the final state is well defined for every row, and
+        # injection lines up positionally with the cached state.
+        effective_k = torch.full(
+            (original_batch_size,), max_k, dtype=torch.long, device=store.device
+        )
+    else:
+        effective_k = sample_effective_rollout_k(original_batch_size, max_k, store.device)
     clip_ids, starts = sample_rollout_rows(start_pools, effective_k)
+    if use_persistent:
+        assert persistent_state is not None  # for type checker
+        mask = persistent_state["mask"].to(dtype=torch.bool, device=store.device)
+        assert mask.shape[0] == original_batch_size, (
+            f"persistent_state mask shape {tuple(mask.shape)} must match batch_size {original_batch_size}"
+        )
+        clip_ids = torch.where(mask, persistent_state["clip_ids"], clip_ids)
+        starts = torch.where(mask, persistent_state["cur_idx"], starts)
     cur_idx = starts
     prev_vec, prev_pelvis, prev_payload = target_state(store, clip_ids, cur_idx - 1)
     cur_vec, cur_pelvis, cur_payload = target_state(store, clip_ids, cur_idx)
+    if use_persistent:
+        mask_vec = mask[:, None]
+        prev_vec = torch.where(mask_vec, persistent_state["prev_vec"], prev_vec)
+        prev_pelvis = torch.where(mask_vec, persistent_state["prev_pelvis"], prev_pelvis)
+        prev_payload = torch.where(mask_vec, persistent_state["prev_payload"], prev_payload)
+        cur_vec = torch.where(mask_vec, persistent_state["cur_vec"], cur_vec)
+        cur_pelvis = torch.where(mask_vec, persistent_state["cur_pelvis"], cur_pelvis)
+        cur_payload = torch.where(mask_vec, persistent_state["cur_payload"], cur_payload)
     row_weight = (1.0 / effective_k.float()) / float(original_batch_size)
     total_loss = torch.zeros((), dtype=torch.float32, device=store.device)
     ae_total = torch.zeros_like(total_loss)
@@ -1258,7 +1296,7 @@ def pure_ae_rollout_loss(
         cur_idx = torch.where(reset, reset_starts, next_idx)
         effective_k = effective_k.index_select(0, rows)
         row_weight = row_weight.index_select(0, rows)
-    return ControllerLossResult(
+    loss_result = ControllerLossResult(
         total=total_loss,
         terms={
             "ae_score": ae_total,
@@ -1270,6 +1308,27 @@ def pure_ae_rollout_loss(
             **envelope_terms,
         },
     )
+    if not need_final_state:
+        return loss_result
+    # We forced effective_k=max_k above so no rows were dropped; clip_ids /
+    # cur_idx / *_vec / *_pelvis / *_payload still correspond positionally to
+    # the original batch. Advance one more step using the last pred_vec so the
+    # cached state matches "where the controller would continue".
+    with torch.no_grad():
+        next_vec, next_pelvis, next_payload = advance_transition_state(
+            store, clip_ids, cur_idx, pred_vec.detach()
+        )
+        final_state = {
+            "clip_ids": clip_ids.detach(),
+            "cur_idx": (cur_idx + 1).detach(),
+            "prev_vec": cur_vec.detach(),
+            "prev_pelvis": cur_pelvis.detach(),
+            "prev_payload": cur_payload.detach(),
+            "cur_vec": next_vec.detach(),
+            "cur_pelvis": next_pelvis.detach(),
+            "cur_payload": next_payload.detach(),
+        }
+    return loss_result, final_state
 
 
 def pure_ae_rollout_loss_static(
@@ -1613,9 +1672,52 @@ class EagerPureAEStep:
         self.identity_maxabs_weight = float(identity_maxabs_weight)
         self.identity_world_pos_weight = float(identity_world_pos_weight)
         self.identity_pelvis_pos_weight = float(identity_pelvis_pos_weight)
+        # DAgger-style persistent rollout state (see JOURNAL v15+). Off by
+        # default; enable via configure_persistent_state(prob, warmup).
+        self.persistent_state_prob: float = 0.0
+        self.persistent_state_warmup: int = 0
+        self._persistent_state: dict[str, torch.Tensor] | None = None
+        self._step_count: int = 0
+
+    def configure_persistent_state(self, prob: float, warmup: int) -> None:
+        """Enable DAgger-style persistent rollout state.
+
+        With probability `prob`, each row's fresh dataset-sampled start is
+        replaced by the cached final state of the previous training step's
+        rollout. Cache is built once we've done `warmup` warm-up steps with
+        only dataset starts so the cache is not initialised from random
+        controller behaviour.
+        """
+        self.persistent_state_prob = max(0.0, float(prob))
+        self.persistent_state_warmup = max(0, int(warmup))
+
+    def _build_inject_mask(self) -> torch.Tensor:
+        # Only cyclic clips have an unambiguous "continue forever" semantics.
+        # Non-cyclic clips (turns) need fresh starts so we don't fall off the
+        # end of the clip; mask them out.
+        assert self._persistent_state is not None
+        cached_clip_ids = self._persistent_state["clip_ids"]
+        cached_cur_idx = self._persistent_state["cur_idx"]
+        cyclic = self.store.cyclic.index_select(0, cached_clip_ids).to(self.store.device)
+        max_start = max_training_start_for_clip_ids(self.store, cached_clip_ids)
+        room = cyclic | (cached_cur_idx + self.rollout_k < max_start)
+        bernoulli = torch.rand(
+            cached_clip_ids.shape[0], device=self.store.device
+        ) < float(self.persistent_state_prob)
+        return bernoulli & room
 
     def step(self) -> ControllerLossResult:
-        loss_result = pure_ae_rollout_loss(
+        use_persistent = (
+            self.persistent_state_prob > 0.0
+            and self._step_count >= self.persistent_state_warmup
+            and self._persistent_state is not None
+        )
+        persistent_arg: dict[str, torch.Tensor] | None = None
+        if use_persistent:
+            mask = self._build_inject_mask()
+            persistent_arg = dict(self._persistent_state)  # type: ignore[arg-type]
+            persistent_arg["mask"] = mask
+        rollout_out = pure_ae_rollout_loss(
             self.model,
             self.ae,
             self.mean,
@@ -1633,11 +1735,20 @@ class EagerPureAEStep:
             self.identity_maxabs_weight,
             self.identity_world_pos_weight,
             self.identity_pelvis_pos_weight,
+            persistent_state=persistent_arg,
+            return_final_state=self.persistent_state_prob > 0.0,
         )
+        if isinstance(rollout_out, tuple):
+            loss_result, final_state = rollout_out
+        else:
+            loss_result, final_state = rollout_out, None
         self.optimizer.zero_grad(set_to_none=True)
         loss_result.total.backward()
         maybe_clip_rl_gradients(self.model, self.rl_cfg)
         self.optimizer.step()
+        if final_state is not None:
+            self._persistent_state = final_state
+        self._step_count += 1
         return detach_loss_result(loss_result)
 
 
@@ -1949,6 +2060,10 @@ def main() -> None:
                         help="Target pelvis-local Z (m) for the pelvis-height constraint. Default is walkF mean (~0.886).")
     parser.add_argument("--pelvis-height-tolerance-m", type=float, default=RLLossConfig().pelvis_height_tolerance_m,
                         help="Tolerance band around the pelvis-height target before the penalty engages.")
+    parser.add_argument("--persistent-state-prob", type=float, default=0.0,
+                        help="DAgger-style probability of replacing each row's fresh dataset start with the cached final state of the previous rollout. 0.0 disables. See JOURNAL v15.")
+    parser.add_argument("--persistent-state-warmup", type=int, default=200,
+                        help="Number of training steps with dataset-only starts before persistent state begins. Lets the cache populate from a half-decent controller.")
     args = parser.parse_args()
 
     if args.rollout_schedule is not None:
@@ -2211,9 +2326,15 @@ def main() -> None:
             identity_world_pos_weight,
             identity_pelvis_pos_weight,
         )
+        if hasattr(stepper, "configure_persistent_state") and float(args.persistent_state_prob) > 0.0:
+            stepper.configure_persistent_state(
+                prob=float(args.persistent_state_prob),
+                warmup=int(args.persistent_state_warmup),
+            )
         print(
             f"stage={stage_idx + 1}/{len(ROLLOUT_SCHEDULE)} K={stage_k} "
-            f"steps={stage_steps} batch={int(cache['batch_size'])} lr={lr:.3g} stepper={stepper.kind}",
+            f"steps={stage_steps} batch={int(cache['batch_size'])} lr={lr:.3g} stepper={stepper.kind} "
+            f"persistent_state_prob={float(args.persistent_state_prob):.2f} warmup={int(args.persistent_state_warmup)}",
             flush=True,
         )
         for stage_step in range(1, stage_steps + 1):
